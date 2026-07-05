@@ -1,0 +1,10 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0   # Postgres driver (Neon / Render); SQLite path unaffected
+pydantic>=2.6.0
+python-multipart>=0.0.9
+pytest>=8.0.0
+httpx>=0.27.0
+google-genai>=1.0.0      # Google Gemini SDK (AI assistant / auto-categorize / insights)
+python-dotenv>=1.0.0     # load GEMINI_API_KEY from a .env file

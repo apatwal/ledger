@@ -1,0 +1,22 @@
+# Secrets / local env
+.env
+.env.local
+
+# Claude Code local settings (machine-specific absolute paths)
+.claude/settings.local.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node / frontend
+node_modules/
+dist/
+
+# Local database
+*.db
+
+# OS
+.DS_Store

@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# CI: FAST checks only.
+#
+# This workflow runs quick, hermetic checks on every push and pull request:
+#   - frontend: TypeScript typecheck + Vite build (`npm run build` == `tsc && vite build`)
+#   - backend:  unit/integration tests via pytest
+#
+# Explicitly OUT OF SCOPE here:
+#   - NO end-to-end (e2e) tests
+#   - NO long-running servers or services spun up
+#   - NO secrets (nothing is injected from the repo/org secret store)
+# ---------------------------------------------------------------------------
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build # `tsc && vite build` — typecheck + Vite build
+
+  backend:
+    runs-on: ubuntu-latest
+    # All pytest tests run in-process against the FastAPI app via TestClient,
+    # so nothing needs to be excluded here — the full suite runs.
+    #
+    # GEMINI_API_KEY is intentionally left UNSET: the tests assert graceful
+    # degradation (HTTP 503) when the key is absent. Do NOT add it as a
+    # secret or env var, or those tests would no longer exercise that path.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt
+      - run: pytest -q
