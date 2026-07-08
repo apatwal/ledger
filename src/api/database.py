@@ -1,10 +1,17 @@
 import os
+from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
+# Default SQLite path resolves to <project root>/expense_tracker.db — the same
+# location locally AND inside the Docker image (/app/expense_tracker.db), so an
+# unset DATABASE_URL works in both. Set DATABASE_URL (e.g. postgresql://…) to
+# override. Computed relative to this file (src/api/database.py -> parents[2]).
+_DEFAULT_SQLITE_PATH = Path(__file__).resolve().parents[2] / "expense_tracker.db"
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "sqlite:////Users/adityapatwal/Documents/projects/expense tracker/expense_tracker.db",
+    f"sqlite:///{_DEFAULT_SQLITE_PATH}",
 )
 
 # v6: dialect selected by DATABASE_URL. SQLite (unset default or sqlite://…) needs

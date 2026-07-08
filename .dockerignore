@@ -1,0 +1,32 @@
+# Keep the build context (and image) lean, and NEVER ship secrets or local DBs.
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node / frontend (rebuilt inside the image)
+node_modules/
+dist/
+
+# Secrets & local data — must never enter the image
+.env
+.env.local
+*.db
+
+# VCS / tooling / editor
+.git/
+.github/
+.claude/
+.gitignore
+.dockerignore
+Dockerfile
+
+# Tests & docs (not needed at runtime)
+tests/
+docs/
+README.md
+
+# OS
+.DS_Store

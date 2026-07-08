@@ -12,7 +12,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 import sqlalchemy
 from datetime import date
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -80,6 +80,51 @@ def get_accounts(db: Session = Depends(get_db)):
         )
     ).scalars().all()
     return list(rows)
+
+
+# ── Static frontend (v6 deploy: single-origin — FastAPI serves the built SPA) ──
+# In production the Docker image builds the React app to ./dist and this process
+# serves it alongside /api from ONE origin (no CORS needed in prod). Registered
+# AFTER all /api routers so the SPA catch-all never shadows the API. Skipped
+# entirely when dist/ is absent (local dev with the Vite server on :3000).
+
+_STATIC_DIR = Path(
+    os.environ.get(
+        "STATIC_DIR",
+        str(Path(__file__).resolve().parents[2] / "dist"),
+    )
+).resolve()
+
+if (_STATIC_DIR / "index.html").is_file():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    _INDEX_HTML = _STATIC_DIR / "index.html"
+
+    # Mount hashed build assets (JS/CSS) at /assets.
+    _assets_dir = _STATIC_DIR / "assets"
+    if _assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        """SPA fallback: serve index.html for any non-API path so client-side
+        routes (/dashboard, /transactions, /rules) work on refresh. Real API,
+        docs, and openapi paths are handled by their own routes registered above;
+        guard here too in case dist ships a static file with a matching name."""
+        # Never let the catch-all answer API/docs/schema paths.
+        if (
+            full_path == "api"
+            or full_path.startswith("api/")
+            or full_path in ("docs", "redoc", "openapi.json")
+        ):
+            raise HTTPException(status_code=404, detail="Not found")
+        # Serve a real static file if one exists at that path (e.g. vite.svg,
+        # favicon), otherwise fall back to index.html for client-side routing.
+        candidate = (_STATIC_DIR / full_path).resolve()
+        if full_path and candidate.is_file() and str(candidate).startswith(str(_STATIC_DIR)):
+            return FileResponse(str(candidate))
+        return FileResponse(str(_INDEX_HTML))
 
 
 # ── DB init + seed ───────────────────────────────────────────────────────────

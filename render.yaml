@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: expense-tracker
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    plan: free
+    envVars:
+      # Postgres connection string (Neon). sync:false => Render prompts for it and
+      # never stores it in this file. Reuse the SAME Neon URL as local so prod
+      # shares the data. If unset, the app falls back to in-container SQLite
+      # (ephemeral — resets on every deploy), so set this for real persistence.
+      - key: DATABASE_URL
+        sync: false
+      # Google Gemini key for the AI assistant / auto-categorize / insights.
+      # sync:false => prompted at deploy, not committed. If unset, AI endpoints
+      # return 503 and the rest of the app works normally.
+      - key: GEMINI_API_KEY
+        sync: false
+      # Optional model override (defaults to gemini-2.5-flash in code).
+      # - key: GEMINI_MODEL
+      #   value: gemini-2.5-flash
