@@ -13,6 +13,7 @@ export interface Transaction {
   account: string | null // which card/account; null = Unassigned (v4)
   needs_review: boolean // v5
   review_reason: string | null // v5
+  dup_dismissed?: boolean // v7 — marked "not a duplicate", excluded from flagging
   source: TransactionSource
   created_at: string
 }
@@ -173,6 +174,23 @@ export interface CategorizeBatchItem {
 
 export interface CategorizeBatchResult {
   results: CategorizeBatchItem[]
+}
+
+// ─── Duplicate detection (v7) ──────────────────────────────────────────────────
+
+export interface DuplicateGroup {
+  group_key: string
+  date: string // YYYY-MM-DD
+  amount: number
+  description: string | null
+  account: string | null
+  count: number
+  total_extra: number // (count-1)*amount — the over-charged amount
+  transactions: Transaction[]
+}
+
+export interface DismissDuplicatesResult {
+  dismissed: number
 }
 
 // ─── Health ──────────────────────────────────────────────────────────────────

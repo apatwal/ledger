@@ -1,4 +1,4 @@
-# Expense Tracker — API Contract & Data Model (v1)
+# Expense Tracker — API Contract & Data Model (v7)
 
 This is the **shared source of truth** for Backend, Frontend, and QA. Build to this exactly.
 Backend confirms it is live by messaging Frontend once the server runs.
@@ -181,6 +181,49 @@ Checking/savings exports differ from credit cards in three ways the importer mus
 
 ### Reference fixture
 - `tests/fixtures/debit_sample.csv` — synthetic checking statement covering: paycheck (income), credit-card payment (transfer), brokerage deposit, Venmo, Zelle, ATM withdrawal, cash deposit, utilities, check. Regression guard for debit handling + needs_review flagging.
+
+## Duplicate Detection (v7)
+Surfaces likely-duplicate charges so the user can review and dismiss them. One
+**dynamic** rule catches BOTH real merchant double-charges AND accidentally
+re-imported / overlapping-statement rows — a re-import produces rows with an
+identical `date` + `amount` + merchant + account, which is exactly what this rule
+groups on. No separate "import dedupe" pass is needed; re-imports are covered by
+the same rule.
+
+### Data model addition
+- **`transactions` gains `dup_dismissed`** (bool, default false). Added via the
+  same `inspect(engine).get_columns(...)` → `ALTER TABLE ADD COLUMN` startup-migration
+  pattern as `needs_review` (`_migrate_add_dup_dismissed_column`, portable DDL
+  `BOOLEAN NOT NULL DEFAULT FALSE` — works on SQLite and Postgres). `TransactionCreate`/
+  `TransactionOut` gain `dup_dismissed: bool = False` (round-trips through `PUT` like
+  `needs_review`).
+
+### Duplicate-group rule
+A **duplicate group** = 2+ transactions where ALL of these match:
+- `type == "expense"` (income / transfer / refund are ignored)
+- exact same `date`
+- exact same `amount` rounded to 2 decimals
+- same **normalized description**: `" ".join((description or "").split()).lower()`
+- same **normalized account**: `(account or "").strip().lower()`
+
+Rows with `dup_dismissed == True` are **excluded from grouping entirely**, so a
+group only forms among non-dismissed rows (count >= 2). Grouping is computed
+**in Python** (portable — no reliance on DB string functions).
+
+### Schemas
+- `DuplicateGroup`: `{ group_key: str, date: date, amount: float, description: str|null, account: str|null, count: int, total_extra: float, transactions: TransactionOut[] }`
+  - `group_key` = stable string `f"{date}|{amount:.2f}|{normdesc}|{normacct}"`.
+  - `total_extra` = `round((count - 1) * amount, 2)` — the wasted spend if all but one are true duplicates.
+  - `transactions` = the actual rows in the group, **newest first**.
+- `DismissDuplicatesRequest`: `{ ids: int[] }`.
+
+### Endpoints
+- `GET /api/duplicates` → query `start_date?`, `end_date?`, `account?` (same style as stats) →
+  `200 DuplicateGroup[]`. Considers only `type == "expense"` AND `dup_dismissed == false` rows
+  passing the filters; emits only groups with `count >= 2`; **sorted by `total_extra` descending**.
+- `POST /api/duplicates/dismiss` → body `DismissDuplicatesRequest` `{ ids: int[] }` → sets
+  `dup_dismissed = true` on every existing transaction whose id is in `ids` →
+  `{ "dismissed": <int rows updated> }` (ids that don't exist are ignored; empty list → `0`).
 
 ## Persistence / Postgres (v6)
 The app must run on **SQLite (local dev/tests) AND Postgres (Neon, for real persistence + Render deploy)** from the same code, selected by `DATABASE_URL`.

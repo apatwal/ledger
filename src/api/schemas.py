@@ -13,6 +13,7 @@ class TransactionCreate(BaseModel):
     account: Optional[str] = None
     needs_review: bool = False
     review_reason: Optional[str] = None
+    dup_dismissed: bool = False   # v7
     source: Literal["manual", "csv"] = "manual"
 
     @field_validator("amount")
@@ -162,3 +163,20 @@ class RuleOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# ── Duplicate detection (v7) ─────────────────────────────────────────────────
+
+class DuplicateGroup(BaseModel):
+    group_key: str
+    date: date
+    amount: float
+    description: Optional[str]
+    account: Optional[str]
+    count: int
+    total_extra: float
+    transactions: list[TransactionOut]
+
+
+class DismissDuplicatesRequest(BaseModel):
+    ids: list[int]

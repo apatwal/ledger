@@ -14,7 +14,7 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts'
-import { TrendingDown, Sparkles } from 'lucide-react'
+import { TrendingDown, Sparkles, Copy } from 'lucide-react'
 import {
   getStatsSummary,
   getStatsByCategory,
@@ -23,9 +23,11 @@ import {
   getAccounts,
   getInsights,
   getAssistantStatus,
+  getDuplicates,
 } from '../lib/api'
-import type { StatsSummary, StatsByCategory, StatsOverTime, AccountStat, Granularity } from '../lib/types'
+import type { StatsSummary, StatsByCategory, StatsOverTime, AccountStat, Granularity, DuplicateGroup } from '../lib/types'
 import DatePicker from './DatePicker'
+import DuplicatesModal from './DuplicatesModal'
 
 // Ledger palette — inks, greens, ochres pulled from the design system.
 const PIE_COLORS = [
@@ -148,6 +150,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  // Duplicate detection (v7) — respects the current date/account filters.
+  const [duplicates, setDuplicates] = useState<DuplicateGroup[]>([])
+  const [dupModalOpen, setDupModalOpen] = useState(false)
+
   const [aiEnabled, setAiEnabled] = useState(false)
   const [insights, setInsights] = useState<string | null>(null)
   const [insightsLoading, setInsightsLoading] = useState(false)
@@ -212,6 +218,32 @@ export default function Dashboard() {
   useEffect(() => {
     void loadData()
   }, [loadData])
+
+  // Duplicate params track the same window/account as the headline stats.
+  const dupParams = {
+    start_date: startDate,
+    end_date: endDate,
+    ...(accountFilter ? { account: accountFilter } : {}),
+  }
+
+  const loadDuplicates = useCallback(async () => {
+    try {
+      const rows = await getDuplicates({
+        start_date: startDate,
+        end_date: endDate,
+        ...(accountFilter ? { account: accountFilter } : {}),
+      })
+      setDuplicates(rows)
+    } catch {
+      setDuplicates([]) // non-critical — never block the dashboard on this
+    }
+  }, [startDate, endDate, accountFilter])
+
+  useEffect(() => {
+    void loadDuplicates()
+  }, [loadDuplicates])
+
+  const dupTotalExtra = duplicates.reduce((sum, g) => sum + g.total_extra, 0)
 
   const GRANULARITIES: Granularity[] = ['day', 'week', 'month', 'year']
 
@@ -306,6 +338,27 @@ export default function Dashboard() {
           </button>
         )}
       </div>
+
+      {/* Possible duplicates — attention card, only when there's at least one group */}
+      {duplicates.length > 0 && (
+        <div className="dup-alert">
+          <div>
+            <div className="dup-alert-head">
+              <Copy size={13} />
+              <span>Possible duplicates</span>
+            </div>
+            <div className="dup-alert-text">
+              <strong>{duplicates.length}</strong> group{duplicates.length === 1 ? '' : 's'} of repeated charges
+              {dupTotalExtra > 0 && (
+                <> — up to <strong>{fmt(dupTotalExtra)}</strong> over-charged</>
+              )}.
+            </div>
+          </div>
+          <button className="btn btn-secondary btn-sm" onClick={() => setDupModalOpen(true)}>
+            Review
+          </button>
+        </div>
+      )}
 
       {loading && (
         <div className="loading-state">
@@ -543,6 +596,14 @@ export default function Dashboard() {
             )}
           </div>
         </>
+      )}
+
+      {dupModalOpen && (
+        <DuplicatesModal
+          params={dupParams}
+          onClose={() => setDupModalOpen(false)}
+          onChanged={() => void loadDuplicates()}
+        />
       )}
     </div>
   )

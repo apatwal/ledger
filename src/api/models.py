@@ -17,6 +17,7 @@ class Transaction(Base):
     needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # v5
     review_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)        # v5
     batch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # import batch (v5.2); null = manual
+    dup_dismissed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # v7
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")  # manual | csv
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 

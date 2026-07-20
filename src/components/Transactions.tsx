@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Plus, Pencil, Trash2, Search, ChevronLeft, ChevronRight, AlertCircle, Sparkles } from 'lucide-react'
-import { getTransactions, deleteTransaction, getCategories, getAccounts, getAssistantStatus, categorizeBatch, createRule, applyRules } from '../lib/api'
+import { getTransactions, deleteTransaction, getCategories, getAccounts, getAssistantStatus, categorizeBatch, createRule, applyRules, getDuplicates } from '../lib/api'
 import type { Transaction, TransactionQuery } from '../lib/types'
 import TransactionModal from './TransactionModal'
 import DatePicker from './DatePicker'
@@ -53,6 +53,11 @@ export default function Transactions() {
   const [startDate, setStartDate] = useState(DEFAULT_START)
   const [endDate, setEndDate] = useState(DEFAULT_END)
 
+  // Duplicate detection (v7) — ids of rows that belong to a flagged duplicate group,
+  // scanned across the current window/account. `dupOnly` is a client-side quick filter.
+  const [dupIds, setDupIds] = useState<Set<number>>(new Set())
+  const [dupOnly, setDupOnly] = useState(false)
+
   // AI batch categorize
   const [aiEnabled, setAiEnabled] = useState(false)
   const [categorizing, setCategorizing] = useState(false)
@@ -97,6 +102,22 @@ export default function Transactions() {
   useEffect(() => {
     void load(offset)
   }, [load, offset])
+
+  // Fetch duplicate groups for the current window/account and flatten to an id set.
+  useEffect(() => {
+    let cancelled = false
+    getDuplicates({
+      ...(accountFilter ? { account: accountFilter } : {}),
+      ...(startDate ? { start_date: startDate } : {}),
+      ...(endDate ? { end_date: endDate } : {}),
+    })
+      .then((groups) => {
+        if (cancelled) return
+        setDupIds(new Set(groups.flatMap((g) => g.transactions.map((t) => t.id))))
+      })
+      .catch(() => { if (!cancelled) setDupIds(new Set()) })
+    return () => { cancelled = true }
+  }, [accountFilter, startDate, endDate])
 
   useEffect(() => {
     getCategories()
@@ -166,6 +187,7 @@ export default function Transactions() {
     setStartDate(DEFAULT_START)
     setEndDate(DEFAULT_END)
     setSearch('')
+    setDupOnly(false)
     setOffset(0)
   }
 
@@ -199,7 +221,7 @@ export default function Transactions() {
   }
 
   // Client-side search filter (description/category/date match)
-  const filtered = search.trim()
+  const searched = search.trim()
     ? transactions.filter((t) =>
         t.category.toLowerCase().includes(search.toLowerCase()) ||
         (t.description?.toLowerCase() ?? '').includes(search.toLowerCase()) ||
@@ -207,6 +229,8 @@ export default function Transactions() {
         t.date.includes(search)
       )
     : transactions
+  // "Duplicates only" quick filter (client-side; scoped to the loaded page)
+  const filtered = dupOnly ? searched.filter((t) => dupIds.has(t.id)) : searched
 
   return (
     <div>
@@ -275,6 +299,19 @@ export default function Transactions() {
               <option value="true">Needs review only</option>
             </select>
           </div>
+          {dupIds.size > 0 && (
+            <div>
+              <label htmlFor="f-dup">Duplicates</label>
+              <select
+                id="f-dup"
+                value={dupOnly ? 'true' : ''}
+                onChange={(e) => setDupOnly(e.target.value === 'true')}
+              >
+                <option value="">All rows</option>
+                <option value="true">Duplicates only</option>
+              </select>
+            </div>
+          )}
           <div>
             <label htmlFor="f-start">From date</label>
             <DatePicker
@@ -382,6 +419,14 @@ export default function Transactions() {
                           title={tx.review_reason ?? 'This row needs review'}
                         >
                           needs review
+                        </span>
+                      )}
+                      {dupIds.has(tx.id) && (
+                        <span
+                          className="badge badge-duplicate"
+                          title="This charge matches another with the same date, amount, merchant and account"
+                        >
+                          duplicate
                         </span>
                       )}
                     </div>

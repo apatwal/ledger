@@ -23,6 +23,8 @@ import type {
   CategorizeBatchResult,
   ImportBatch,
   ReassignImportResult,
+  DuplicateGroup,
+  DismissDuplicatesResult,
 } from './types'
 
 const BASE = '/api'
@@ -120,6 +122,24 @@ export async function reassignImport(id: number, account: string | null): Promis
 
 export async function deleteImport(id: number): Promise<void> {
   await fetch(`${BASE}/imports/${id}`, { method: 'DELETE' })
+}
+
+// ─── Duplicate detection (v7) ────────────────────────────────────────────────
+
+export async function getDuplicates(params?: {
+  start_date?: string
+  end_date?: string
+  account?: string
+}): Promise<DuplicateGroup[]> {
+  const qs = toQuery(params as Record<string, string | number | boolean | undefined> ?? {})
+  return request<DuplicateGroup[]>(`/duplicates${qs}`)
+}
+
+export async function dismissDuplicates(ids: number[]): Promise<DismissDuplicatesResult> {
+  return request<DismissDuplicatesResult>('/duplicates/dismiss', {
+    method: 'POST',
+    body: JSON.stringify({ ids }),
+  })
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────

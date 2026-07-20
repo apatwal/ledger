@@ -1051,6 +1051,15 @@ td.num {
   background: var(--gold-wash);
   color: var(--gold);
 }
+/* Duplicate badge (v7) — red/attention tone, distinct from the gold needs-review */
+.badge-duplicate {
+  background: var(--red-wash);
+  color: var(--red-deep);
+  border: 1px solid rgba(168, 50, 46, 0.28);
+  text-transform: none;
+  letter-spacing: 0.01em;
+  font-weight: 500;
+}
 
 /* ─── Modal ─────────────────────────────────────────────────────────────── */
 .modal-backdrop {
@@ -1115,6 +1124,128 @@ td.num {
   padding: 16px 24px;
   border-top: 1px solid var(--rule);
 }
+
+/* Wider modal for list-style content (v7 duplicates) */
+.modal-wide {
+  max-width: 680px;
+}
+
+/* ─── Duplicate detection (v7) ──────────────────────────────────────────── */
+.dup-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--red-wash);
+  border: 1px solid rgba(168, 50, 46, 0.3);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  color: var(--red-deep);
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.dup-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dup-group {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  background: var(--paper-sunk);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--red);
+  border-radius: var(--radius-sm);
+}
+
+.dup-group-main {
+  min-width: 200px;
+  flex: 1;
+}
+
+.dup-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.dup-merchant {
+  font-weight: 600;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.dup-group-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--ink-soft);
+  margin-bottom: 4px;
+}
+
+.dup-dot { color: var(--ink-faint); }
+
+.dup-extra {
+  font-size: 12px;
+  color: var(--red-deep);
+}
+
+.dup-group-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dup-confirm-label {
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin-right: 2px;
+}
+
+/* Dashboard "possible duplicates" attention card */
+.dup-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--red);
+  border-radius: var(--radius);
+  padding: 16px 22px;
+  margin-bottom: 18px;
+  box-shadow: var(--shadow-card);
+}
+
+.dup-alert-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--red);
+  margin-bottom: 6px;
+}
+
+.dup-alert-text {
+  font-size: 14px;
+  color: var(--ink);
+  line-height: 1.5;
+}
+.dup-alert-text strong { font-weight: 700; }
 
 /* ─── CSV / drag-drop ───────────────────────────────────────────────────── */
 .dropzone {

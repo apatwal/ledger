@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
-from .routes import transactions, stats, csv_import, assistant, rules, imports
+from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Expense Tracker API", version="1.0.0")
@@ -40,6 +40,7 @@ app.include_router(stats.router, prefix=API_PREFIX)
 app.include_router(assistant.router, prefix=API_PREFIX)
 app.include_router(rules.router, prefix=API_PREFIX)
 app.include_router(imports.router, prefix=API_PREFIX)
+app.include_router(duplicates.router, prefix=API_PREFIX)
 
 
 # ── Standalone endpoints ──────────────────────────────────────────────────────
@@ -175,6 +176,11 @@ def _migrate_add_statement_type_column() -> None:
     _add_column_if_missing("import_batches", "statement_type", "VARCHAR")
 
 
+def _migrate_add_dup_dismissed_column() -> None:
+    """v7 migration: add `dup_dismissed` to transactions (portable)."""
+    _add_column_if_missing("transactions", "dup_dismissed", "BOOLEAN NOT NULL DEFAULT FALSE")
+
+
 def seed_data(db: Session) -> None:
     """Insert ~19 realistic transactions if the table is empty."""
     count = db.execute(sqlalchemy.text("SELECT COUNT(*) FROM transactions")).scalar()
@@ -220,6 +226,7 @@ def startup():
     _migrate_add_needs_review_column()  # v5: ensure needs_review/review_reason exist
     _migrate_add_batch_id_column()      # v5.2: ensure batch_id exists
     _migrate_add_statement_type_column()  # v5.3: ensure import_batches.statement_type exists
+    _migrate_add_dup_dismissed_column()   # v7: ensure transactions.dup_dismissed exists
     # Auto-seeding is OPT-IN. By default the DB starts empty so real user data
     # is never re-created on restart. Set SEED_DB=1 (for dev/demo) to seed the
     # sample transactions into an empty DB.
