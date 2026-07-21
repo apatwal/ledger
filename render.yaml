@@ -20,3 +20,37 @@ services:
       # Optional model override (defaults to gemini-2.5-flash in code).
       # - key: GEMINI_MODEL
       #   value: gemini-2.5-flash
+
+      # ── Authentication (Clerk) ────────────────────────────────────────────
+      # Forces auth ON in prod: with REQUIRE_AUTH=true (or Render's own RENDER
+      # var) the app REFUSES to boot unless CLERK_ISSUER/CLERK_JWKS_URL is set,
+      # so we never deploy wide-open. Leave "true" for real deploys.
+      - key: REQUIRE_AUTH
+        value: "true"
+      # Clerk Frontend API URL, e.g. https://<subdomain>.clerk.accounts.dev.
+      # Presence of this ENABLES auth. sync:false => prompted at deploy.
+      - key: CLERK_ISSUER
+        sync: false
+      # Clerk secret key (sk_...) — server-side email lookup fallback.
+      - key: CLERK_SECRET_KEY
+        sync: false
+      # Comma-separated email allowlist (empty = any authenticated Clerk user).
+      - key: ALLOWED_EMAILS
+        sync: false
+      # Frontend (Vite) Clerk publishable key (pk_...) consumed at build time.
+      - key: VITE_CLERK_PUBLISHABLE_KEY
+        sync: false
+
+      # ── Plaid integration ─────────────────────────────────────────────────
+      # sync:false => prompted at deploy, never committed. Unset => /api/plaid/*
+      # network endpoints return 503 and the rest of the app works normally.
+      - key: PLAID_CLIENT_ID
+        sync: false
+      - key: PLAID_SECRET
+        sync: false
+      # sandbox | development | production
+      - key: PLAID_ENV
+        sync: false
+      # Comma-separated Plaid products, e.g. transactions,investments
+      - key: PLAID_PRODUCTS
+        sync: false

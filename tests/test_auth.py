@@ -138,21 +138,28 @@ class TestAuthEnabled:
         assert resp.json() == {"status": "ok"}
 
     def test_plaid_sync_token_exempt(self, client, monkeypatch):
-        """A matching X-Plaid-Sync-Token bypasses Clerk auth (cron sync-all),
-        with no Bearer header and without invoking verify_token."""
+        """A matching X-Plaid-Sync-Token exempts Clerk auth ONLY on the cron
+        sync-all route — the shared secret is never a master key for other
+        routes. With no Bearer header:
+          * a normal protected route (GET /api/transactions) => 401
+          * POST /api/plaid/sync-all passes the auth layer (NOT 401)."""
         _enable(monkeypatch)
         monkeypatch.setenv("PLAID_SYNC_TOKEN", "cron-secret-123")
 
-        # Prove the exemption short-circuits before token verification.
-        def _should_not_run(token):
-            raise AssertionError("verify_token must not be called for sync-token exemption")
-
-        monkeypatch.setattr(auth, "verify_token", _should_not_run)
-
-        resp = client.get(
+        # Security guarantee: the sync token does NOT exempt other routes.
+        resp_other = client.get(
             "/api/transactions", headers={"X-Plaid-Sync-Token": "cron-secret-123"}
         )
-        assert resp.status_code == 200
+        assert resp_other.status_code == 401
+
+        # The exemption applies on the sync-all route: the request clears the
+        # Clerk auth layer. Plaid is unconfigured in tests, so the handler
+        # itself returns 503 (or 200 if mocked) — anything but 401 proves the
+        # exemption fired.
+        resp_sync = client.post(
+            "/api/plaid/sync-all", headers={"X-Plaid-Sync-Token": "cron-secret-123"}
+        )
+        assert resp_sync.status_code != 401
 
     def test_wrong_plaid_sync_token_still_401(self, client, monkeypatch):
         """A non-matching X-Plaid-Sync-Token is NOT exempt: falls through to the

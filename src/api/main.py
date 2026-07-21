@@ -2,6 +2,7 @@
 Expense Tracker — FastAPI backend
 Run: uvicorn src.api.main:app --reload --port 8000
 """
+import logging
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -20,14 +21,28 @@ from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
 from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets
 from . import plaid_client
+from . import auth
 from .auth import require_user
+
+logger = logging.getLogger("expense_tracker.auth")
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Expense Tracker API", version="1.0.0")
 
+# CORS origins are env-driven (CORS_ORIGINS, comma-separated). We do NOT use "*"
+# because allow_credentials=True with a wildcard is both unsafe and rejected by
+# browsers. Defaults to the local Vite dev origin. In single-origin prod (SPA
+# served by FastAPI) CORS is not exercised at all.
+_cors_origins_raw = (os.environ.get("CORS_ORIGINS") or "").strip()
+_cors_origins = (
+    [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    if _cors_origins_raw
+    else ["http://localhost:3000"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -250,8 +265,40 @@ def seed_data(db: Session) -> None:
     print(f"[seed] Inserted {len(samples)} sample transactions.")
 
 
+def _require_auth_in_prod() -> bool:
+    """True when this looks like a production deploy that must not run wide-open:
+    an explicit REQUIRE_AUTH=true, or the presence of Render's own RENDER env var."""
+    if (os.environ.get("REQUIRE_AUTH") or "").strip().lower() == "true":
+        return True
+    return bool(os.environ.get("RENDER"))
+
+
+def _enforce_auth_policy() -> None:
+    """Fix 1: never silently deploy wide-open.
+
+    * If this is a production deploy (REQUIRE_AUTH=true or Render) AND auth is
+      disabled (no CLERK_ISSUER/CLERK_JWKS_URL), REFUSE to boot.
+    * Otherwise just log loudly whether auth is on or off. Under the test suite
+      neither REQUIRE_AUTH nor RENDER is set, so the hard-fail never triggers —
+      only the warning is logged.
+    """
+    if auth.is_auth_enabled():
+        logger.info("[auth] enabled (issuer=%s)", auth._issuer() or "<jwks-url>")
+        return
+    if _require_auth_in_prod():
+        raise RuntimeError(
+            "[auth] REFUSING TO BOOT: authentication is DISABLED but this is a "
+            "production deploy (REQUIRE_AUTH=true or RENDER set). Set CLERK_ISSUER "
+            "(or CLERK_JWKS_URL) to enable auth, or unset REQUIRE_AUTH/RENDER."
+        )
+    logger.warning(
+        "[auth] DISABLED — all /api routes are OPEN. Set CLERK_ISSUER to enable."
+    )
+
+
 @app.on_event("startup")
 def startup():
+    _enforce_auth_policy()
     Base.metadata.create_all(bind=engine)
     _migrate_add_account_column()       # v4: ensure `account` column exists on legacy DBs
     _migrate_add_needs_review_column()  # v5: ensure needs_review/review_reason exist

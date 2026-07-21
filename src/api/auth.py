@@ -30,12 +30,13 @@ Verification (require_user), when enabled:
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import urllib.request
 from typing import Optional
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 
 # ── Module-level caches ────────────────────────────────────────────────────────
 # Cached PyJWKClient (keyed by JWKS URL) so we don't refetch signing keys every
@@ -152,7 +153,11 @@ def _lookup_email_via_clerk_api(sub: str) -> Optional[str]:
             data = json.loads(resp.read().decode("utf-8"))
         email = _primary_email_from_user(data)
     except Exception:
-        email = None
+        # Transient failure (network/timeout/403): do NOT cache. Caching None here
+        # would 403 the user until process restart, so leave the cache untouched so
+        # the next request retries the lookup.
+        return None
+    # Cache only a SUCCESSFUL resolution (including a legitimate "no email" -> None).
     _email_cache[sub] = email
     return email
 
@@ -194,6 +199,7 @@ def resolve_email(claims: dict) -> Optional[str]:
 # ── FastAPI dependency ───────────────────────────────────────────────────────
 
 def require_user(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
     x_plaid_sync_token: Optional[str] = Header(default=None),
 ) -> Optional[dict]:
@@ -201,17 +207,24 @@ def require_user(
 
     * Auth disabled (no Clerk env) -> return None, allow everything (keeps local
       dev + the existing test suite green).
-    * A valid X-Plaid-Sync-Token matching PLAID_SYNC_TOKEN is exempt (cron
-      sync-all keeps working without a Clerk user).
+    * A valid X-Plaid-Sync-Token matching PLAID_SYNC_TOKEN is exempt ONLY on the
+      cron sync-all route (/plaid/sync-all) — so the shared secret is never a
+      master key for other routes.
     * Otherwise: verify the Bearer JWT, resolve the email, enforce the allowlist.
     """
     if not is_auth_enabled():
         return None
 
-    # Exemption: the Plaid cron sync-all shared secret.
-    sync_token = (os.environ.get("PLAID_SYNC_TOKEN") or "").strip()
-    if sync_token and x_plaid_sync_token == sync_token:
-        return {"sub": None, "email": None, "via": "plaid_sync_token"}
+    # Exemption: the Plaid cron sync-all shared secret. Scoped to ONLY the
+    # sync-all route so a leaked token can't unlock any other /api endpoint.
+    if request.url.path.endswith("/plaid/sync-all"):
+        sync_token = (os.environ.get("PLAID_SYNC_TOKEN") or "").strip()
+        if (
+            sync_token
+            and x_plaid_sync_token
+            and hmac.compare_digest(x_plaid_sync_token, sync_token)
+        ):
+            return {"sub": None, "email": None, "via": "plaid_sync_token"}
 
     if not authorization or not authorization.strip().lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
