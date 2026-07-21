@@ -3348,6 +3348,145 @@ td.num {
   }
 }
 
+/* ─── LedgerLoader — pen signs "Ledger" ─────────────────────────────────────
+   Shared in-app loader (auth bootstrap overlay + route-transition inline).
+   Reveal technique: the word is real text revealed L→R with an animated
+   clip-path inset; a pen-nib SVG rides the reveal edge via `left: 0→100%`
+   (relative to the word's own width) in sync; a ruled baseline draws in with
+   scaleX; a gold ink-dot sits at the nib tip. One loop = write → hold → fade
+   → reset (while hidden) → repeat. Mirrors the boot splash in index.html. */
+.ledger-loader {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  color: var(--ink);
+}
+.ledger-loader-overlay {
+  flex: 1; /* #root is display:flex (row) — fill it so centering works */
+  min-height: 100vh;
+  width: 100%;
+  padding: 2rem;
+  background: var(--paper);
+}
+.ledger-loader-inline {
+  width: 100%;
+  min-height: 320px;
+  padding: 56px 24px;
+}
+
+/* The stage wraps only the word, so its width == the word's width and the
+   nib's `left: %` + the baseline both track the glyphs exactly. */
+.ledger-loader-stage {
+  position: relative;
+  display: inline-block;
+}
+.ledger-loader-word {
+  display: block;
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--ink);
+  clip-path: inset(0 100% 0 0);
+  animation: ledgerLoaderWrite 3s ease-in-out infinite;
+}
+.ledger-loader-overlay .ledger-loader-word {
+  font-size: 72px;
+}
+.ledger-loader-inline .ledger-loader-word {
+  font-size: 52px;
+}
+.ledger-loader-baseline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -12px;
+  height: 2px;
+  background: var(--rule-ink);
+  transform: scaleX(0);
+  transform-origin: left center;
+  animation: ledgerLoaderBaseline 3s ease-in-out infinite;
+}
+.ledger-loader-nib {
+  position: absolute;
+  left: 0;
+  bottom: -13px; /* tip rides the baseline */
+  width: 24px;
+  height: 28px;
+  transform: translateX(-4px);
+  pointer-events: none;
+  animation: ledgerLoaderNib 3s ease-in-out infinite;
+}
+.ledger-loader-nib svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.ledger-loader-ink {
+  position: absolute;
+  left: 2px;
+  bottom: 2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 5px var(--gold-wash);
+}
+.ledger-loader-caption {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+@keyframes ledgerLoaderWrite {
+  0% { clip-path: inset(0 100% 0 0); opacity: 1; }
+  50% { clip-path: inset(0 0 0 0); opacity: 1; } /* fully written */
+  75% { clip-path: inset(0 0 0 0); opacity: 1; } /* hold */
+  90% { clip-path: inset(0 0 0 0); opacity: 0; } /* fade out */
+  90.01% { clip-path: inset(0 100% 0 0); opacity: 0; } /* reset while hidden */
+  100% { clip-path: inset(0 100% 0 0); opacity: 0; }
+}
+@keyframes ledgerLoaderNib {
+  0% { left: 0; opacity: 0; }
+  6% { opacity: 1; }
+  50% { left: 100%; opacity: 1; } /* reaches the end as writing completes */
+  62% { left: 100%; opacity: 0; } /* pen lifts */
+  90%, 100% { left: 0; opacity: 0; } /* reset while hidden */
+}
+@keyframes ledgerLoaderBaseline {
+  0% { transform: scaleX(0); opacity: 1; }
+  50% { transform: scaleX(1); opacity: 1; }
+  88% { transform: scaleX(1); opacity: 1; }
+  94% { transform: scaleX(1); opacity: 0; }
+  94.01% { transform: scaleX(0); opacity: 0; }
+  100% { transform: scaleX(0); opacity: 0; }
+}
+
+/* Reduced motion → the finished word, held statically. No writing, no nib. */
+@media (prefers-reduced-motion: reduce) {
+  .ledger-loader-word {
+    animation: none;
+    clip-path: none;
+    opacity: 1;
+  }
+  .ledger-loader-baseline {
+    animation: none;
+    transform: scaleX(1);
+    opacity: 1;
+  }
+  .ledger-loader-nib {
+    animation: none;
+    opacity: 0;
+  }
+  .ledger-loader-caption {
+    animation: none;
+  }
+}
+
 .topbar-user {
   margin-left: auto;
   display: flex;

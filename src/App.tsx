@@ -1,5 +1,6 @@
 import { lazy, Suspense } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
+import LedgerLoader from './components/LedgerLoader'
 import Layout from './components/Layout'
 import { AccountSelectionProvider } from './lib/accountSelection'
 
@@ -15,12 +16,7 @@ const Budget = lazy(() => import('./components/Budget'))
 
 // On-theme placeholder shown while a route chunk is fetched.
 function RouteFallback() {
-  return (
-    <div className="loading-state">
-      <div className="spinner spinner-lg" />
-      Loading…
-    </div>
-  )
+  return <LedgerLoader variant="inline" />
 }
 
 export default function App() {

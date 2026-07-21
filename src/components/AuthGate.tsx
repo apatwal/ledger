@@ -1,6 +1,7 @@
 import { useEffect, type ReactNode } from 'react'
 import { Show, SignIn, ClerkLoading, ClerkLoaded, useAuth } from '@clerk/react'
 import { setAuthTokenGetter } from '../lib/api'
+import LedgerLoader from './LedgerLoader'
 import LoginLedger from './LoginLedger'
 
 /**
@@ -21,9 +22,7 @@ export default function AuthGate({ children }: { children: ReactNode }) {
   return (
     <>
       <ClerkLoading>
-        <div className="auth-screen">
-          <div className="auth-loading">Loading…</div>
-        </div>
+        <LedgerLoader variant="overlay" />
       </ClerkLoading>
       <ClerkLoaded>
         <Show when="signed-out">
