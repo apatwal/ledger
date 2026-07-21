@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AreaChart,
   Area,
@@ -24,10 +25,11 @@ import {
   getAssistantStatus,
   getDuplicates,
 } from '../lib/api'
-import type { StatsSummary, StatsByCategory, StatsOverTime, AccountStat, Granularity, DuplicateGroup } from '../lib/types'
+import type { Granularity } from '../lib/types'
 import DatePicker from './DatePicker'
 import DuplicatesModal from './DuplicatesModal'
 import { useAccountSelection } from '../lib/accountSelection'
+import { acctKey } from '../lib/queryKeys'
 import { iconForCategory } from '../lib/categoryIcons'
 
 // Ledger palette — inks, greens, ochres pulled from the design system.
@@ -139,32 +141,63 @@ export default function Dashboard() {
   const [granularity, setGranularity] = useState<Granularity>(initial.granularity)
   const [activePreset, setActivePreset] = useState<PresetKey | null>('30d')
 
+  const queryClient = useQueryClient()
+
   // Which accounts are in view is driven globally by the header selector.
-  const { accountsParam, isSelected, toggle, balanceOf, allSelected, selected } = useAccountSelection()
-  const accountsKey = allSelected ? '__all__' : selected.join(',')
+  const { accountsParam, isSelected, toggle, balanceOf } = useAccountSelection()
+  // The account selection is stringified into every stats/duplicates key so
+  // cached data is never shown for the wrong filter.
+  const accounts = accountsParam()
+  const acctPart = acctKey(accounts)
 
-  const [summary, setSummary] = useState<StatsSummary | null>(null)
-  const [byCategory, setByCategory] = useState<StatsByCategory[]>([])
-  const [overTime, setOverTime] = useState<StatsOverTime[]>([])
-  const [byAccount, setByAccount] = useState<AccountStat[]>([])
+  // Headline stats. by-account is the per-card breakdown — always across all
+  // cards (date range only), so its key omits the account selection.
+  const summaryQ = useQuery({
+    queryKey: ['stats', 'summary', { start_date: startDate, end_date: endDate, accounts: acctPart }],
+    queryFn: () => getStatsSummary({ start_date: startDate, end_date: endDate, accounts }),
+  })
+  const byCategoryQ = useQuery({
+    queryKey: ['stats', 'by-category', { start_date: startDate, end_date: endDate, accounts: acctPart }],
+    queryFn: () => getStatsByCategory({ start_date: startDate, end_date: endDate, accounts }),
+  })
+  const overTimeQ = useQuery({
+    queryKey: ['stats', 'over-time', { start_date: startDate, end_date: endDate, accounts: acctPart, granularity }],
+    queryFn: () => getStatsOverTime(granularity, { start_date: startDate, end_date: endDate, accounts }),
+  })
+  const byAccountQ = useQuery({
+    queryKey: ['stats', 'by-account', { start_date: startDate, end_date: endDate }],
+    queryFn: () => getStatsByAccount({ start_date: startDate, end_date: endDate }),
+  })
 
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const summary = summaryQ.data ?? null
+  const byCategory = byCategoryQ.data ?? []
+  const overTime = overTimeQ.data ?? []
+  const byAccount = byAccountQ.data ?? []
+  const loading = summaryQ.isPending || byCategoryQ.isPending || overTimeQ.isPending || byAccountQ.isPending
+  const firstError = summaryQ.error ?? byCategoryQ.error ?? overTimeQ.error ?? byAccountQ.error
+  const error = firstError instanceof Error ? firstError.message : firstError ? 'Failed to load data' : null
+
+  // Refresh/retry forces every filtered stats + duplicates variant to refetch.
+  const loadData = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ['stats'] })
+    void queryClient.invalidateQueries({ queryKey: ['duplicates'] })
+  }, [queryClient])
 
   // Duplicate detection (v7) — respects the current date/account filters.
-  const [duplicates, setDuplicates] = useState<DuplicateGroup[]>([])
+  // Non-critical: on error we just show nothing (data ?? []).
+  const duplicatesQ = useQuery({
+    queryKey: ['duplicates', { start_date: startDate, end_date: endDate, accounts: acctPart }],
+    queryFn: () => getDuplicates({ start_date: startDate, end_date: endDate, accounts }),
+  })
+  const duplicates = duplicatesQ.data ?? []
   const [dupModalOpen, setDupModalOpen] = useState(false)
 
-  const [aiEnabled, setAiEnabled] = useState(false)
+  const assistantStatusQ = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
+  const aiEnabled = assistantStatusQ.data?.enabled ?? false
+
   const [insights, setInsights] = useState<string | null>(null)
   const [insightsLoading, setInsightsLoading] = useState(false)
   const [insightsError, setInsightsError] = useState<string | null>(null)
-
-  useEffect(() => {
-    getAssistantStatus()
-      .then((s) => setAiEnabled(s.enabled))
-      .catch(() => setAiEnabled(false))
-  }, [])
 
   const loadInsights = useCallback(async () => {
     setInsightsLoading(true)
@@ -185,64 +218,12 @@ export default function Dashboard() {
     setInsightsError(null)
   }, [startDate, endDate])
 
-  const loadData = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      // The global account selection drives the headline stats; when all are
-      // selected `accountsParam()` is undefined → server aggregates everything.
-      const params = {
-        start_date: startDate,
-        end_date: endDate,
-        accounts: accountsParam(),
-      }
-      // by-account is the per-card breakdown — always across all cards (date range only).
-      const [s, cat, ot, acct] = await Promise.all([
-        getStatsSummary(params),
-        getStatsByCategory(params),
-        getStatsOverTime(granularity, params),
-        getStatsByAccount({ start_date: startDate, end_date: endDate }),
-      ])
-      setSummary(s)
-      setByCategory(cat)
-      setOverTime(ot)
-      setByAccount(acct)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load data')
-    } finally {
-      setLoading(false)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startDate, endDate, granularity, accountsKey])
-
-  useEffect(() => {
-    void loadData()
-  }, [loadData])
-
   // Duplicate params track the same window/accounts as the headline stats.
   const dupParams = {
     start_date: startDate,
     end_date: endDate,
-    accounts: accountsParam(),
+    accounts,
   }
-
-  const loadDuplicates = useCallback(async () => {
-    try {
-      const rows = await getDuplicates({
-        start_date: startDate,
-        end_date: endDate,
-        accounts: accountsParam(),
-      })
-      setDuplicates(rows)
-    } catch {
-      setDuplicates([]) // non-critical — never block the dashboard on this
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startDate, endDate, accountsKey])
-
-  useEffect(() => {
-    void loadDuplicates()
-  }, [loadDuplicates])
 
   const dupTotalExtra = duplicates.reduce((sum, g) => sum + g.total_extra, 0)
 
@@ -601,7 +582,7 @@ export default function Dashboard() {
         <DuplicatesModal
           params={dupParams}
           onClose={() => setDupModalOpen(false)}
-          onChanged={() => void loadDuplicates()}
+          onChanged={() => void queryClient.invalidateQueries({ queryKey: ['duplicates'] })}
         />
       )}
     </div>

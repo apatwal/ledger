@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Plus, X, Pencil, Trash2, PiggyBank, Target, Check, AlertTriangle } from 'lucide-react'
 import {
   getSavingsGoals,
@@ -354,49 +355,44 @@ type DeleteTarget =
   | { kind: 'limit'; limit: CategoryBudget }
 
 export default function Budget() {
+  const queryClient = useQueryClient()
   const { accounts } = useAccountSelection()
   const accountLabels = accounts.map((a) => a.label)
 
-  const [goals, setGoals] = useState<SavingsGoal[]>([])
-  const [limits, setLimits] = useState<CategoryBudget[]>([])
-  const [categoryOptions, setCategoryOptions] = useState<string[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const goalsQuery = useQuery({ queryKey: ['budgets', 'goals'], queryFn: getSavingsGoals })
+  const limitsQuery = useQuery({ queryKey: ['budgets', 'categories'], queryFn: getCategoryBudgets })
+  const categoriesQuery = useQuery({ queryKey: ['categories'], queryFn: getCategories })
+
+  const goals = goalsQuery.data ?? []
+  const limits = limitsQuery.data ?? []
+  const categoryOptions = categoriesQuery.data ?? []
+  const loading = goalsQuery.isPending || limitsQuery.isPending
+  const loadError = goalsQuery.error ?? limitsQuery.error
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const error = deleteError ?? (loadError instanceof Error ? loadError.message : loadError ? 'Failed to load budget' : null)
+
+  const invalidateBudgets = () => { void queryClient.invalidateQueries({ queryKey: ['budgets'] }) }
+  const load = () => {
+    void goalsQuery.refetch()
+    void limitsQuery.refetch()
+  }
 
   const [goalModal, setGoalModal] = useState<{ open: boolean; goal: SavingsGoal | null }>({ open: false, goal: null })
   const [limitModal, setLimitModal] = useState<{ open: boolean; limit: CategoryBudget | null }>({ open: false, limit: null })
   const [deleting, setDeleting] = useState<DeleteTarget | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const [g, l] = await Promise.all([getSavingsGoals(), getCategoryBudgets()])
-      setGoals(g)
-      setLimits(l)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load budget')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void load()
-    getCategories().then(setCategoryOptions).catch(() => { /* free-text still works */ })
-  }, [load])
-
   async function confirmDelete() {
     if (!deleting) return
     setDeleteBusy(true)
+    setDeleteError(null)
     try {
       if (deleting.kind === 'goal') await deleteSavingsGoal(deleting.goal.id)
       else await deleteCategoryBudget(deleting.limit.id)
       setDeleting(null)
-      await load()
+      invalidateBudgets()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to delete')
+      setDeleteError(e instanceof Error ? e.message : 'Failed to delete')
     } finally {
       setDeleteBusy(false)
     }
@@ -421,7 +417,7 @@ export default function Budget() {
         <div className="error-state">
           <AlertTriangle size={32} />
           <div>{error}</div>
-          <button className="btn btn-secondary btn-sm" onClick={() => void load()}>Retry</button>
+          <button className="btn btn-secondary btn-sm" onClick={load}>Retry</button>
         </div>
       )}
 
@@ -571,7 +567,7 @@ export default function Budget() {
           goal={goalModal.goal}
           accountLabels={accountLabels}
           onClose={() => setGoalModal({ open: false, goal: null })}
-          onSaved={() => { setGoalModal({ open: false, goal: null }); void load() }}
+          onSaved={() => { setGoalModal({ open: false, goal: null }); invalidateBudgets() }}
         />
       )}
 
@@ -580,7 +576,7 @@ export default function Budget() {
           limit={limitModal.limit}
           categoryOptions={categoryOptions}
           onClose={() => setLimitModal({ open: false, limit: null })}
-          onSaved={() => { setLimitModal({ open: false, limit: null }); void load() }}
+          onSaved={() => { setLimitModal({ open: false, limit: null }); invalidateBudgets() }}
         />
       )}
 

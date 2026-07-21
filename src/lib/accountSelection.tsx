@@ -5,7 +5,30 @@
 // later are shown by default rather than silently hidden.
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { getAccounts, getPlaidStatus } from './api'
+
+// Fetches (and de-dupes/caches) the account universe: transaction labels ∪ Plaid
+// app_account labels, with balances where Plaid provides them.
+async function fetchAccountUniverse(): Promise<AccountInfo[]> {
+  const [acctRes, plaidRes] = await Promise.allSettled([getAccounts(), getPlaidStatus()])
+  const byLabel = new Map<string, AccountInfo>()
+  const add = (label: string | null | undefined, extra?: Partial<AccountInfo>) => {
+    const l = (label ?? '').trim()
+    if (!l) return
+    const prev = byLabel.get(l) ?? { label: l }
+    byLabel.set(l, { ...prev, ...extra, label: l })
+  }
+  if (acctRes.status === 'fulfilled') acctRes.value.forEach((l) => add(l))
+  if (plaidRes.status === 'fulfilled') {
+    for (const item of plaidRes.value.items ?? []) {
+      for (const a of item.accounts ?? []) {
+        add(a.app_account, { available: a.available, current: a.current, currency: a.currency })
+      }
+    }
+  }
+  return [...byLabel.values()].sort((x, y) => x.label.localeCompare(y.label))
+}
 
 const STORAGE_KEY = 'expense.deselectedAccounts'
 
@@ -57,38 +80,17 @@ function saveDeselected(set: Set<string>) {
 }
 
 export function AccountSelectionProvider({ children }: { children: ReactNode }) {
-  const [accounts, setAccounts] = useState<AccountInfo[]>([])
   const [deselected, setDeselected] = useState<Set<string>>(() => loadDeselected())
-  const [loading, setLoading] = useState(true)
 
-  const refresh = useCallback(() => {
-    setLoading(true)
-    // Balances (and some labels) come from Plaid; the label universe also includes
-    // any accounts only seen in imported/manual transactions.
-    Promise.allSettled([getAccounts(), getPlaidStatus()])
-      .then(([acctRes, plaidRes]) => {
-        const byLabel = new Map<string, AccountInfo>()
-        const add = (label: string | null | undefined, extra?: Partial<AccountInfo>) => {
-          const l = (label ?? '').trim()
-          if (!l) return
-          const prev = byLabel.get(l) ?? { label: l }
-          byLabel.set(l, { ...prev, ...extra, label: l })
-        }
-        if (acctRes.status === 'fulfilled') acctRes.value.forEach((l) => add(l))
-        if (plaidRes.status === 'fulfilled') {
-          for (const item of plaidRes.value.items ?? []) {
-            for (const a of item.accounts ?? []) {
-              add(a.app_account, { available: a.available, current: a.current, currency: a.currency })
-            }
-          }
-        }
-        const list = [...byLabel.values()].sort((x, y) => x.label.localeCompare(y.label))
-        setAccounts(list)
-      })
-      .finally(() => setLoading(false))
-  }, [])
-
-  useEffect(() => { refresh() }, [refresh])
+  // The account universe is a cached, deduped read shared across the app. Its
+  // balances (and some labels) come from Plaid; the label universe also includes
+  // accounts only seen in imported/manual transactions.
+  const { data: accounts = [], isPending, refetch } = useQuery({
+    queryKey: ['accounts', 'universe'],
+    queryFn: fetchAccountUniverse,
+  })
+  const loading = isPending
+  const refresh = useCallback(() => { void refetch() }, [refetch])
 
   // Persist whenever the deselected set changes.
   useEffect(() => { saveDeselected(deselected) }, [deselected])

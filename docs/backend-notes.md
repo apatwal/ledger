@@ -433,6 +433,38 @@ On Render, set `DATABASE_URL` to the Neon connection string in the service env;
 `create_all` + the portable migrations run on startup. Tests always use in-memory
 SQLite and are unaffected.
 
+## Performance / Neon cold starts (feature/performance)
+
+Neon scales its Postgres compute **to zero when idle**, so the first request
+after a lull stalls for several seconds while it spins back up. Two gated,
+Postgres-only mitigations (the SQLite path used by local dev + tests is
+**completely unchanged**):
+
+- **Connection-pool tuning** (`database.py`, Postgres branch only): alongside the
+  existing `pool_pre_ping=True`, the engine now sets `pool_size=5`,
+  `max_overflow=5`, and `pool_recycle=300`. `pool_recycle` discards connections
+  older than 300s so we never hand out one Neon's proxy has already idle-closed
+  (avoids stale-connection stalls); `pool_pre_ping` still catches any that slip
+  through. All three are env-overridable: `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`,
+  `DB_POOL_RECYCLE`. SQLite keeps `connect_args={"check_same_thread": False}`
+  with no pool args (default pool behavior).
+
+- **Keep-warm ping** (`main.py`, `_maybe_start_keepalive`): an optional in-process
+  APScheduler job (same pattern as the Plaid auto-sync scheduler) that opens a
+  short-lived session, runs `SELECT 1`, and closes it on an interval — keeping
+  Neon's compute from scaling to zero. **Gated**: it only starts when the dialect
+  is Postgres (`engine.dialect.name != "sqlite"`) **and** `DB_KEEPALIVE_SECONDS`
+  is a positive int (e.g. `240` for every 4 min). Unset/0 or on SQLite → it never
+  starts, so tests and local SQLite are unaffected. Errors in the job are caught
+  and logged (`[keepalive] ping failed: …`), never crashing the server. On
+  startup when enabled it logs `[keepalive] Neon keep-warm every 240s`.
+
+  **Limitation:** this only keeps Neon warm while THIS server process is alive.
+  On a host that itself sleeps (e.g. Render free tier, which suspends the
+  instance when idle) it can't run, so it does nothing until the instance is back
+  up — the very-first request after the host wakes still pays the cold start.
+  For always-on hosting it keeps the DB hot continuously.
+
 ## Notes
 
 - `savings` in stats = sum of expense rows where category is `Savings` or

@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { X, Copy, AlertCircle } from 'lucide-react'
 import { getDuplicates, dismissDuplicates, deleteTransaction } from '../lib/api'
 import type { DuplicateGroup } from '../lib/types'
+import { acctKey } from '../lib/queryKeys'
 
 interface Props {
   // The dashboard/ledger filters this modal should respect.
@@ -16,30 +18,35 @@ function fmt(n: number): string {
 }
 
 export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
-  const [groups, setGroups] = useState<DuplicateGroup[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
+  // Key includes the full filter window (dates + account selection) so cached
+  // duplicate groups are never shown for the wrong filter.
+  const dupQuery = useQuery({
+    queryKey: ['duplicates', {
+      start_date: params?.start_date,
+      end_date: params?.end_date,
+      account: params?.account,
+      accounts: acctKey(params?.accounts),
+    }],
+    queryFn: () => getDuplicates(params),
+  })
+  const groups: DuplicateGroup[] = dupQuery.data ?? []
+  const loading = dupQuery.isPending
+  const [actionError, setActionError] = useState<string | null>(null)
+  const error = actionError ?? (dupQuery.error instanceof Error ? dupQuery.error.message : dupQuery.error ? 'Failed to load duplicates' : null)
+
   // key of the group with a pending in-flight action, so we can disable its buttons
   const [busyKey, setBusyKey] = useState<string | null>(null)
   // key of the group whose "Delete extra" is awaiting confirmation
   const [confirmKey, setConfirmKey] = useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const rows = await getDuplicates(params)
-      setGroups(rows)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load duplicates')
-    } finally {
-      setLoading(false)
-    }
-  }, [params])
-
-  useEffect(() => {
-    void load()
-  }, [load])
+  // Any duplicate mutation changes the ledger — refresh duplicates + the lists
+  // and stats that derive from them (all filtered variants via prefix).
+  const invalidateAfterDupChange = () => {
+    void queryClient.invalidateQueries({ queryKey: ['duplicates'] })
+    void queryClient.invalidateQueries({ queryKey: ['transactions'] })
+    void queryClient.invalidateQueries({ queryKey: ['stats'] })
+  }
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -51,13 +58,13 @@ export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
 
   async function handleDismiss(group: DuplicateGroup) {
     setBusyKey(group.group_key)
-    setError(null)
+    setActionError(null)
     try {
       await dismissDuplicates(group.transactions.map((t) => t.id))
       onChanged?.()
-      await load()
+      invalidateAfterDupChange()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to dismiss group')
+      setActionError(e instanceof Error ? e.message : 'Failed to dismiss group')
     } finally {
       setBusyKey(null)
       setConfirmKey(null)
@@ -66,7 +73,7 @@ export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
 
   async function handleDeleteExtra(group: DuplicateGroup) {
     setBusyKey(group.group_key)
-    setError(null)
+    setActionError(null)
     try {
       // Keep the oldest (smallest id); delete every other row in the group.
       const sorted = [...group.transactions].sort((a, b) => a.id - b.id)
@@ -75,9 +82,9 @@ export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
         await deleteTransaction(tx.id)
       }
       onChanged?.()
-      await load()
+      invalidateAfterDupChange()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to delete extra charges')
+      setActionError(e instanceof Error ? e.message : 'Failed to delete extra charges')
     } finally {
       setBusyKey(null)
       setConfirmKey(null)

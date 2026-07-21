@@ -1,10 +1,25 @@
 import { ClerkProvider } from '@clerk/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import AuthGate from './components/AuthGate'
 import './styles/globals.css'
+
+// One client for the whole app. Reads are cached for 30s (fresh), kept for 5min
+// after the last observer unmounts, and never refetch just because the window
+// regained focus — this is a single-user ledger, not a live feed.
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,
+      gcTime: 5 * 60_000,
+      refetchOnWindowFocus: false,
+      retry: 1,
+    },
+  },
+})
 
 // Gated: with a publishable key, the app runs behind Clerk sign-in and attaches
 // the session token to API calls. Without one, it renders directly (local dev /
@@ -56,6 +71,8 @@ const tree = publishableKey ? (
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <BrowserRouter>{tree}</BrowserRouter>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>{tree}</BrowserRouter>
+    </QueryClientProvider>
   </React.StrictMode>,
 )

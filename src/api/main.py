@@ -267,6 +267,7 @@ def startup():
         with SessionLocal() as db:
             seed_data(db)
     _maybe_start_plaid_scheduler()        # v8: optional in-process auto-sync
+    _maybe_start_keepalive()              # feature/performance: optional Neon keep-warm
 
 
 # ── Plaid auto-sync scheduler (v8) ─────────────────────────────────────────────
@@ -310,3 +311,48 @@ def _maybe_start_plaid_scheduler() -> None:
         print(f"[plaid] auto-sync scheduler started ({interval} min interval).")
     except Exception as e:
         print(f"[plaid] scheduler not started: {e}")
+
+
+# ── Neon keep-warm ping (feature/performance) ──────────────────────────────────
+# Optional in-process APScheduler job that issues a lightweight `SELECT 1` on an
+# interval to keep Neon's serverless compute from scaling to zero (which is what
+# causes the multi-second cold-start stall on the first request after idle) while
+# THIS server process is alive. GATED like the Plaid scheduler: only starts when
+# the DB is Postgres AND DB_KEEPALIVE_SECONDS is a positive int. On SQLite (local
+# dev + tests, env unset) it NEVER starts, so nothing changes there. LIMITATION:
+# it only keeps Neon warm while this process runs — on a host that itself sleeps
+# (e.g. Render free tier) it does nothing until the instance is back up.
+
+_keepalive_scheduler = None
+
+
+def _maybe_start_keepalive() -> None:
+    global _keepalive_scheduler
+    try:
+        if engine.dialect.name == "sqlite":
+            return  # SQLite (local/tests): never keep-warm
+        raw = (os.getenv("DB_KEEPALIVE_SECONDS") or "").strip()
+        if not raw:
+            return
+        try:
+            seconds = int(raw)
+        except ValueError:
+            return
+        if seconds <= 0:
+            return
+
+        from apscheduler.schedulers.background import BackgroundScheduler
+
+        def _job():
+            try:
+                with SessionLocal() as db:
+                    db.execute(sqlalchemy.text("SELECT 1"))
+            except Exception as e:  # never let a transient DB blip crash the scheduler
+                print(f"[keepalive] ping failed: {e}")
+
+        _keepalive_scheduler = BackgroundScheduler(daemon=True)
+        _keepalive_scheduler.add_job(_job, "interval", seconds=seconds, id="neon_keepalive")
+        _keepalive_scheduler.start()
+        print(f"[keepalive] Neon keep-warm every {seconds}s")
+    except Exception as e:
+        print(f"[keepalive] not started: {e}")

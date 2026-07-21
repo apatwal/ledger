@@ -1,5 +1,6 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Plus, Pencil, Trash2, Search, ChevronLeft, ChevronRight, AlertCircle, Sparkles, EyeOff, ChevronDown, Check } from 'lucide-react'
 import { getTransactions, deleteTransaction, getCategories, getAssistantStatus, categorizeBatch, createRule, applyRules, getDuplicates } from '../lib/api'
 import type { Transaction, TransactionQuery } from '../lib/types'
@@ -7,6 +8,7 @@ import TransactionModal from './TransactionModal'
 import DatePicker from './DatePicker'
 import { todayISO, toISO, addDays } from '../lib/date'
 import { useAccountSelection } from '../lib/accountSelection'
+import { acctKey, invalidateLedger } from '../lib/queryKeys'
 import { iconForCategory } from '../lib/categoryIcons'
 
 // Merchant logo → rounded avatar, falling back to the category glyph when the
@@ -211,17 +213,15 @@ function ExcludeFilter({
 }
 
 export default function Transactions() {
-  const [transactions, setTransactions] = useState<Transaction[]>([])
-  const [categories, setCategories] = useState<string[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
+  const [actionError, setActionError] = useState<string | null>(null)
 
   // Which accounts are in view is driven globally by the header selector.
   const { accountsParam, allSelected, selected } = useAccountSelection()
-  const accountsKey = allSelected ? '__all__' : selected.join(',')
+  const accountsSel = accountsParam()
+  const acctPart = acctKey(accountsSel)
 
   const [offset, setOffset] = useState(0)
-  const [hasMore, setHasMore] = useState(false)
 
   const [searchParams] = useSearchParams()
 
@@ -242,13 +242,11 @@ export default function Transactions() {
   const excludeTypesKey = [...excludeTypes].sort().join(',')
   const excludeCategoriesKey = [...excludeCategories].sort().join(',')
 
-  // Duplicate detection (v7) — ids of rows that belong to a flagged duplicate group,
-  // scanned across the current window/account. `dupOnly` is a client-side quick filter.
-  const [dupIds, setDupIds] = useState<Set<number>>(new Set())
+  // Duplicate detection (v7) — `dupOnly` is a client-side quick filter over ids
+  // of rows that belong to a flagged duplicate group.
   const [dupOnly, setDupOnly] = useState(false)
 
   // AI batch categorize
-  const [aiEnabled, setAiEnabled] = useState(false)
   const [categorizing, setCategorizing] = useState(false)
   const [aiMsg, setAiMsg] = useState<string | null>(null)
 
@@ -263,64 +261,58 @@ export default function Transactions() {
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null)
 
-  const load = useCallback(async (page: number) => {
-    setLoading(true)
-    setError(null)
-    const query: TransactionQuery = {
+  // Build the current query. Every param that changes the result set is also
+  // encoded into the query key below, so cached pages are never shown for the
+  // wrong filter.
+  const query: TransactionQuery = {
+    limit: PAGE_SIZE + 1,
+    offset: offset * PAGE_SIZE,
+  }
+  if (typeFilter) query.type = typeFilter
+  if (categoryFilter) query.category = categoryFilter
+  if (accountsSel) query.accounts = accountsSel
+  if (reviewFilter === 'true') query.needs_review = true
+  if (startDate) query.start_date = startDate
+  if (endDate) query.end_date = endDate
+  if (excludeTypes.size) query.exclude_types = [...excludeTypes]
+  if (excludeCategories.size) query.exclude_categories = [...excludeCategories]
+
+  const listQuery = useQuery({
+    queryKey: ['transactions', 'list', {
+      type: typeFilter || null,
+      category: categoryFilter || null,
+      accounts: acctPart,
+      needs_review: reviewFilter === 'true',
+      start_date: startDate || null,
+      end_date: endDate || null,
+      exclude_types: excludeTypesKey,
+      exclude_categories: excludeCategoriesKey,
       limit: PAGE_SIZE + 1,
-      offset: page * PAGE_SIZE,
-    }
-    if (typeFilter) query.type = typeFilter
-    if (categoryFilter) query.category = categoryFilter
-    const acc = accountsParam()
-    if (acc) query.accounts = acc
-    if (reviewFilter === 'true') query.needs_review = true
-    if (startDate) query.start_date = startDate
-    if (endDate) query.end_date = endDate
-    if (excludeTypes.size) query.exclude_types = [...excludeTypes]
-    if (excludeCategories.size) query.exclude_categories = [...excludeCategories]
+      offset: offset * PAGE_SIZE,
+    }],
+    queryFn: () => getTransactions(query),
+  })
+  const rawRows = listQuery.data ?? []
+  const hasMore = rawRows.length > PAGE_SIZE
+  const transactions = rawRows.slice(0, PAGE_SIZE)
+  const loading = listQuery.isPending
+  const error = actionError ?? (listQuery.error instanceof Error ? listQuery.error.message : listQuery.error ? 'Failed to load transactions' : null)
 
-    try {
-      const rows = await getTransactions(query)
-      setHasMore(rows.length > PAGE_SIZE)
-      setTransactions(rows.slice(0, PAGE_SIZE))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load transactions')
-    } finally {
-      setLoading(false)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [typeFilter, categoryFilter, accountsKey, reviewFilter, startDate, endDate, excludeTypesKey, excludeCategoriesKey])
-
-  useEffect(() => {
-    void load(offset)
-  }, [load, offset])
-
-  // Fetch duplicate groups for the current window/accounts and flatten to an id set.
-  useEffect(() => {
-    let cancelled = false
-    getDuplicates({
-      ...(accountsParam() ? { accounts: accountsParam() } : {}),
+  // Duplicate groups for the current window/accounts, flattened to an id set.
+  // Shares the ['duplicates'] prefix with the dashboard so writes refresh both.
+  const dupIdsQuery = useQuery({
+    queryKey: ['duplicates', 'ids', { start_date: startDate || null, end_date: endDate || null, accounts: acctPart }],
+    queryFn: () => getDuplicates({
+      ...(accountsSel ? { accounts: accountsSel } : {}),
       ...(startDate ? { start_date: startDate } : {}),
       ...(endDate ? { end_date: endDate } : {}),
-    })
-      .then((groups) => {
-        if (cancelled) return
-        setDupIds(new Set(groups.flatMap((g) => g.transactions.map((t) => t.id))))
-      })
-      .catch(() => { if (!cancelled) setDupIds(new Set()) })
-    return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accountsKey, startDate, endDate])
+    }),
+  })
+  const dupIds = new Set((dupIdsQuery.data ?? []).flatMap((g) => g.transactions.map((t) => t.id)))
 
-  useEffect(() => {
-    getCategories()
-      .then(setCategories)
-      .catch(() => { /* ignore */ })
-    getAssistantStatus()
-      .then((s) => setAiEnabled(s.enabled))
-      .catch(() => setAiEnabled(false))
-  }, [])
+  const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: getCategories })
+  const { data: assistantStatus } = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
+  const aiEnabled = assistantStatus?.enabled ?? false
 
   // Persist exclusions whenever they change.
   useEffect(() => { saveExcluded(EXCLUDE_TYPES_KEY, excludeTypes) }, [excludeTypes])
@@ -341,7 +333,8 @@ export default function Transactions() {
         ...(endDate ? { end_date: endDate } : {}),
       })
       setAiMsg(`AI categorized ${results.length} transaction${results.length === 1 ? '' : 's'}.`)
-      void load(offset)
+      void queryClient.invalidateQueries({ queryKey: ['transactions'] })
+      void queryClient.invalidateQueries({ queryKey: ['stats'] })
     } catch (e) {
       setAiMsg(e instanceof Error ? e.message : 'Auto-categorize failed')
     } finally {
@@ -352,7 +345,7 @@ export default function Transactions() {
   // v5.1 — resolve a brokerage row: create a rule (savings=Investment expense, or keep transfer) + apply.
   async function handleBrokerageChoice(tx: Transaction, choice: 'savings' | 'transfer') {
     setBrokerageBusyId(tx.id)
-    setError(null)
+    setActionError(null)
     const token = brokerageToken(tx)
     try {
       await createRule({
@@ -364,9 +357,12 @@ export default function Transactions() {
         set_category: choice === 'savings' ? 'Investment' : null,
       })
       await applyRules({})
-      void load(offset)
+      void queryClient.invalidateQueries({ queryKey: ['rules'] })
+      void queryClient.invalidateQueries({ queryKey: ['transactions'] })
+      void queryClient.invalidateQueries({ queryKey: ['stats'] })
+      void queryClient.invalidateQueries({ queryKey: ['duplicates'] })
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to save your choice')
+      setActionError(e instanceof Error ? e.message : 'Failed to save your choice')
     } finally {
       setBrokerageBusyId(null)
     }
@@ -401,8 +397,9 @@ export default function Transactions() {
   }
 
   function handleApplyFilters() {
+    // Filters are already live (they're in the query key); resetting to page 1
+    // keeps the narrower result set from stranding you on an empty page.
     setOffset(0)
-    void load(0)
   }
 
   function handleClearFilters() {
@@ -428,21 +425,22 @@ export default function Transactions() {
 
   async function handleDelete(id: number) {
     setDeletingId(id)
+    setActionError(null)
     try {
       await deleteTransaction(id)
       setDeleteConfirmId(null)
-      void load(offset)
+      invalidateLedger(queryClient)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed')
+      setActionError(e instanceof Error ? e.message : 'Delete failed')
     } finally {
       setDeletingId(null)
     }
   }
 
   function handleSaved() {
+    // TransactionModal invalidates the ledger on save; just close here.
     setModalOpen(false)
     setEditingTx(null)
-    void load(offset)
   }
 
   // Client-side search filter (description/category/date match)

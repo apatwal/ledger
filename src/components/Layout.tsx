@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
 import { LayoutDashboard, List, Upload, BookText, Wand2, LineChart, PiggyBank } from 'lucide-react'
 import { UserButton } from '@clerk/react'
 import { getHealth } from '../lib/api'
@@ -15,13 +15,9 @@ interface LayoutProps {
 }
 
 export default function Layout({ children }: LayoutProps) {
-  const [online, setOnline] = useState<boolean | null>(null)
-
-  useEffect(() => {
-    getHealth()
-      .then(() => setOnline(true))
-      .catch(() => setOnline(false))
-  }, [])
+  // Health ping — cached; null while connecting, true when synced, false offline.
+  const health = useQuery({ queryKey: ['health'], queryFn: getHealth })
+  const online: boolean | null = health.isSuccess ? true : health.isError ? false : null
 
   return (
     <div className="app-layout">

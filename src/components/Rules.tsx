@@ -1,4 +1,5 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Plus, Pencil, Trash2, X, Wand2, AlertCircle, Check } from 'lucide-react'
 import {
   getRules,
@@ -24,9 +25,14 @@ function actionsSummary(r: Rule): string {
 }
 
 export default function Rules() {
-  const [rules, setRules] = useState<Rule[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
+  const rulesQuery = useQuery({ queryKey: ['rules'], queryFn: () => getRules() })
+  const rules = rulesQuery.data ?? []
+  const loading = rulesQuery.isPending
+  const [actionError, setActionError] = useState<string | null>(null)
+  const error = actionError ?? (rulesQuery.error instanceof Error ? rulesQuery.error.message : rulesQuery.error ? 'Failed to load rules' : null)
+
+  const invalidateRules = () => { void queryClient.invalidateQueries({ queryKey: ['rules'] }) }
 
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState<Rule | null>(null)
@@ -37,29 +43,14 @@ export default function Rules() {
   const [applying, setApplying] = useState(false)
   const [applyMsg, setApplyMsg] = useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      setRules(await getRules())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load rules')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void load()
-  }, [load])
-
   async function handleToggle(rule: Rule) {
     setBusyId(rule.id)
+    setActionError(null)
     try {
       await updateRule(rule.id, { enabled: !rule.enabled })
-      await load()
+      invalidateRules()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to update rule')
+      setActionError(e instanceof Error ? e.message : 'Failed to update rule')
     } finally {
       setBusyId(null)
     }
@@ -67,12 +58,13 @@ export default function Rules() {
 
   async function handleDelete(id: number) {
     setBusyId(id)
+    setActionError(null)
     try {
       await deleteRule(id)
       setDeleteConfirmId(null)
-      await load()
+      invalidateRules()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed')
+      setActionError(e instanceof Error ? e.message : 'Delete failed')
     } finally {
       setBusyId(null)
     }
@@ -84,6 +76,11 @@ export default function Rules() {
     try {
       const { updated } = await applyRules({})
       setApplyMsg(`Re-applied rules — ${updated} transaction${updated === 1 ? '' : 's'} updated.`)
+      // Applying rules rewrites transactions → their categories/types and every
+      // derived stat may have changed.
+      void queryClient.invalidateQueries({ queryKey: ['transactions'] })
+      void queryClient.invalidateQueries({ queryKey: ['stats'] })
+      void queryClient.invalidateQueries({ queryKey: ['duplicates'] })
     } catch (e) {
       setApplyMsg(e instanceof Error ? e.message : 'Failed to apply rules')
     } finally {
@@ -209,7 +206,7 @@ export default function Rules() {
         <RuleModal
           rule={editing}
           onClose={() => setModalOpen(false)}
-          onSaved={() => { setModalOpen(false); void load() }}
+          onSaved={() => { setModalOpen(false); invalidateRules() }}
         />
       )}
     </div>
@@ -233,16 +230,11 @@ function RuleModal({ rule, onClose, onSaved }: { rule: Rule | null; onClose: () 
   const [setCategory, setSetCategory] = useState(rule?.set_category ?? '')
   const [setAccount, setSetAccount] = useState(rule?.set_account ?? '')
 
-  const [categories, setCategories] = useState<string[]>([])
-  const [accounts, setAccounts] = useState<string[]>([])
+  const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: getCategories })
+  const { data: accounts = [] } = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [matchCount, setMatchCount] = useState<number | null>(null)
-
-  useEffect(() => {
-    getCategories().then(setCategories).catch(() => { /* ignore */ })
-    getAccounts().then(setAccounts).catch(() => { /* ignore */ })
-  }, [])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }

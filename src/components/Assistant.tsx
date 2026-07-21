@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Sparkles, X, ArrowUp, Check, ArrowRight } from 'lucide-react'
 import { getAssistantStatus, assistantBudget } from '../lib/api'
 import type { ChatMessage, BudgetChatResponse } from '../lib/types'
@@ -37,7 +38,7 @@ function hasCreations(c?: BudgetChatResponse['created']): boolean {
 }
 
 export default function Assistant() {
-  const [enabled, setEnabled] = useState(false)
+  const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [entries, setEntries] = useState<ChatEntry[]>([])
   const [input, setInput] = useState('')
@@ -47,11 +48,8 @@ export default function Assistant() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  useEffect(() => {
-    getAssistantStatus()
-      .then((s) => setEnabled(s.enabled))
-      .catch(() => setEnabled(false))
-  }, [])
+  const { data: status } = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
+  const enabled = status?.enabled ?? false
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
@@ -75,6 +73,8 @@ export default function Assistant() {
       const history: ChatMessage[] = next.map((e) => ({ role: e.role, content: e.content }))
       const res = await assistantBudget(history)
       setEntries([...next, { role: 'assistant', content: res.reply, created: res.created }])
+      // The assistant may have created goals/limits — refresh the Budget views.
+      if (hasCreations(res.created)) void queryClient.invalidateQueries({ queryKey: ['budgets'] })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Something went wrong')
     } finally {

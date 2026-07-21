@@ -1,7 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { TrendingUp, LineChart } from 'lucide-react'
 import { getHoldings } from '../lib/api'
-import type { Holding } from '../lib/types'
 
 function fmtMoney(n: number | null | undefined, currency?: string | null): string {
   if (n === null || n === undefined) return '—'
@@ -22,25 +21,16 @@ function fmtQty(n: number | null | undefined): string {
 }
 
 export default function Holdings() {
-  const [holdings, setHoldings] = useState<Holding[]>([])
-  const [loading, setLoading] = useState(true)
-  // `disabled` = Plaid isn't configured (503); distinct from "no holdings yet".
-  const [disabled, setDisabled] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    getHoldings()
-      .then((rows) => { if (!cancelled) setHoldings(rows) })
-      .catch((e: unknown) => {
-        if (cancelled) return
-        const msg = e instanceof Error ? e.message : ''
-        if (msg.startsWith('503')) setDisabled(true)
-        else setError(msg || 'Could not load holdings')
-      })
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [])
+  const { data: holdings = [], isPending, error: queryError } = useQuery({
+    queryKey: ['plaid', 'holdings'],
+    queryFn: getHoldings,
+  })
+  const loading = isPending
+  // A 503 means Plaid isn't configured — a "feature off" state, distinct from a
+  // real error or "no holdings yet".
+  const errMsg = queryError instanceof Error ? queryError.message : queryError ? 'Could not load holdings' : null
+  const disabled = errMsg?.startsWith('503') ?? false
+  const error = disabled ? null : errMsg
 
   const total = holdings.reduce((sum, h) => sum + (h.value ?? 0), 0)
 

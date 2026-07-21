@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { usePlaidLink } from 'react-plaid-link'
 import type { PlaidLinkOnSuccessMetadata } from 'react-plaid-link'
 import {
@@ -19,7 +20,8 @@ import {
   plaidSync,
   deletePlaidItem,
 } from '../lib/api'
-import type { PlaidStatus, PlaidItem, PlaidSyncResult } from '../lib/types'
+import type { PlaidItem, PlaidSyncResult } from '../lib/types'
+import { invalidateLedger } from '../lib/queryKeys'
 
 // Human-friendly "last synced" — relative for recent, absolute for older.
 function formatSynced(iso: string | null): string {
@@ -62,9 +64,13 @@ function syncSummary(r: PlaidSyncResult): string {
 }
 
 export default function PlaidConnect() {
-  const [status, setStatus] = useState<PlaidStatus | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
+  const statusQuery = useQuery({ queryKey: ['plaid', 'status'], queryFn: getPlaidStatus })
+  const status = statusQuery.data ?? null
+  const loading = statusQuery.isPending
+  const [actionError, setActionError] = useState<string | null>(null)
+  const error = actionError
+    ?? (statusQuery.error instanceof Error ? statusQuery.error.message : statusQuery.error ? 'Could not load bank sync status' : null)
 
   // Link flow
   const [linkToken, setLinkToken] = useState<string | null>(null)
@@ -78,19 +84,9 @@ export default function PlaidConnect() {
   const [removingId, setRemovingId] = useState<number | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
 
-  const refresh = useCallback(async () => {
-    try {
-      const s = await getPlaidStatus()
-      setStatus(s)
-      setError(null)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not load bank sync status')
-    }
-  }, [])
-
-  useEffect(() => {
-    void refresh().finally(() => setLoading(false))
-  }, [refresh])
+  // Bank sync mutates the ledger (transactions, accounts, holdings) and the plaid
+  // status itself — refresh everything via prefix invalidation.
+  const refresh = useCallback(() => { invalidateLedger(queryClient) }, [queryClient])
 
   // ─── Link success → exchange → first sync ──────────────────────────────────
   const onLinkSuccess = useCallback(
@@ -98,14 +94,14 @@ export default function PlaidConnect() {
       setLinkToken(null)
       setFinishing(true)
       setMsg(null)
-      setError(null)
+      setActionError(null)
       try {
         const item = await exchangePlaidPublicToken(publicToken)
         const res = await plaidSync(item.id)
         setMsg(`Connected ${item.institution_name ?? 'your bank'}. ${syncSummary(res)}`)
-        await refresh()
+        refresh()
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not finish connecting your bank')
+        setActionError(e instanceof Error ? e.message : 'Could not finish connecting your bank')
       } finally {
         setFinishing(false)
       }
@@ -134,14 +130,14 @@ export default function PlaidConnect() {
 
   async function handleConnect() {
     setPreparing(true)
-    setError(null)
+    setActionError(null)
     setMsg(null)
     try {
       const { link_token } = await createPlaidLinkToken()
       shouldOpen.current = true
       setLinkToken(link_token)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not start bank connection')
+      setActionError(e instanceof Error ? e.message : 'Could not start bank connection')
     } finally {
       setPreparing(false)
     }
@@ -149,14 +145,14 @@ export default function PlaidConnect() {
 
   async function handleSync(itemId?: number) {
     setSyncingId(itemId ?? 'all')
-    setError(null)
+    setActionError(null)
     setMsg(null)
     try {
       const res = await plaidSync(itemId)
       setMsg(syncSummary(res))
-      await refresh()
+      refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Sync failed')
+      setActionError(e instanceof Error ? e.message : 'Sync failed')
     } finally {
       setSyncingId(null)
     }
@@ -164,15 +160,15 @@ export default function PlaidConnect() {
 
   async function handleDisconnect(id: number) {
     setRemovingId(id)
-    setError(null)
+    setActionError(null)
     setMsg(null)
     try {
       await deletePlaidItem(id)
       setConfirmId(null)
       setMsg('Bank disconnected. Its imported transactions were kept.')
-      await refresh()
+      refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not disconnect')
+      setActionError(e instanceof Error ? e.message : 'Could not disconnect')
     } finally {
       setRemovingId(null)
     }
