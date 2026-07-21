@@ -1,8 +1,11 @@
 name: E2E
 
-# Run the Playwright end-to-end suite on every push to main.
+# Run the Playwright end-to-end suite on every push to main, and on PRs
+# targeting main (so breakage is caught before merge, not after).
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   workflow_dispatch: {} # allow manual runs from the Actions tab
 
