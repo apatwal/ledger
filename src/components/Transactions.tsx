@@ -1,11 +1,36 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Plus, Pencil, Trash2, Search, ChevronLeft, ChevronRight, AlertCircle, Sparkles } from 'lucide-react'
-import { getTransactions, deleteTransaction, getCategories, getAccounts, getAssistantStatus, categorizeBatch, createRule, applyRules, getDuplicates } from '../lib/api'
+import { Plus, Pencil, Trash2, Search, ChevronLeft, ChevronRight, AlertCircle, Sparkles, EyeOff, ChevronDown, Check } from 'lucide-react'
+import { getTransactions, deleteTransaction, getCategories, getAssistantStatus, categorizeBatch, createRule, applyRules, getDuplicates } from '../lib/api'
 import type { Transaction, TransactionQuery } from '../lib/types'
 import TransactionModal from './TransactionModal'
 import DatePicker from './DatePicker'
 import { todayISO, toISO, addDays } from '../lib/date'
+import { useAccountSelection } from '../lib/accountSelection'
+import { iconForCategory } from '../lib/categoryIcons'
+
+// Merchant logo → rounded avatar, falling back to the category glyph when the
+// logo is missing or fails to load.
+function MerchantAvatar({ tx }: { tx: Transaction }) {
+  const [broken, setBroken] = useState(false)
+  const Icon = iconForCategory(tx.category)
+  if (tx.logo_url && !broken) {
+    return (
+      <img
+        className="merchant-logo"
+        src={tx.logo_url}
+        alt=""
+        loading="lazy"
+        onError={() => setBroken(true)}
+      />
+    )
+  }
+  return (
+    <span className="merchant-logo merchant-logo-fallback" aria-hidden="true">
+      <Icon size={13} />
+    </span>
+  )
+}
 
 // Default filter window: the last 30 days (matches the Dashboard default).
 const DEFAULT_END = todayISO()
@@ -31,12 +56,169 @@ function fmt(n: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 }
 
+// ─── Exclude filter (v10) ──────────────────────────────────────────────────
+// Lets the ledger hide whole transaction TYPES and/or CATEGORIES. The checked
+// sets are sent as `exclude_types` / `exclude_categories` so the server hides
+// them across pagination, and persisted to localStorage so the choice sticks.
+const EXCLUDE_TYPES_KEY = 'expense.excludeTypes'
+const EXCLUDE_CATEGORIES_KEY = 'expense.excludeCategories'
+
+const TYPE_OPTIONS: { value: 'income' | 'expense' | 'transfer' | 'refund'; label: string }[] = [
+  { value: 'income', label: 'Income' },
+  { value: 'expense', label: 'Expense' },
+  { value: 'transfer', label: 'Transfer' },
+  { value: 'refund', label: 'Refund' },
+]
+
+function loadExcluded(key: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return new Set()
+    const arr = JSON.parse(raw) as unknown
+    return new Set(Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function saveExcluded(key: string, set: Set<string>) {
+  try {
+    localStorage.setItem(key, JSON.stringify([...set]))
+  } catch {
+    /* storage unavailable — exclusions just won't persist */
+  }
+}
+
+// Dropdown that mirrors the account multi-select: check items to EXCLUDE them.
+function ExcludeFilter({
+  categories,
+  excludedTypes,
+  excludedCategories,
+  onToggleType,
+  onToggleCategory,
+  onClear,
+}: {
+  categories: string[]
+  excludedTypes: Set<string>
+  excludedCategories: Set<string>
+  onToggleType: (value: string) => void
+  onToggleCategory: (value: string) => void
+  onClear: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    function onDown(e: MouseEvent) {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  const count = excludedTypes.size + excludedCategories.size
+  const label = count === 0 ? 'Nothing hidden' : `${count} hidden`
+
+  return (
+    <div className="exclude-filter" ref={rootRef}>
+      <button
+        type="button"
+        className={`exclude-trigger${open ? ' open' : ''}`}
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        title="Hide certain transaction types or categories from the ledger"
+      >
+        <EyeOff size={14} />
+        <span className="exclude-trigger-label">{label}</span>
+        {count > 0 && <span className="exclude-count">{count}</span>}
+        <ChevronDown size={14} className="exclude-caret" />
+      </button>
+
+      {open && (
+        <div className="exclude-popover" role="listbox" aria-multiselectable="true">
+          <div className="exclude-actions">
+            <span className="exclude-hint">Check to hide</span>
+            {count > 0 && (
+              <>
+                <span className="exclude-dot">·</span>
+                <button type="button" className="exclude-action" onClick={onClear}>Clear</button>
+              </>
+            )}
+          </div>
+
+          <div className="exclude-group-label">Types</div>
+          <div className="exclude-list">
+            {TYPE_OPTIONS.map((t) => {
+              const on = excludedTypes.has(t.value)
+              return (
+                <button
+                  key={t.value}
+                  type="button"
+                  role="option"
+                  aria-selected={on}
+                  className={`exclude-row${on ? ' on' : ''}`}
+                  onClick={() => onToggleType(t.value)}
+                >
+                  <span className={`exclude-check${on ? ' on' : ''}`}>
+                    {on && <Check size={11} strokeWidth={3} />}
+                  </span>
+                  <span className="exclude-name">{t.label}</span>
+                </button>
+              )
+            })}
+          </div>
+
+          {categories.length > 0 && (
+            <>
+              <div className="exclude-group-label">Categories</div>
+              <div className="exclude-list">
+                {categories.map((c) => {
+                  const on = excludedCategories.has(c)
+                  const Icon = iconForCategory(c)
+                  return (
+                    <button
+                      key={c}
+                      type="button"
+                      role="option"
+                      aria-selected={on}
+                      className={`exclude-row${on ? ' on' : ''}`}
+                      onClick={() => onToggleCategory(c)}
+                    >
+                      <span className={`exclude-check${on ? ' on' : ''}`}>
+                        {on && <Check size={11} strokeWidth={3} />}
+                      </span>
+                      <Icon size={14} className="exclude-row-icon" />
+                      <span className="exclude-name">{c}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Transactions() {
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [categories, setCategories] = useState<string[]>([])
-  const [accounts, setAccounts] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
+  // Which accounts are in view is driven globally by the header selector.
+  const { accountsParam, allSelected, selected } = useAccountSelection()
+  const accountsKey = allSelected ? '__all__' : selected.join(',')
 
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
@@ -47,11 +229,18 @@ export default function Transactions() {
   const [search, setSearch] = useState('')
   const [typeFilter, setTypeFilter] = useState<'' | 'income' | 'expense' | 'transfer' | 'refund'>('')
   const [categoryFilter, setCategoryFilter] = useState('')
-  const [accountFilter, setAccountFilter] = useState('')
   // '' = all, 'true' = only needs-review (deep-linkable via ?needs_review=true)
   const [reviewFilter, setReviewFilter] = useState<'' | 'true'>(searchParams.get('needs_review') === 'true' ? 'true' : '')
   const [startDate, setStartDate] = useState(DEFAULT_START)
   const [endDate, setEndDate] = useState(DEFAULT_END)
+
+  // Exclude filter (v10) — hide whole types/categories server-side. Restored
+  // from localStorage on mount and persisted on change (like the account picker).
+  const [excludeTypes, setExcludeTypes] = useState<Set<string>>(() => loadExcluded(EXCLUDE_TYPES_KEY))
+  const [excludeCategories, setExcludeCategories] = useState<Set<string>>(() => loadExcluded(EXCLUDE_CATEGORIES_KEY))
+  // Stable primitive keys for effect deps (Sets are re-created each toggle).
+  const excludeTypesKey = [...excludeTypes].sort().join(',')
+  const excludeCategoriesKey = [...excludeCategories].sort().join(',')
 
   // Duplicate detection (v7) — ids of rows that belong to a flagged duplicate group,
   // scanned across the current window/account. `dupOnly` is a client-side quick filter.
@@ -83,10 +272,13 @@ export default function Transactions() {
     }
     if (typeFilter) query.type = typeFilter
     if (categoryFilter) query.category = categoryFilter
-    if (accountFilter) query.account = accountFilter
+    const acc = accountsParam()
+    if (acc) query.accounts = acc
     if (reviewFilter === 'true') query.needs_review = true
     if (startDate) query.start_date = startDate
     if (endDate) query.end_date = endDate
+    if (excludeTypes.size) query.exclude_types = [...excludeTypes]
+    if (excludeCategories.size) query.exclude_categories = [...excludeCategories]
 
     try {
       const rows = await getTransactions(query)
@@ -97,17 +289,18 @@ export default function Transactions() {
     } finally {
       setLoading(false)
     }
-  }, [typeFilter, categoryFilter, accountFilter, reviewFilter, startDate, endDate])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [typeFilter, categoryFilter, accountsKey, reviewFilter, startDate, endDate, excludeTypesKey, excludeCategoriesKey])
 
   useEffect(() => {
     void load(offset)
   }, [load, offset])
 
-  // Fetch duplicate groups for the current window/account and flatten to an id set.
+  // Fetch duplicate groups for the current window/accounts and flatten to an id set.
   useEffect(() => {
     let cancelled = false
     getDuplicates({
-      ...(accountFilter ? { account: accountFilter } : {}),
+      ...(accountsParam() ? { accounts: accountsParam() } : {}),
       ...(startDate ? { start_date: startDate } : {}),
       ...(endDate ? { end_date: endDate } : {}),
     })
@@ -117,28 +310,33 @@ export default function Transactions() {
       })
       .catch(() => { if (!cancelled) setDupIds(new Set()) })
     return () => { cancelled = true }
-  }, [accountFilter, startDate, endDate])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountsKey, startDate, endDate])
 
   useEffect(() => {
     getCategories()
       .then(setCategories)
-      .catch(() => { /* ignore */ })
-    getAccounts()
-      .then(setAccounts)
       .catch(() => { /* ignore */ })
     getAssistantStatus()
       .then((s) => setAiEnabled(s.enabled))
       .catch(() => setAiEnabled(false))
   }, [])
 
+  // Persist exclusions whenever they change.
+  useEffect(() => { saveExcluded(EXCLUDE_TYPES_KEY, excludeTypes) }, [excludeTypes])
+  useEffect(() => { saveExcluded(EXCLUDE_CATEGORIES_KEY, excludeCategories) }, [excludeCategories])
+
   async function handleAutoCategorize() {
     setCategorizing(true)
     setAiMsg(null)
     try {
-      // Target the current view's window/account; only uncategorized/needs-review rows.
+      // Target the current view's window; only uncategorized/needs-review rows.
+      // The batch endpoint takes a single account, so scope to it only when the
+      // global selection has narrowed to exactly one.
+      const singleAccount = !allSelected && selected.length === 1 ? selected[0] : undefined
       const { results } = await categorizeBatch({
         only_uncategorized: true,
-        ...(accountFilter ? { account: accountFilter } : {}),
+        ...(singleAccount ? { account: singleAccount } : {}),
         ...(startDate ? { start_date: startDate } : {}),
         ...(endDate ? { end_date: endDate } : {}),
       })
@@ -174,6 +372,34 @@ export default function Transactions() {
     }
   }
 
+  // Toggle a single type/category in the exclude set. Reset to page 1 so the
+  // narrower result set doesn't leave you stranded on an empty page.
+  function toggleExcludeType(value: string) {
+    setExcludeTypes((prev) => {
+      const next = new Set(prev)
+      if (next.has(value)) next.delete(value)
+      else next.add(value)
+      return next
+    })
+    setOffset(0)
+  }
+
+  function toggleExcludeCategory(value: string) {
+    setExcludeCategories((prev) => {
+      const next = new Set(prev)
+      if (next.has(value)) next.delete(value)
+      else next.add(value)
+      return next
+    })
+    setOffset(0)
+  }
+
+  function clearExclusions() {
+    setExcludeTypes(new Set())
+    setExcludeCategories(new Set())
+    setOffset(0)
+  }
+
   function handleApplyFilters() {
     setOffset(0)
     void load(0)
@@ -182,7 +408,6 @@ export default function Transactions() {
   function handleClearFilters() {
     setTypeFilter('')
     setCategoryFilter('')
-    setAccountFilter('')
     setReviewFilter('')
     setStartDate(DEFAULT_START)
     setEndDate(DEFAULT_END)
@@ -284,15 +509,6 @@ export default function Transactions() {
             </select>
           </div>
           <div>
-            <label htmlFor="f-account">Account / Card</label>
-            <select id="f-account" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
-              <option value="">All cards</option>
-              {accounts.map((a) => (
-                <option key={a} value={a}>{a}</option>
-              ))}
-            </select>
-          </div>
-          <div>
             <label htmlFor="f-review">Review</label>
             <select id="f-review" value={reviewFilter} onChange={(e) => setReviewFilter(e.target.value as '' | 'true')}>
               <option value="">All rows</option>
@@ -312,6 +528,17 @@ export default function Transactions() {
               </select>
             </div>
           )}
+          <div>
+            <label>Exclude</label>
+            <ExcludeFilter
+              categories={categories}
+              excludedTypes={excludeTypes}
+              excludedCategories={excludeCategories}
+              onToggleType={toggleExcludeType}
+              onToggleCategory={toggleExcludeCategory}
+              onClear={clearExclusions}
+            />
+          </div>
           <div>
             <label htmlFor="f-start">From date</label>
             <DatePicker
@@ -429,6 +656,14 @@ export default function Transactions() {
                           duplicate
                         </span>
                       )}
+                      {tx.pending && (
+                        <span
+                          className="badge badge-pending"
+                          title="This charge is still pending and may change or disappear"
+                        >
+                          pending
+                        </span>
+                      )}
                     </div>
                     {isBrokerageReview(tx) && (
                       <div className="brokerage-choice">
@@ -456,14 +691,29 @@ export default function Transactions() {
                       </div>
                     )}
                   </td>
-                  <td>{tx.category}</td>
+                  <td>
+                    {(() => {
+                      const CatIcon = iconForCategory(tx.category)
+                      return (
+                        <span className="cat-cell">
+                          <CatIcon size={14} className="cat-cell-icon" />
+                          {tx.category}
+                        </span>
+                      )
+                    })()}
+                  </td>
                   <td>
                     {tx.account
                       ? <span className="badge badge-account">{tx.account}</span>
                       : <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>Unassigned</span>}
                   </td>
-                  <td style={{ color: 'var(--text-muted)', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {tx.description ?? <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>—</span>}
+                  <td style={{ maxWidth: 240 }}>
+                    <span className="merchant-cell">
+                      <MerchantAvatar tx={tx} />
+                      <span className="merchant-cell-text" title={tx.merchant_name ?? tx.description ?? undefined}>
+                        {tx.merchant_name ?? tx.description ?? <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>—</span>}
+                      </span>
+                    </span>
                   </td>
                   <td className="num" style={{ fontWeight: 600 }}>
                     <span

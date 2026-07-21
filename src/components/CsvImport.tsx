@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { Upload, Download, FileText, CheckCircle, AlertTriangle, XCircle, X, ArrowLeftRight, CreditCard, Eye, Sparkles, History, Trash2, Check, Landmark } from 'lucide-react'
 import { importCsv, getCsvTemplateUrl, getAccounts, getAssistantStatus, categorizeBatch, getImports, reassignImport, deleteImport } from '../lib/api'
 import type { CsvImportResult, ImportBatch, StatementType } from '../lib/types'
+import PlaidConnect from './PlaidConnect'
 
 // Lightweight client-side peek: does the file look like a bank/checking export
 // (a header row with a running-balance / balance column)? If so, pre-select "bank".
@@ -163,19 +164,34 @@ export default function CsvImport() {
 
   return (
     <div>
-      <div className="page-header" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-        <div>
-          <div className="page-eyebrow">Bulk entry</div>
-          <h1 className="page-title">Import from CSV</h1>
-          <p className="page-subtitle">Post many entries to the ledger at once.</p>
-        </div>
+      <div className="page-header">
+        <div className="page-eyebrow">Bulk entry</div>
+        <h1 className="page-title">Import transactions</h1>
+        <p className="page-subtitle">Connect a bank for automatic sync, or import a CSV.</p>
+      </div>
+
+      {/* Bank sync (v8) */}
+      <div className="import-section-label">
+        <Landmark size={14} />
+        Connect a bank (auto-sync)
+      </div>
+      <div style={{ marginBottom: 24 }}>
+        <PlaidConnect />
+      </div>
+
+      {/* CSV import */}
+      <div className="import-section-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          <FileText size={14} />
+          Or import a CSV
+        </span>
         <a
           href={getCsvTemplateUrl()}
           download
-          className="btn btn-secondary"
-          style={{ textDecoration: 'none' }}
+          className="btn btn-secondary btn-sm"
+          style={{ textDecoration: 'none', textTransform: 'none', letterSpacing: 0 }}
         >
-          <Download size={15} />
+          <Download size={14} />
           Download template
         </a>
       </div>

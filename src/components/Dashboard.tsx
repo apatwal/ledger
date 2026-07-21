@@ -20,7 +20,6 @@ import {
   getStatsByCategory,
   getStatsOverTime,
   getStatsByAccount,
-  getAccounts,
   getInsights,
   getAssistantStatus,
   getDuplicates,
@@ -28,6 +27,8 @@ import {
 import type { StatsSummary, StatsByCategory, StatsOverTime, AccountStat, Granularity, DuplicateGroup } from '../lib/types'
 import DatePicker from './DatePicker'
 import DuplicatesModal from './DuplicatesModal'
+import { useAccountSelection } from '../lib/accountSelection'
+import { iconForCategory } from '../lib/categoryIcons'
 
 // Ledger palette — inks, greens, ochres pulled from the design system.
 const PIE_COLORS = [
@@ -138,9 +139,9 @@ export default function Dashboard() {
   const [granularity, setGranularity] = useState<Granularity>(initial.granularity)
   const [activePreset, setActivePreset] = useState<PresetKey | null>('30d')
 
-  // Account filter: '' = All cards (aggregate across everything).
-  const [accountFilter, setAccountFilter] = useState('')
-  const [accounts, setAccounts] = useState<string[]>([])
+  // Which accounts are in view is driven globally by the header selector.
+  const { accountsParam, isSelected, toggle, balanceOf, allSelected, selected } = useAccountSelection()
+  const accountsKey = allSelected ? '__all__' : selected.join(',')
 
   const [summary, setSummary] = useState<StatsSummary | null>(null)
   const [byCategory, setByCategory] = useState<StatsByCategory[]>([])
@@ -163,9 +164,6 @@ export default function Dashboard() {
     getAssistantStatus()
       .then((s) => setAiEnabled(s.enabled))
       .catch(() => setAiEnabled(false))
-    getAccounts()
-      .then(setAccounts)
-      .catch(() => { /* no accounts yet */ })
   }, [])
 
   const loadInsights = useCallback(async () => {
@@ -191,11 +189,12 @@ export default function Dashboard() {
     setLoading(true)
     setError(null)
     try {
-      // account filter drives the headline stats; '' => omit (aggregate all).
+      // The global account selection drives the headline stats; when all are
+      // selected `accountsParam()` is undefined → server aggregates everything.
       const params = {
         start_date: startDate,
         end_date: endDate,
-        ...(accountFilter ? { account: accountFilter } : {}),
+        accounts: accountsParam(),
       }
       // by-account is the per-card breakdown — always across all cards (date range only).
       const [s, cat, ot, acct] = await Promise.all([
@@ -213,17 +212,18 @@ export default function Dashboard() {
     } finally {
       setLoading(false)
     }
-  }, [startDate, endDate, granularity, accountFilter])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startDate, endDate, granularity, accountsKey])
 
   useEffect(() => {
     void loadData()
   }, [loadData])
 
-  // Duplicate params track the same window/account as the headline stats.
+  // Duplicate params track the same window/accounts as the headline stats.
   const dupParams = {
     start_date: startDate,
     end_date: endDate,
-    ...(accountFilter ? { account: accountFilter } : {}),
+    accounts: accountsParam(),
   }
 
   const loadDuplicates = useCallback(async () => {
@@ -231,13 +231,14 @@ export default function Dashboard() {
       const rows = await getDuplicates({
         start_date: startDate,
         end_date: endDate,
-        ...(accountFilter ? { account: accountFilter } : {}),
+        accounts: accountsParam(),
       })
       setDuplicates(rows)
     } catch {
       setDuplicates([]) // non-critical — never block the dashboard on this
     }
-  }, [startDate, endDate, accountFilter])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startDate, endDate, accountsKey])
 
   useEffect(() => {
     void loadDuplicates()
@@ -304,20 +305,6 @@ export default function Dashboard() {
               {g.charAt(0).toUpperCase() + g.slice(1)}
             </button>
           ))}
-        </div>
-        <div className="filter-group">
-          <label className="filter-label" htmlFor="dash-account">Card</label>
-          <select
-            id="dash-account"
-            className="filter-select"
-            value={accountFilter}
-            onChange={(e) => setAccountFilter(e.target.value)}
-          >
-            <option value="">All cards</option>
-            {accounts.map((a) => (
-              <option key={a} value={a}>{a}</option>
-            ))}
-          </select>
         </div>
         <button className="btn btn-primary btn-sm" onClick={() => void loadData()}>
           Refresh
@@ -417,22 +404,25 @@ export default function Dashboard() {
             <section className="bycard">
               <div className="bycard-head">
                 <div className="chart-title">Spending by card</div>
-                <span className="chart-note">{byAccount.length} account{byAccount.length === 1 ? '' : 's'} · click to filter</span>
+                <span className="chart-note">{byAccount.length} account{byAccount.length === 1 ? '' : 's'} · click to toggle</span>
               </div>
               <div className="bycard-list">
                 {(() => {
                   const maxExpense = Math.max(...byAccount.map((a) => a.expense), 1)
                   return byAccount.map((a) => {
-                    const active = accountFilter === a.account
+                    // Clicking a card toggles its membership in the global selection.
+                    const on = isSelected(a.account)
                     const pct = Math.round((a.expense / maxExpense) * 100)
+                    const bal = balanceOf(a.account)
+                    const balAmt = bal?.current ?? bal?.available
                     return (
                       <button
                         key={a.account}
                         type="button"
-                        className={`bycard-row${active ? ' active' : ''}`}
-                        onClick={() => setAccountFilter(active ? '' : a.account)}
-                        aria-pressed={active}
-                        title={active ? 'Clear card filter' : `Filter dashboard to ${a.account}`}
+                        className={`bycard-row${on ? ' active' : ' off'}`}
+                        onClick={() => toggle(a.account)}
+                        aria-pressed={on}
+                        title={on ? `Hide ${a.account} everywhere` : `Show ${a.account} again`}
                       >
                         <div className="bycard-row-top">
                           <span className="bycard-name">{a.account}</span>
@@ -444,7 +434,9 @@ export default function Dashboard() {
                         <div className="bycard-meta">
                           <span>Income {fmt(a.income)}</span>
                           <span className={a.net >= 0 ? 'pos' : 'neg'}>Net {fmtSigned(a.net)}</span>
-                          <span>{a.count} {a.count === 1 ? 'entry' : 'entries'}</span>
+                          {balAmt !== null && balAmt !== undefined
+                            ? <span>Balance {fmt(balAmt)}</span>
+                            : <span>{a.count} {a.count === 1 ? 'entry' : 'entries'}</span>}
                         </div>
                       </button>
                     )
@@ -554,7 +546,14 @@ export default function Dashboard() {
                     </Pie>
                     <Tooltip content={<PieTooltip />} />
                     <Legend
-                      formatter={(value) => <span style={{ fontSize: 12, color: C.inkFaint }}>{value}</span>}
+                      formatter={(value) => {
+                        const Icon = iconForCategory(String(value))
+                        return (
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: C.inkFaint, verticalAlign: 'middle' }}>
+                            <Icon size={12} /> {value}
+                          </span>
+                        )
+                      }}
                     />
                   </PieChart>
                 </ResponsiveContainer>

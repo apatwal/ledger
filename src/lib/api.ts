@@ -25,9 +25,24 @@ import type {
   ReassignImportResult,
   DuplicateGroup,
   DismissDuplicatesResult,
+  PlaidStatus,
+  PlaidItem,
+  PlaidSyncResult,
+  Holding,
+  CategoryBudget,
+  CategoryBudgetInput,
+  CategoryBudgetUpdate,
+  SavingsGoal,
+  SavingsGoalInput,
+  SavingsGoalUpdate,
+  BudgetChatResponse,
 } from './types'
 
 const BASE = '/api'
+
+// A query value can be a scalar, or a string[] (serialized comma-joined, e.g. `accounts`).
+type QueryValue = string | number | boolean | string[] | undefined
+type QueryParams = Record<string, QueryValue>
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -41,10 +56,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-function toQuery(params: Record<string, string | number | boolean | undefined>): string {
+function toQuery(params: QueryParams): string {
   const q = new URLSearchParams()
   for (const [key, val] of Object.entries(params)) {
-    if (val !== undefined && val !== null && val !== '') {
+    if (val === undefined || val === null || val === '') continue
+    if (Array.isArray(val)) {
+      // `accounts` and friends → comma-joined; empty arrays are omitted (means "all").
+      if (val.length) q.set(key, val.join(','))
+    } else {
       q.set(key, String(val))
     }
   }
@@ -55,7 +74,9 @@ function toQuery(params: Record<string, string | number | boolean | undefined>):
 // ─── Transactions ─────────────────────────────────────────────────────────────
 
 export async function getTransactions(query?: TransactionQuery): Promise<Transaction[]> {
-  const qs = toQuery(query as Record<string, string | number | boolean | undefined> ?? {})
+  // `accounts`, `exclude_types` and `exclude_categories` are string[] — toQuery
+  // serializes them comma-joined and omits empty arrays.
+  const qs = toQuery((query as QueryParams) ?? {})
   return request<Transaction[]>(`/transactions${qs}`)
 }
 
@@ -130,8 +151,9 @@ export async function getDuplicates(params?: {
   start_date?: string
   end_date?: string
   account?: string
+  accounts?: string[]
 }): Promise<DuplicateGroup[]> {
-  const qs = toQuery(params as Record<string, string | number | boolean | undefined> ?? {})
+  const qs = toQuery((params as QueryParams) ?? {})
   return request<DuplicateGroup[]>(`/duplicates${qs}`)
 }
 
@@ -142,23 +164,69 @@ export async function dismissDuplicates(ids: number[]): Promise<DismissDuplicate
   })
 }
 
+// ─── Plaid bank sync (v8) ───────────────────────────────────────────────────
+
+export async function getPlaidStatus(): Promise<PlaidStatus> {
+  return request<PlaidStatus>('/plaid/status')
+}
+
+export async function createPlaidLinkToken(): Promise<{ link_token: string; expiration: string }> {
+  return request<{ link_token: string; expiration: string }>('/plaid/link-token', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
+export async function exchangePlaidPublicToken(public_token: string): Promise<PlaidItem> {
+  return request<PlaidItem>('/plaid/exchange', {
+    method: 'POST',
+    body: JSON.stringify({ public_token }),
+  })
+}
+
+export async function plaidSync(itemId?: number): Promise<PlaidSyncResult> {
+  return request<PlaidSyncResult>('/plaid/sync', {
+    method: 'POST',
+    body: JSON.stringify(itemId === undefined ? {} : { item_id: itemId }),
+  })
+}
+
+export async function getPlaidItems(): Promise<PlaidItem[]> {
+  return request<PlaidItem[]>('/plaid/items')
+}
+
+// Investment holdings (v9). Throws on 503 when Plaid is unconfigured; [] when
+// there are no investment accounts.
+export async function getHoldings(): Promise<Holding[]> {
+  return request<Holding[]>('/plaid/holdings')
+}
+
+export async function deletePlaidItem(id: number): Promise<void> {
+  const res = await fetch(`${BASE}/plaid/items/${id}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`${res.status} ${res.statusText}: ${text}`)
+  }
+}
+
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
 export interface DateRangeParams {
   start_date?: string
   end_date?: string
   account?: string
+  accounts?: string[] // v9 — multi-account filter (comma-joined server-side)
 }
 
 export async function getStatsSummary(params?: DateRangeParams): Promise<StatsSummary> {
-  const qs = toQuery(params as Record<string, string | number | boolean | undefined> ?? {})
+  const qs = toQuery((params as QueryParams) ?? {})
   return request<StatsSummary>(`/stats/summary${qs}`)
 }
 
 export async function getStatsByCategory(
   params?: DateRangeParams & { type?: 'income' | 'expense' }
 ): Promise<StatsByCategory[]> {
-  const qs = toQuery(params as Record<string, string | number | boolean | undefined> ?? {})
+  const qs = toQuery((params as QueryParams) ?? {})
   return request<StatsByCategory[]>(`/stats/by-category${qs}`)
 }
 
@@ -168,7 +236,7 @@ export async function getStatsOverTime(
 ): Promise<StatsOverTime[]> {
   const qs = toQuery({
     granularity,
-    ...(params as Record<string, string | number | boolean | undefined> ?? {}),
+    ...((params as QueryParams) ?? {}),
   })
   return request<StatsOverTime[]>(`/stats/over-time${qs}`)
 }
@@ -221,7 +289,7 @@ export async function suggestCategory(payload: {
 }
 
 export async function getInsights(params?: DateRangeParams): Promise<InsightsResult> {
-  const qs = toQuery(params as Record<string, string | number | boolean | undefined> ?? {})
+  const qs = toQuery((params as QueryParams) ?? {})
   return request<InsightsResult>(`/assistant/insights${qs}`)
 }
 
@@ -274,5 +342,71 @@ export async function previewRule(data: RuleCreate): Promise<PreviewRuleResult> 
   return request<PreviewRuleResult>('/rules/preview', {
     method: 'POST',
     body: JSON.stringify(data),
+  })
+}
+
+// ─── Budget: category limits (v9d) ────────────────────────────────────────────
+
+export async function getCategoryBudgets(): Promise<CategoryBudget[]> {
+  return request<CategoryBudget[]>('/budgets/categories')
+}
+
+export async function createCategoryBudget(data: CategoryBudgetInput): Promise<CategoryBudget> {
+  return request<CategoryBudget>('/budgets/categories', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateCategoryBudget(id: number, data: CategoryBudgetUpdate): Promise<CategoryBudget> {
+  return request<CategoryBudget>(`/budgets/categories/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteCategoryBudget(id: number): Promise<void> {
+  const res = await fetch(`${BASE}/budgets/categories/${id}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`${res.status} ${res.statusText}: ${text}`)
+  }
+}
+
+// ─── Budget: savings goals (v9d) ──────────────────────────────────────────────
+
+export async function getSavingsGoals(): Promise<SavingsGoal[]> {
+  return request<SavingsGoal[]>('/budgets/goals')
+}
+
+export async function createSavingsGoal(data: SavingsGoalInput): Promise<SavingsGoal> {
+  return request<SavingsGoal>('/budgets/goals', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function updateSavingsGoal(id: number, data: SavingsGoalUpdate): Promise<SavingsGoal> {
+  return request<SavingsGoal>(`/budgets/goals/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function deleteSavingsGoal(id: number): Promise<void> {
+  const res = await fetch(`${BASE}/budgets/goals/${id}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`${res.status} ${res.statusText}: ${text}`)
+  }
+}
+
+// ─── Assistant budget-creation (v9d) ──────────────────────────────────────────
+// Creates budgets from natural language; also returns a normal chat `reply`.
+// Throws on 503 when the AI provider is unconfigured.
+export async function assistantBudget(messages: ChatMessage[]): Promise<BudgetChatResponse> {
+  return request<BudgetChatResponse>('/assistant/budget', {
+    method: 'POST',
+    body: JSON.stringify({ messages }),
   })
 }

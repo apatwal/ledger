@@ -7,25 +7,28 @@ from sqlalchemy import select, func, and_, case
 from ..database import get_db
 from ..models import Transaction
 from ..schemas import SummaryResponse, CategoryStat, OverTimeStat, AccountStat
+from ..account_filter import account_filter_condition
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
 SAVINGS_CATEGORIES = ("Savings", "Investment")
 
 
-def _date_filter(start_date, end_date, account=None):
+def _date_filter(start_date, end_date, account=None, accounts=None):
     # v2: transfers (money between the user's own accounts) are EXCLUDED from
     # ALL stats — income, expense, net, savings, savings_rate, by-category,
     # over-time, and the summary row count.
     # v4: optional account filter — restrict to a single card/account when given.
+    # v9: optional `accounts` comma-list filter (wins over single `account`).
     # v5.4: `refund` is NOT excluded — it participates as a NEGATIVE expense.
     conditions = [Transaction.type != "transfer"]
     if start_date:
         conditions.append(Transaction.date >= start_date)
     if end_date:
         conditions.append(Transaction.date <= end_date)
-    if account:
-        conditions.append(Transaction.account == account)
+    acct_cond = account_filter_condition(account, accounts)
+    if acct_cond is not None:
+        conditions.append(acct_cond)
     return conditions
 
 
@@ -68,9 +71,10 @@ def get_summary(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     account: Optional[str] = None,   # plain default so direct (non-HTTP) callers like ai.py work
+    accounts: Optional[str] = None,  # v9: comma-separated multi-account filter
     db: Session = Depends(get_db),
 ):
-    cond = _date_filter(start_date, end_date, account)
+    cond = _date_filter(start_date, end_date, account, accounts)
     base = select(
         func.coalesce(
             func.sum(case((Transaction.type == "income", Transaction.amount), else_=0.0)), 0.0
@@ -120,9 +124,10 @@ def get_by_category(
     end_date: Optional[date] = Query(None),
     type: Optional[str] = Query("expense"),
     account: Optional[str] = None,   # plain default so direct (non-HTTP) callers like ai.py work
+    accounts: Optional[str] = None,  # v9: comma-separated multi-account filter
     db: Session = Depends(get_db),
 ):
-    cond = _date_filter(start_date, end_date, account)
+    cond = _date_filter(start_date, end_date, account, accounts)
 
     if type == "expense":
         # v5.4: net expense per category = Σ(expense) − Σ(refund). Include both
@@ -166,9 +171,10 @@ def get_over_time(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     account: Optional[str] = None,   # plain default so direct (non-HTTP) callers like ai.py work
+    accounts: Optional[str] = None,  # v9: comma-separated multi-account filter
     db: Session = Depends(get_db),
 ):
-    cond = _date_filter(start_date, end_date, account)
+    cond = _date_filter(start_date, end_date, account, accounts)
 
     # v6: dialect-aware period label — same output formats on SQLite and Postgres.
     period_expr = _period_expr(db, granularity)

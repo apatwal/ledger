@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from sqlalchemy import Integer, Float, String, Date, DateTime, Boolean, func
+from sqlalchemy import Integer, Float, String, Text, Date, DateTime, Boolean, func
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
@@ -18,7 +18,17 @@ class Transaction(Base):
     review_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)        # v5
     batch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # import batch (v5.2); null = manual
     dup_dismissed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # v7
-    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")  # manual | csv
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")  # manual | csv | plaid
+    # v8 Plaid: null for manual/csv rows; set for bank-synced rows.
+    plaid_transaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    plaid_account_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    plaid_item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # v9 Plaid enrichment: null for manual/csv rows; populated for bank-synced rows.
+    merchant_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pending_transaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    category_icon_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 
@@ -38,6 +48,61 @@ class Rule(Base):
     set_type: Mapped[str | None] = mapped_column(String(20), nullable=True)        # income|expense|transfer
     set_category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     set_account: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+
+
+class PlaidItem(Base):
+    """One linked Plaid Item (a bank login) (v8). The access_token is stored
+    server-side ONLY and is NEVER returned by the API. `accounts_json` holds a
+    JSON map of {account_id: {name, mask, type, subtype, app_account, available,
+    current, currency}} so a sync can label each transaction's account and expose
+    per-account balances. `cursor` persists the /transactions/sync incremental
+    cursor. v9 adds institution branding (`institution_logo`/`institution_color`)."""
+    __tablename__ = "plaid_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    item_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    access_token: Mapped[str] = mapped_column(String(512), nullable=False)
+    institution_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    institution_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # v9 institution branding (best-effort; null when unavailable).
+    institution_logo: Mapped[str | None] = mapped_column(Text, nullable=True)   # base64 PNG
+    institution_color: Mapped[str | None] = mapped_column(String(32), nullable=True)  # hex color
+    accounts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+
+
+class CategoryBudget(Base):
+    """A monthly category spending limit (v9b). Calendar-month reset, NO rollover.
+    `category` is treated as unique-ish: POST upserts (updates the limit if a
+    budget already exists for that category). `spent`/`remaining`/`pct`/`over` are
+    computed on read from the current calendar month's net expense, never stored."""
+    __tablename__ = "category_budgets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    category: Mapped[str] = mapped_column(String(100), nullable=False)
+    limit_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    period: Mapped[str] = mapped_column(String(20), nullable=False, default="monthly")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+
+
+class SavingsGoal(Base):
+    """A savings goal (v9b): a target amount + optional target date, with progress
+    tracked against a DESIGNATED connected account's balance growth. `account` is
+    the app_account label of the designated PlaidItem account; `starting_balance`
+    is captured at creation from that account's current Plaid balance so progress
+    = current_balance − starting_balance. Progress fields are computed on read."""
+    __tablename__ = "savings_goals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    target_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    account: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    starting_balance: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 

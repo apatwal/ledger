@@ -271,6 +271,90 @@ def suggest_category(
     return {"category": parsed.category.strip(), "confidence": round(confidence, 2)}
 
 
+# ── Budget creation (structured output) ────────────────────────────────────────
+
+BUDGET_SYSTEM_INSTRUCTION = (
+    "You are the budgeting assistant inside a personal expense-tracker app. "
+    f"Today's date is {TODAY}. All amounts are in US dollars (USD). "
+    "The user is asking you to set up budgets. Turn their request into concrete "
+    "actions of two kinds:\n"
+    "  - kind='goal': a savings goal with a name, a positive target_amount, an "
+    "optional target_date (YYYY-MM-DD; infer a sensible date like the end of the "
+    "named month), and an optional account (the connected account whose balance "
+    "growth funds the goal — pick one from the provided account labels only if the "
+    "user names or clearly implies it, else leave null).\n"
+    "  - kind='category_limit': a monthly spending cap on ONE category with a "
+    "positive limit_amount. Prefer an EXISTING known category; use its exact "
+    "spelling. Only invent a short new category if none fit.\n"
+    "For a savings goal you MAY also add a few category_limit actions that form a "
+    "realistic monthly savings plan toward the goal, but only if the user seems to "
+    "want a plan. If the message is NOT about creating budgets, return an empty "
+    "actions list and a brief helpful reply. Always write `reply` as a short, "
+    "natural, first-person confirmation of what you set up (no markdown headings)."
+)
+
+
+def plan_budget(
+    messages: list[dict],
+    known_categories: Optional[list[str]] = None,
+    account_labels: Optional[list[str]] = None,
+) -> dict:
+    """Turn a chat request into concrete budget/goal creation actions via Gemini
+    structured output. Returns {"actions": [ {kind, ...}, ... ], "reply": str}.
+    Actions are dicts; the caller (assistant route) persists them via the shared
+    budget create helpers. The caller passes in known categories + account labels
+    so this stays pure w.r.t. the DB."""
+    from google.genai import types
+    from pydantic import BaseModel
+
+    class _BudgetAction(BaseModel):
+        kind: str  # "goal" | "category_limit"
+        # goal fields
+        name: Optional[str] = None
+        target_amount: Optional[float] = None
+        target_date: Optional[str] = None  # YYYY-MM-DD
+        account: Optional[str] = None
+        # category_limit fields
+        category: Optional[str] = None
+        limit_amount: Optional[float] = None
+
+    class _BudgetPlan(BaseModel):
+        actions: list[_BudgetAction]
+        reply: str
+
+    client = get_client()
+
+    convo = "\n".join(
+        f"{m.get('role', 'user')}: {m.get('content', '')}"
+        for m in messages
+        if m.get("content")
+    )
+    prompt = (
+        f"Known categories: {', '.join(known_categories or []) or '(none yet)'}.\n"
+        f"Connected account labels: {', '.join(account_labels or []) or '(none)'}.\n\n"
+        f"Conversation:\n{convo}\n\n"
+        "Produce the budget actions and a confirmation reply."
+    )
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=BUDGET_SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            response_schema=_BudgetPlan,
+            temperature=0.2,
+        ),
+    )
+    parsed = getattr(response, "parsed", None)
+    if parsed is None:
+        data = json.loads(response.text)
+        parsed = _BudgetPlan(**data)
+    return {
+        "actions": [a.model_dump() for a in parsed.actions],
+        "reply": (parsed.reply or "").strip(),
+    }
+
+
 # ── Insights (one-shot narrative) ──────────────────────────────────────────────
 
 def generate_insights(db: Session, start_date: Optional[date], end_date: Optional[date]) -> str:

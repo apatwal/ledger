@@ -7,6 +7,7 @@ from sqlalchemy import select, and_
 from ..database import get_db
 from ..models import Transaction
 from ..schemas import TransactionCreate, TransactionOut
+from ..account_filter import account_filter_condition, parse_accounts
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -19,6 +20,9 @@ def _build_filters(
     category: Optional[str],
     account: Optional[str] = None,
     needs_review: Optional[bool] = None,
+    accounts: Optional[str] = None,
+    exclude_types: Optional[str] = None,
+    exclude_categories: Optional[str] = None,
 ):
     conditions = []
     if start_date:
@@ -29,10 +33,18 @@ def _build_filters(
         conditions.append(Transaction.type == type_)
     if category:
         conditions.append(Transaction.category == category)
-    if account:
-        conditions.append(Transaction.account == account)
+    acct_cond = account_filter_condition(account, accounts)
+    if acct_cond is not None:
+        conditions.append(acct_cond)
     if needs_review is not None:
         conditions.append(Transaction.needs_review == needs_review)
+    # v9: comma-separated exclusion filters (trim/ignore empty tokens, mirror `accounts`).
+    excluded_types = parse_accounts(exclude_types)
+    if excluded_types is not None:
+        conditions.append(Transaction.type.not_in(excluded_types))
+    excluded_categories = parse_accounts(exclude_categories)
+    if excluded_categories is not None:
+        conditions.append(Transaction.category.not_in(excluded_categories))
     if conditions:
         db_query = db_query.where(and_(*conditions))
     return db_query
@@ -54,13 +66,19 @@ def list_transactions(
     type: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
     account: Optional[str] = Query(None),
+    accounts: Optional[str] = Query(None),   # v9: comma-separated multi-account filter
     needs_review: Optional[bool] = Query(None),
+    exclude_types: Optional[str] = Query(None),       # v9: comma-separated types to HIDE
+    exclude_categories: Optional[str] = Query(None),  # v9: comma-separated categories to HIDE
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     stmt = select(Transaction).order_by(Transaction.date.desc(), Transaction.id.desc())
-    stmt = _build_filters(stmt, start_date, end_date, type, category, account, needs_review)
+    stmt = _build_filters(
+        stmt, start_date, end_date, type, category, account, needs_review, accounts,
+        exclude_types=exclude_types, exclude_categories=exclude_categories,
+    )
     stmt = stmt.offset(offset).limit(limit)
     return db.execute(stmt).scalars().all()
 

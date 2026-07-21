@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, List, Upload, BookText, Wand2 } from 'lucide-react'
+import { LayoutDashboard, List, Upload, BookText, Wand2, LineChart, PiggyBank } from 'lucide-react'
 import { getHealth } from '../lib/api'
 import Assistant from './Assistant'
+import AccountSelect from './AccountSelect'
 
 interface LayoutProps {
   children: React.ReactNode
@@ -51,6 +52,22 @@ export default function Layout({ children }: LayoutProps) {
             Transactions
           </NavLink>
 
+          <NavLink
+            to="/investments"
+            className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+          >
+            <LineChart className="nav-link-icon" />
+            Investments
+          </NavLink>
+
+          <NavLink
+            to="/budget"
+            className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+          >
+            <PiggyBank className="nav-link-icon" />
+            Budget
+          </NavLink>
+
           <div className="nav-section-label">Tools</div>
 
           <NavLink
@@ -66,7 +83,7 @@ export default function Layout({ children }: LayoutProps) {
             className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
           >
             <Upload className="nav-link-icon" />
-            CSV Import
+            Import
           </NavLink>
         </nav>
 
@@ -79,7 +96,13 @@ export default function Layout({ children }: LayoutProps) {
         </div>
       </aside>
 
-      <main className="main-content">{children}</main>
+      <main className="main-content">
+        <div className="topbar">
+          <div className="topbar-label">Viewing</div>
+          <AccountSelect />
+        </div>
+        {children}
+      </main>
 
       <Assistant />
     </div>

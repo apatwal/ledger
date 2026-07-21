@@ -5,7 +5,7 @@ import type { DuplicateGroup } from '../lib/types'
 
 interface Props {
   // The dashboard/ledger filters this modal should respect.
-  params?: { start_date?: string; end_date?: string; account?: string }
+  params?: { start_date?: string; end_date?: string; account?: string; accounts?: string[] }
   onClose: () => void
   // Fired after any mutation so the opener can refresh its duplicate count.
   onChanged?: () => void

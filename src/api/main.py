@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 
 from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
-from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates
+from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets
+from . import plaid_client
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Expense Tracker API", version="1.0.0")
@@ -41,6 +42,8 @@ app.include_router(assistant.router, prefix=API_PREFIX)
 app.include_router(rules.router, prefix=API_PREFIX)
 app.include_router(imports.router, prefix=API_PREFIX)
 app.include_router(duplicates.router, prefix=API_PREFIX)
+app.include_router(plaid_routes.router, prefix=API_PREFIX)   # /api/plaid/* (v8)
+app.include_router(budgets.router, prefix=API_PREFIX)        # /api/budgets/* (v9b)
 
 
 # ── Standalone endpoints ──────────────────────────────────────────────────────
@@ -181,6 +184,26 @@ def _migrate_add_dup_dismissed_column() -> None:
     _add_column_if_missing("transactions", "dup_dismissed", "BOOLEAN NOT NULL DEFAULT FALSE")
 
 
+def _migrate_add_plaid_columns() -> None:
+    """v8 migration: add Plaid provenance columns to transactions (portable).
+    `plaid_items` is created automatically by create_all()."""
+    _add_column_if_missing("transactions", "plaid_transaction_id", "VARCHAR")
+    _add_column_if_missing("transactions", "plaid_account_id", "VARCHAR")
+    _add_column_if_missing("transactions", "plaid_item_id", "INTEGER")
+
+
+def _migrate_add_v9_enrichment_columns() -> None:
+    """v9 migration: add Plaid transaction-enrichment columns to transactions and
+    institution-branding columns to plaid_items (portable)."""
+    _add_column_if_missing("transactions", "merchant_name", "VARCHAR")
+    _add_column_if_missing("transactions", "logo_url", "VARCHAR")
+    _add_column_if_missing("transactions", "pending", "BOOLEAN NOT NULL DEFAULT FALSE")
+    _add_column_if_missing("transactions", "pending_transaction_id", "VARCHAR")
+    _add_column_if_missing("transactions", "category_icon_url", "VARCHAR")
+    _add_column_if_missing("plaid_items", "institution_logo", "TEXT")
+    _add_column_if_missing("plaid_items", "institution_color", "VARCHAR")
+
+
 def seed_data(db: Session) -> None:
     """Insert ~19 realistic transactions if the table is empty."""
     count = db.execute(sqlalchemy.text("SELECT COUNT(*) FROM transactions")).scalar()
@@ -227,9 +250,55 @@ def startup():
     _migrate_add_batch_id_column()      # v5.2: ensure batch_id exists
     _migrate_add_statement_type_column()  # v5.3: ensure import_batches.statement_type exists
     _migrate_add_dup_dismissed_column()   # v7: ensure transactions.dup_dismissed exists
+    _migrate_add_plaid_columns()          # v8: ensure transactions.plaid_* columns exist
+    _migrate_add_v9_enrichment_columns()  # v9: ensure enrichment + branding columns exist
     # Auto-seeding is OPT-IN. By default the DB starts empty so real user data
     # is never re-created on restart. Set SEED_DB=1 (for dev/demo) to seed the
     # sample transactions into an empty DB.
     if os.getenv("SEED_DB") in {"1", "true", "True", "yes"}:
         with SessionLocal() as db:
             seed_data(db)
+    _maybe_start_plaid_scheduler()        # v8: optional in-process auto-sync
+
+
+# ── Plaid auto-sync scheduler (v8) ─────────────────────────────────────────────
+# In-process APScheduler job that periodically calls sync_items(). GATED: only
+# starts when Plaid is configured AND PLAID_AUTOSYNC_INTERVAL_MINUTES is a
+# positive int. Never runs in tests (env unset) and never breaks startup — any
+# failure is swallowed. On Render's free tier (which sleeps) use a Cron Job
+# hitting POST /api/plaid/sync-all instead (see docs/api-contract.md).
+
+_plaid_scheduler = None
+
+
+def _maybe_start_plaid_scheduler() -> None:
+    global _plaid_scheduler
+    try:
+        if not plaid_client.is_configured():
+            return
+        raw = (os.getenv("PLAID_AUTOSYNC_INTERVAL_MINUTES") or "").strip()
+        if not raw:
+            return
+        try:
+            interval = int(raw)
+        except ValueError:
+            return
+        if interval <= 0:
+            return
+
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from .routes.plaid_routes import sync_items
+
+        def _job():
+            try:
+                with SessionLocal() as db:
+                    sync_items(db)
+            except Exception as e:  # never let a sync failure crash the scheduler
+                print(f"[plaid] auto-sync failed: {e}")
+
+        _plaid_scheduler = BackgroundScheduler(daemon=True)
+        _plaid_scheduler.add_job(_job, "interval", minutes=interval, id="plaid_autosync")
+        _plaid_scheduler.start()
+        print(f"[plaid] auto-sync scheduler started ({interval} min interval).")
+    except Exception as e:
+        print(f"[plaid] scheduler not started: {e}")
