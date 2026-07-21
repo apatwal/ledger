@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import Transaction
 from ..schemas import DuplicateGroup, DismissDuplicatesRequest, TransactionOut
+from ..account_filter import account_filter_condition
 
 router = APIRouter(prefix="/duplicates", tags=["duplicates"])
 
@@ -42,20 +43,23 @@ def list_duplicates(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     account: Optional[str] = Query(None),
+    accounts: Optional[str] = Query(None),   # v9: comma-separated multi-account filter
     db: Session = Depends(get_db),
 ):
     """Find groups of 2+ non-dismissed expense transactions that share the same
     date, amount (2dp), normalized description, and normalized account.
 
-    Optional `start_date`/`end_date`/`account` filters restrict the candidate
-    rows (same style as stats.py)."""
+    Optional `start_date`/`end_date`/`account`/`accounts` filters restrict the
+    candidate rows (same style as stats.py). `accounts` (comma list) wins over
+    the single `account`."""
     conditions = [Transaction.type == "expense", Transaction.dup_dismissed == False]  # noqa: E712
     if start_date:
         conditions.append(Transaction.date >= start_date)
     if end_date:
         conditions.append(Transaction.date <= end_date)
-    if account:
-        conditions.append(Transaction.account == account)
+    acct_cond = account_filter_condition(account, accounts)
+    if acct_cond is not None:
+        conditions.append(acct_cond)
 
     stmt = (
         select(Transaction)

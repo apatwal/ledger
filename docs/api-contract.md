@@ -1,4 +1,4 @@
-# Expense Tracker — API Contract & Data Model (v7)
+# Expense Tracker — API Contract & Data Model (v9)
 
 This is the **shared source of truth** for Backend, Frontend, and QA. Build to this exactly.
 Backend confirms it is live by messaging Frontend once the server runs.
@@ -242,3 +242,347 @@ The app must run on **SQLite (local dev/tests) AND Postgres (Neon, for real pers
 
 ## Health
 - `GET /api/health` → `{ "status": "ok" }`
+
+## Authentication (Clerk)
+
+All `/api/*` routes are protected by Clerk session-JWT verification plus a
+single-user email allowlist — but this is **GATED**. With no Clerk env set, auth
+is **DISABLED**: the app behaves exactly as before, every `/api` route is open,
+local dev works, and the full test suite passes. Auth turns **ON** only when
+configured. (Same "gated by env var" pattern as the AI assistant and Plaid.)
+
+### What enables it
+Auth is enabled when **`CLERK_ISSUER`** (or **`CLERK_JWKS_URL`**) is set. Until
+then, `is_auth_enabled()` is `False` and the `require_user` dependency is a no-op.
+
+### Config (environment — see `.env.example`)
+| var | default | purpose |
+| --- | --- | --- |
+| `CLERK_ISSUER` | — | Clerk Frontend API URL, e.g. `https://<subdomain>.clerk.accounts.dev`. Presence enables auth; the JWT `iss` must equal it. |
+| `CLERK_JWKS_URL` | `${CLERK_ISSUER}/.well-known/jwks.json` | Signing-key endpoint (RS256). Set only to override. |
+| `CLERK_SECRET_KEY` | — | Optional `sk_...`; enables a server-side email lookup (`GET https://api.clerk.com/v1/users/{sub}`) when the token carries no `email` claim. |
+| `ALLOWED_EMAILS` | — | Comma-separated allowlist (case-insensitive). Empty = any authenticated Clerk user is allowed. Single-user: set to your email. |
+| `PLAID_SYNC_TOKEN` | — | Shared secret (also used by `sync-all`). A matching `X-Plaid-Sync-Token` header is exempt from Clerk auth. |
+| `VITE_CLERK_PUBLISHABLE_KEY` | — | **Frontend** key (`pk_...`), consumed by the React app, not the API. Set on the frontend build/host. |
+
+### Verification steps (`require_user`)
+When enabled, each protected request must send `Authorization: Bearer <clerk-session-jwt>`. The dependency:
+1. If auth disabled → allow (return `None`), no checks.
+2. If a valid `X-Plaid-Sync-Token` matches `PLAID_SYNC_TOKEN` → allow (cron exemption).
+3. Missing/malformed `Authorization` header → **401**.
+4. Verify the JWT with PyJWT (RS256) using a cached `PyJWKClient(CLERK_JWKS_URL)`: signature, `exp`/`nbf`, and `iss == CLERK_ISSUER`. Invalid/expired/network error → **401** (fails closed). `azp` is not hard-failed.
+5. Resolve email: prefer an `email` claim; else, if `CLERK_SECRET_KEY` is set, look it up via the Clerk API (cached per `sub`).
+6. If `ALLOWED_EMAILS` is non-empty and the email is missing or not in the list → **403**.
+7. Returns `{sub, email}`.
+
+### 401 vs 403
+- **401 Unauthorized** — no/malformed token, or the token fails verification (bad signature, expired, wrong issuer). *"You are not authenticated."*
+- **403 Forbidden** — the token is valid but the user's email is not on `ALLOWED_EMAILS` (or can't be resolved while an allowlist is set). *"You are authenticated but not allowed."*
+
+### Exemptions (always open)
+- `GET /api/health` — never protected (Render health checks).
+- The static SPA / catch-all — serves the login page.
+- `POST /api/plaid/sync-all` — reachable via `X-Plaid-Sync-Token` (Render cron), no Clerk user needed.
+
+### How to configure
+1. Create a Clerk application at <https://dashboard.clerk.com>.
+2. Copy the **Frontend API URL** → `CLERK_ISSUER` (JWKS URL is derived; override with `CLERK_JWKS_URL` if needed).
+3. Copy the **Secret key** (`sk_...`) → `CLERK_SECRET_KEY` (optional; only needed for the email-lookup fallback).
+4. Set `ALLOWED_EMAILS` to your email (single-user allowlist).
+5. Set `VITE_CLERK_PUBLISHABLE_KEY` (`pk_...`) on the frontend so the React app can sign the user in and attach the session token.
+
+## Plaid Integration (v8)
+
+Pull transactions + investment transactions directly from banks via Plaid Link,
+instead of (or alongside) CSV import. **Everything network-touching is gated by
+`PLAID_CLIENT_ID`/`PLAID_SECRET`**: with them unset the app boots normally, all
+existing tests pass, and every `/api/plaid/*` network endpoint returns `503`
+(mirrors the AI assistant's gating). `GET /api/plaid/status` and
+`GET /api/plaid/items` always work (they only read the DB).
+
+### Config (environment — see `.env.example`, read via `os.getenv`)
+| var | default | purpose |
+|-----|---------|---------|
+| `PLAID_CLIENT_ID` | — | Plaid client id (required to enable) |
+| `PLAID_SECRET` | — | Plaid secret (required to enable) |
+| `PLAID_ENV` | `sandbox` | `sandbox` \| `development` \| `production` → API host |
+| `PLAID_PRODUCTS` | `transactions,investments` | comma list |
+| `PLAID_COUNTRY_CODES` | `US` | comma list |
+| `PLAID_REDIRECT_URI` | — | optional OAuth redirect URI |
+| `PLAID_SYNC_TOKEN` | — | optional shared secret guarding `POST /plaid/sync-all` |
+| `PLAID_AUTOSYNC_INTERVAL_MINUTES` | — | optional; positive int enables in-process auto-sync |
+
+`plaid-python` (pip resolves **40.1.0**) and `apscheduler>=3.10` are in
+`requirements.txt`. The **access_token is stored server-side only** on the
+`plaid_items` table and is **NEVER returned** by any endpoint.
+
+### Data model additions
+- New table `plaid_items`: `id`, `item_id` (unique, indexed), `access_token`
+  (server-side only), `institution_id`, `institution_name`, `accounts_json`
+  (JSON `{account_id: {name, mask, type, subtype, app_account}}`), `cursor`
+  (for `/transactions/sync`), `status` (default `active`), `last_synced_at`,
+  `created_at`.
+- `transactions` gains: `plaid_transaction_id` (indexed, nullable),
+  `plaid_account_id` (nullable), `plaid_item_id` (nullable). Plaid rows set
+  `source="plaid"`. Manual/CSV rows leave all three null. `create_all` builds
+  `plaid_items`; `_migrate_add_plaid_columns()` (portable inspect()-based
+  `ALTER TABLE`) adds the three columns to legacy transactions tables.
+
+### Endpoints (all under `/api/plaid`)
+- `GET /status` → `PlaidStatus { configured: bool, env: str, products: string[], items: PlaidItemOut[] }`. **Works without keys** (`configured=false`). Never 503.
+- `POST /link-token` → `{ link_token, expiration }`. Creates a Link token (products/country codes from env, `client_user_id="local-user"`, optional redirect_uri). **503** if unconfigured.
+- `POST /exchange` body `{ public_token }` → `PlaidItemOut`. Exchanges for an access_token, fetches accounts + best-effort institution name, stores/updates a `PlaidItem` (account label = `"{name} ••{mask}"`). **503** if unconfigured.
+- `POST /sync` body `{ item_id?: int|null }` → `PlaidSyncResult { items_synced, added, modified, removed }`. Syncs one item, or ALL items when `item_id` is null. **503** if unconfigured; **404** if a given `item_id` doesn't exist.
+- `POST /sync-all` (header `X-Plaid-Sync-Token` required only when `PLAID_SYNC_TOKEN` set) → `PlaidSyncResult`. Cron/scheduler friendly; **401** on token mismatch, **503** if unconfigured.
+- `GET /items` → `PlaidItemOut[]`. **Works without keys.**
+- `DELETE /items/{id}` → `204`. Best-effort Plaid `item/remove`, then deletes the `PlaidItem` row. **Keeps the imported transactions** — just nulls their `plaid_item_id`. **404** if not found.
+
+`PlaidItemOut { id, item_id, institution_id?, institution_name?, accounts: PlaidAccount[], status, last_synced_at?, created_at }`; `PlaidAccount { account_id, name?, mask?, type?, subtype?, app_account? }`. **No `access_token` field anywhere.**
+
+### Idempotent sync
+`POST /sync` loops `/transactions/sync` with the item's stored `cursor` until
+`has_more` is false, then **UPSERTs by `plaid_transaction_id`**: `added` → insert
+(if new), `modified` → update, `removed` → delete. It also pulls
+`/investments/transactions/get` over a rolling ~730-day window and upserts those
+by `investment_transaction_id`. The new cursor + `last_synced_at` are persisted,
+so re-running sync never duplicates rows (safe to call repeatedly / on a
+schedule). Investments are best-effort — an item without the investments product
+is skipped, not failed.
+
+### Categorization — trust Plaid (no rules engine / needs-review / AI)
+Plaid rows map `personal_finance_category` **directly**; they never run the
+rules engine, are never flagged `needs_review`, and are never AI-categorized.
+`amount` is stored as the absolute value; `type` is derived from
+`personal_finance_category.primary` (PFC) + the sign of Plaid's amount (Plaid
+amount is **positive when money leaves** the account):
+
+| PFC primary | type | category label |
+|-------------|------|----------------|
+| `INCOME` | `income` | Income |
+| `TRANSFER_IN` | `transfer` | Transfer |
+| `TRANSFER_OUT` | `transfer` | Transfer |
+| `LOAN_PAYMENTS` | `transfer` | Payments & Credits |
+| `FOOD_AND_DRINK` | expense/refund* | Food & Drink |
+| `GENERAL_MERCHANDISE` | expense/refund* | Shopping |
+| `TRANSPORTATION` | expense/refund* | Transportation |
+| `TRAVEL` | expense/refund* | Travel |
+| `RENT_AND_UTILITIES` | expense/refund* | Bills & Utilities |
+| `ENTERTAINMENT` | expense/refund* | Entertainment |
+| `MEDICAL` | expense/refund* | Health |
+| `PERSONAL_CARE` | expense/refund* | Personal Care |
+| `GENERAL_SERVICES` | expense/refund* | Services |
+| `GOVERNMENT_AND_NON_PROFIT` | expense/refund* | Government |
+| `BANK_FEES` | expense/refund* | Fees |
+| (missing / unknown PFC) | expense/refund* | Uncategorized |
+
+\* type rule for non-income/non-transfer PFCs: `amount < 0` (money in) →
+`refund`, else → `expense`. `description` = `merchant_name` else `name`;
+`date` = `authorized_date` else `date`.
+
+Investment transactions always use category `Investment`, amount = `abs()`,
+`plaid_transaction_id` = `investment_transaction_id`. To avoid inflating gross
+income/expense with IRA/brokerage buy-sell churn, portfolio moves are
+**neutralized** as `transfer` (excluded from stats) and only real cash flow is
+surfaced. Type is decided from the investment txn's `type` (then `subtype` for
+`cash`), normalized to lowercase:
+
+| `type` | `subtype` | mapped type | rationale |
+|--------|-----------|-------------|-----------|
+| `buy` | — | `transfer` | portfolio churn, neutral |
+| `sell` | — | `transfer` | portfolio churn, neutral |
+| `transfer` | — | `transfer` | neutral |
+| `cancel` | — | `transfer` | neutral |
+| `fee` | — | `expense` | real cost |
+| `cash` | contains `dividend` or `interest` | `income` | real income received |
+| `cash` | contains `contribution` or `deposit` | `expense` | money in → counts toward savings |
+| `cash` | contains `withdrawal` or `distribution` | `transfer` | neutral, don't inflate income |
+| `cash` | other / absent | `transfer` | neutral |
+| unknown / absent | — | `transfer` | neutral default |
+
+`contribution`/`deposit` map to `expense` because savings in this app is
+computed from expense rows in Savings/Investment categories, so a contribution
+correctly counts as money set aside rather than as spending against income.
+
+**Double-count still solved:** classifying credit-card payments
+(`LOAN_PAYMENTS`) and account moves (`TRANSFER_IN`/`TRANSFER_OUT`) as `transfer`
+keeps them excluded from income/expense/savings stats — the same guarantee the
+CSV path provides — so a card payment isn't counted as both a checking-account
+outflow and a card charge.
+
+### Scheduling on Render
+The in-process APScheduler job (enabled when `PLAID_AUTOSYNC_INTERVAL_MINUTES`
+is a positive int **and** Plaid is configured) works on **always-on** instances.
+On Render's **free tier the instance sleeps**, so the in-process scheduler won't
+fire reliably — instead create a **Render Cron Job** that runs
+`POST /api/plaid/sync-all` with the `X-Plaid-Sync-Token` header (set
+`PLAID_SYNC_TOKEN` on both the web service and the cron job). The scheduler is
+guarded so it never starts in tests / when unconfigured, and a scheduler failure
+never breaks startup.
+
+## Richer Plaid data + multi-account filtering (v9)
+
+Builds on v8: richer per-transaction Plaid metadata, per-account balances,
+institution branding, an on-demand holdings endpoint, and a comma-separated
+`accounts` multi-select filter across the list/stats/duplicates endpoints. All
+network-touching endpoints stay gated by `PLAID_CLIENT_ID`/`PLAID_SECRET` (503
+when unset); the app still boots and all existing tests pass with no keys.
+
+### Data model additions
+- `transactions` gains (all null for manual/csv rows; populated for Plaid rows):
+  `merchant_name` (VARCHAR), `logo_url` (VARCHAR), `pending` (BOOLEAN NOT NULL
+  DEFAULT FALSE), `pending_transaction_id` (VARCHAR), `category_icon_url`
+  (VARCHAR). Added by `_migrate_add_v9_enrichment_columns()` (portable
+  inspect()-based `ALTER TABLE`).
+- `plaid_items` gains `institution_logo` (TEXT, base64 PNG) + `institution_color`
+  (VARCHAR, hex) — best-effort, null when Plaid returns no branding. Same
+  migration helper (never returned as part of the access_token; branding is safe
+  to surface).
+- `plaid_items.accounts_json` now stores three extra keys per account alongside
+  `name/mask/type/subtype/app_account`: `available`, `current`, `currency`
+  (`iso_currency_code`). Refreshed on `exchange` and on **every** sync.
+
+### Transaction enrichment mapping (`map_transaction`)
+Existing type/category/description/date logic is unchanged. Added return keys:
+`merchant_name` (Plaid `merchant_name`), `logo_url` (Plaid `logo_url`, else
+`counterparties[0].logo_url`, else null), `pending` (bool), `pending_transaction_id`,
+`category_icon_url` (Plaid `personal_finance_category_icon_url`).
+`map_investment_transaction` is unchanged (no logo/pending); its rows persist
+`pending=false` and null enrichment. Pending→posted reconciliation is unchanged:
+Plaid sends the pending id under `removed` and the posted one under
+`added`/`modified`, and the existing upsert-by-`plaid_transaction_id` handles it.
+
+`TransactionOut` gains: `merchant_name?`, `logo_url?`, `pending` (bool, default
+false), `pending_transaction_id?`, `category_icon_url?`.
+
+### Balances + institution branding
+On `exchange` the `accounts/get` response's `balances.available/current/iso_currency_code`
+are stored per account; `institutions/get_by_id` is called with
+`include_optional_metadata=true` to capture `logo` + `primary_color` (best-effort —
+absent/failed metadata leaves the fields null and never breaks exchange). Every
+`sync` re-fetches balances (`accounts/get`) before syncing transactions (also
+best-effort — a balance failure never fails the sync).
+
+Updated schemas:
+- `PlaidAccount { account_id, name?, mask?, type?, subtype?, app_account?, available?: float, current?: float, currency?: str }`
+- `PlaidItemOut { id, item_id, institution_id?, institution_name?, institution_logo?: str (base64 PNG), institution_color?: str (hex), accounts: PlaidAccount[], status, last_synced_at?, created_at }`. **Still no `access_token` anywhere.**
+
+### Endpoints
+- `GET /api/plaid/holdings` → `HoldingOut[]`. For each item with the investments
+  product, calls `investments/holdings/get`, joins holdings→securities, returns
+  `HoldingOut { account?, institution?, security_name?, ticker_symbol?, quantity?,
+  price?, value?, currency? }` (price = `institution_price`, value =
+  `institution_value`). Computed on demand (no storage). **503** if unconfigured;
+  **empty list** if there are no investment accounts (items without investments
+  are skipped, not failed).
+
+### Multi-account filter — `accounts` param
+`GET /api/transactions`, `GET /api/stats/summary`, `GET /api/stats/by-category`,
+`GET /api/stats/over-time`, and `GET /api/duplicates` accept an optional
+`accounts` query param (comma-separated, e.g. `accounts=Chase ••1234,Amex ••9999`).
+Semantics (shared helper `account_filter.account_filter_condition`):
+- When `accounts` has ≥1 non-empty token → filter `Transaction.account IN (list)`.
+- The legacy single `account` param still works; if **both** are given,
+  `accounts` **wins**.
+- Absent/blank `accounts` (and no `account`) → **all accounts** (no filter).
+`GET /api/stats/by-account` is unchanged (it is the per-account breakdown).
+
+### Exclusion filters — `exclude_types` / `exclude_categories` (`GET /api/transactions`)
+`GET /api/transactions` accepts two optional comma-separated exclusion params that
+HIDE matching rows:
+- `exclude_types` — transaction types (`income`/`expense`/`transfer`/`refund`) to hide,
+  e.g. `exclude_types=transfer,refund` → `Transaction.type NOT IN (list)`.
+- `exclude_categories` — categories to hide, e.g. `exclude_categories=Investment` →
+  `Transaction.category NOT IN (list)`.
+Tokens are trimmed and empty tokens ignored (same parsing as `accounts`, via
+`account_filter.parse_accounts`). Each applies only when it has ≥1 non-empty token;
+absent/blank = no exclusion. They AND with every other filter (start/end/type/
+category/account/accounts/needs_review).
+
+## Budgets + Assistant budget-creation (v9b)
+
+Two independent, holistic budget kinds (all accounts, independent of the UI's
+account selection). Two brand-new tables created by `create_all()` on startup —
+no migration helper needed (create_all builds the full schema; the v6
+`_add_column_if_missing` helpers are only for adding columns to existing tables).
+
+### Data model
+- `category_budgets`: `id`, `category` (VARCHAR, required), `limit_amount` (FLOAT,
+  required), `period` (VARCHAR, default `"monthly"`), `created_at`. Category is
+  treated as unique-ish — `POST` upserts by category.
+- `savings_goals`: `id`, `name` (VARCHAR, required), `target_amount` (FLOAT,
+  required), `target_date` (DATE, nullable), `account` (VARCHAR, nullable — the
+  `app_account` label of the designated connected account), `starting_balance`
+  (FLOAT, default 0 — captured at creation from that account's current Plaid
+  balance), `created_at`.
+
+Computed progress fields are derived on read and never stored.
+
+### Category-limit endpoints (`/api/budgets/categories`)
+- `GET /api/budgets/categories` → `CategoryBudgetOut[]`, each:
+  `{ id, category, limit_amount, period, created_at, spent, remaining, pct, over }`.
+  - `spent` = current CALENDAR-MONTH net expense for that category
+    (`Σ expense − Σ refund`, reusing stats.py's `_NET_EXPENSE`; rows with
+    `type IN (expense, refund)` and `date` in `[first-of-month, first-of-next-month)`).
+    Calendar-month reset, NO rollover.
+  - `remaining = limit_amount − spent`; `pct = spent/limit_amount*100`;
+    `over = spent > limit_amount`.
+- `POST /api/budgets/categories` `{ category, limit_amount, period? }` → **201**,
+  UPSERT by category (updates `limit_amount`/`period` if a budget already exists
+  for that category, else inserts). `limit_amount` must be > 0.
+- `PUT /api/budgets/categories/{id}` — partial update (404 if missing).
+- `DELETE /api/budgets/categories/{id}` → **204** (404 if missing).
+
+### Savings-goal endpoints (`/api/budgets/goals`)
+- `GET /api/budgets/goals` → `SavingsGoalOut[]`, each:
+  `{ id, name, target_amount, target_date, account, starting_balance, created_at,
+     current_balance, saved, pct, remaining, monthly_needed, on_track }`.
+  - `current_balance` = the designated account's latest balance (look up
+    `PlaidItem.accounts_json` by `app_account == goal.account`; use `current`,
+    fallback `available`; `null` if no account / not found).
+  - `saved = max(0, current_balance − starting_balance)` (0 when balance unknown).
+  - `pct = saved/target_amount*100`; `remaining = max(0, target_amount − saved)`.
+  - `monthly_needed` = `remaining` ÷ whole months from today to `target_date`
+    (clamped ≥ 1); `null` when there is no `target_date`.
+  - `on_track` = `saved >= target_amount * elapsed_fraction`, where
+    `elapsed_fraction` is today's position along the creation→target_date timeline
+    (clamped 0..1); `null` when there is no `target_date`.
+- `POST /api/budgets/goals` `{ name, target_amount, target_date?, account? }` →
+  **201**. On create, the designated account's current Plaid balance is looked up
+  and stored as `starting_balance` (0 when unknown / no account). `target_amount`
+  must be > 0.
+- `PUT /api/budgets/goals/{id}` — partial update (does NOT recompute
+  `starting_balance`; 404 if missing).
+- `DELETE /api/budgets/goals/{id}` → **204** (404 if missing).
+
+Shared create helpers in `routes/budgets.py` — `create_category_budget(db,
+category, limit_amount, period="monthly")` and `create_savings_goal(db, name,
+target_amount, target_date=None, account=None)` — back BOTH the routes and the
+Assistant path so persistence is identical. `_account_balance(db, app_account)`
+is reused by goal creation + progress.
+
+### Assistant budget-creation — `POST /api/assistant/budget`
+Creates budgets/goals from a natural-language request **immediately** (no approval
+step), then returns a confirmation. Request mirrors `/assistant/chat`:
+`{ messages: [{ role, content }, ...] }`. Gated on `GEMINI_API_KEY` (**503** when
+unset, **502** on provider error, **400** on empty messages) like the other AI
+endpoints.
+
+Flow: the endpoint passes the KNOWN CATEGORIES (distinct `Transaction.category`)
+and connected account labels (`app_account` from every `PlaidItem.accounts_json`)
+to `ai.plan_budget(messages, known_categories, account_labels)`, which uses Gemini
+**structured output** (`response_schema`) to return:
+```
+{ actions: [ { kind: "goal", name, target_amount, target_date?, account? }
+           | { kind: "category_limit", category, limit_amount } ],
+  reply: str }
+```
+(For a trip/savings goal the model MAY also propose a few `category_limit` actions
+that form a monthly savings plan.) Each action is then persisted via the shared
+create helpers (goals capture `starting_balance` from the designated account),
+and the endpoint returns:
+```
+{ reply: str,
+  created: { goals: SavingsGoalOut[], category_limits: CategoryBudgetOut[] } }
+```
+When no budget intent is detected the model returns empty `actions` — nothing is
+created and only `reply` is populated (plain-chat behavior preserved).

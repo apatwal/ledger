@@ -8,3 +8,8 @@ pytest>=8.0.0
 httpx>=0.27.0
 google-genai>=1.0.0      # Google Gemini SDK (AI assistant / auto-categorize / insights)
 python-dotenv>=1.0.0     # load GEMINI_API_KEY from a .env file
+plaid-python>=20.0.0     # Plaid API client (v8 bank sync); pip resolves 40.x
+apscheduler>=3.10        # in-process auto-sync scheduler (v8)
+pyjwt[crypto]>=2.8       # Clerk session-JWT verification (RS256); pulls in cryptography
+# Note: Clerk user-email lookup fallback uses stdlib urllib (no extra dep).
+# httpx (above) is already a runtime dep but auth.py deliberately avoids it.

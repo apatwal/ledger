@@ -13,7 +13,122 @@
     />
   </head>
   <body>
-    <div id="root"></div>
+    <!--
+      Pre-React boot splash: the pen signs the "Ledger" wordmark while the app
+      bundle downloads. Pure HTML/CSS/inline-SVG (no JS, no imports) so it paints
+      the instant the document opens. It lives INSIDE #root, so React's first
+      render (createRoot(#root).render(...) in src/main.tsx) replaces it wholesale
+      — no teardown code, no residue. Styles are self-contained here because
+      globals.css hasn't loaded yet at this point. Mirrors src/components/
+      LedgerLoader.tsx: clip-path reveal + a nib gliding the reveal edge.
+    -->
+    <div id="root">
+      <style>
+        .boot-splash {
+          position: fixed;
+          inset: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 22px;
+          background: #f1f2ea;
+          font-family: 'Archivo', system-ui, sans-serif;
+        }
+        .boot-splash-stage { position: relative; display: inline-block; }
+        .boot-splash-word {
+          display: block;
+          font-size: 72px;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          line-height: 1;
+          color: #1b1c18;
+          clip-path: inset(0 100% 0 0);
+          animation: bootWrite 3s ease-in-out infinite;
+        }
+        .boot-splash-base {
+          position: absolute;
+          left: 0;
+          right: 0;
+          bottom: -12px;
+          height: 2px;
+          background: #1b1c18;
+          transform: scaleX(0);
+          transform-origin: left center;
+          animation: bootBase 3s ease-in-out infinite;
+        }
+        .boot-splash-nib {
+          position: absolute;
+          left: 0;
+          bottom: -13px;
+          width: 24px;
+          height: 28px;
+          transform: translateX(-4px);
+          animation: bootNib 3s ease-in-out infinite;
+        }
+        .boot-splash-nib svg { display: block; width: 100%; height: 100%; }
+        .boot-splash-ink {
+          position: absolute;
+          left: 2px;
+          bottom: 2px;
+          width: 5px;
+          height: 5px;
+          border-radius: 50%;
+          background: #9a6b16;
+          box-shadow: 0 0 5px rgba(154, 107, 22, 0.12);
+        }
+        .boot-splash-cap {
+          font-family: 'IBM Plex Mono', ui-monospace, monospace;
+          font-size: 12px;
+          letter-spacing: 0.18em;
+          text-transform: uppercase;
+          color: #84877a;
+        }
+        @keyframes bootWrite {
+          0% { clip-path: inset(0 100% 0 0); opacity: 1; }
+          50% { clip-path: inset(0 0 0 0); opacity: 1; }
+          75% { clip-path: inset(0 0 0 0); opacity: 1; }
+          90% { clip-path: inset(0 0 0 0); opacity: 0; }
+          90.01% { clip-path: inset(0 100% 0 0); opacity: 0; }
+          100% { clip-path: inset(0 100% 0 0); opacity: 0; }
+        }
+        @keyframes bootNib {
+          0% { left: 0; opacity: 0; }
+          6% { opacity: 1; }
+          50% { left: 100%; opacity: 1; }
+          62% { left: 100%; opacity: 0; }
+          90%, 100% { left: 0; opacity: 0; }
+        }
+        @keyframes bootBase {
+          0% { transform: scaleX(0); opacity: 1; }
+          50% { transform: scaleX(1); opacity: 1; }
+          88% { transform: scaleX(1); opacity: 1; }
+          94% { transform: scaleX(1); opacity: 0; }
+          94.01% { transform: scaleX(0); opacity: 0; }
+          100% { transform: scaleX(0); opacity: 0; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .boot-splash-word { animation: none; clip-path: none; opacity: 1; }
+          .boot-splash-base { animation: none; transform: scaleX(1); opacity: 1; }
+          .boot-splash-nib { animation: none; opacity: 0; }
+        }
+      </style>
+      <div class="boot-splash" aria-hidden="true">
+        <div class="boot-splash-stage">
+          <span class="boot-splash-word">Ledger</span>
+          <span class="boot-splash-base"></span>
+          <span class="boot-splash-nib">
+            <svg width="24" height="28" viewBox="0 0 24 28" fill="none">
+              <path d="M19 1.6 22.4 5 8.2 19.2 4.2 21.4 5.9 16.6Z" fill="#1b1c18" />
+              <path d="M5.9 16.6 4.2 21.4 8.2 19.2Z" fill="#fbfbf6" />
+              <line x1="6" y1="16.5" x2="4.4" y2="21" stroke="#1b1c18" stroke-width="1" />
+            </svg>
+            <span class="boot-splash-ink"></span>
+          </span>
+        </div>
+        <span class="boot-splash-cap">Loading</span>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

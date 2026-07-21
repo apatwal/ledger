@@ -1,21 +1,23 @@
-import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, List, Upload, BookText, Wand2 } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import { LayoutDashboard, List, Upload, BookText, Wand2, LineChart, PiggyBank } from 'lucide-react'
+import { UserButton } from '@clerk/react'
 import { getHealth } from '../lib/api'
 import Assistant from './Assistant'
+import AccountSelect from './AccountSelect'
+
+// When Clerk isn't configured, the app renders outside <ClerkProvider>, so the
+// UserButton (which needs Clerk context) must be hidden.
+const AUTH_ENABLED = Boolean(import.meta.env.VITE_CLERK_PUBLISHABLE_KEY)
 
 interface LayoutProps {
   children: React.ReactNode
 }
 
 export default function Layout({ children }: LayoutProps) {
-  const [online, setOnline] = useState<boolean | null>(null)
-
-  useEffect(() => {
-    getHealth()
-      .then(() => setOnline(true))
-      .catch(() => setOnline(false))
-  }, [])
+  // Health ping — cached; null while connecting, true when synced, false offline.
+  const health = useQuery({ queryKey: ['health'], queryFn: getHealth })
+  const online: boolean | null = health.isSuccess ? true : health.isError ? false : null
 
   return (
     <div className="app-layout">
@@ -51,6 +53,22 @@ export default function Layout({ children }: LayoutProps) {
             Transactions
           </NavLink>
 
+          <NavLink
+            to="/investments"
+            className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+          >
+            <LineChart className="nav-link-icon" />
+            Investments
+          </NavLink>
+
+          <NavLink
+            to="/budget"
+            className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+          >
+            <PiggyBank className="nav-link-icon" />
+            Budget
+          </NavLink>
+
           <div className="nav-section-label">Tools</div>
 
           <NavLink
@@ -66,7 +84,7 @@ export default function Layout({ children }: LayoutProps) {
             className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
           >
             <Upload className="nav-link-icon" />
-            CSV Import
+            Import
           </NavLink>
         </nav>
 
@@ -79,7 +97,18 @@ export default function Layout({ children }: LayoutProps) {
         </div>
       </aside>
 
-      <main className="main-content">{children}</main>
+      <main className="main-content">
+        <div className="topbar">
+          <div className="topbar-label">Viewing</div>
+          <AccountSelect />
+          {AUTH_ENABLED && (
+            <div className="topbar-user">
+              <UserButton />
+            </div>
+          )}
+        </div>
+        {children}
+      </main>
 
       <Assistant />
     </div>

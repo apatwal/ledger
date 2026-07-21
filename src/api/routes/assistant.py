@@ -15,7 +15,15 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import Transaction
+from ..schemas import BudgetChatRequest, BudgetChatResponse, BudgetCreated
 from .. import ai
+from .budgets import (
+    create_category_budget,
+    create_savings_goal,
+    _category_out,
+    _goal_out,
+    _account_labels,
+)
 
 # Minimum confidence to auto-apply an AI category suggestion + clear needs_review.
 CATEGORIZE_CONFIDENCE_THRESHOLD = 0.6
@@ -27,6 +35,16 @@ _FALLBACK_CATEGORIES = [
     "Transport", "Utilities", "Healthcare", "Entertainment", "Clothing",
     "Savings", "Investment", "Other",
 ]
+
+
+def _parse_iso_date(value: Optional[str]) -> Optional[date]:
+    """Parse a YYYY-MM-DD string from the model; None on empty/invalid."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
 
 
 # ── Request models ─────────────────────────────────────────────────────────────
@@ -75,6 +93,61 @@ def chat(body: ChatRequest, db: Session = Depends(get_db)):
         raise HTTPException(503, str(e))
     except Exception as e:  # provider / network errors
         raise HTTPException(502, f"AI request failed: {e}")
+
+
+@router.post("/budget", response_model=BudgetChatResponse)
+def budget(body: BudgetChatRequest, db: Session = Depends(get_db)):
+    """Create budgets/goals from a natural-language request, IMMEDIATELY (no
+    approval step). Gemini returns structured actions; each is persisted via the
+    SAME create helpers the /budgets routes use, then a confirmation is returned.
+    When no budget intent is detected (empty actions) the reply is returned with
+    nothing created. Gated on GEMINI_API_KEY (503 when unset), like the other AI
+    endpoints."""
+    if not ai.is_enabled():
+        raise HTTPException(503, "AI assistant is not configured. Set GEMINI_API_KEY on the server.")
+    if not body.messages:
+        raise HTTPException(400, "messages must not be empty")
+
+    known = db.execute(
+        sqlalchemy.text("SELECT DISTINCT category FROM transactions ORDER BY category")
+    ).scalars().all()
+    known = list(known) or _FALLBACK_CATEGORIES
+    labels = _account_labels(db)
+
+    try:
+        plan = ai.plan_budget(
+            [m.model_dump() for m in body.messages],
+            known_categories=known,
+            account_labels=labels,
+        )
+    except ai.AINotConfigured as e:
+        raise HTTPException(503, str(e))
+    except Exception as e:  # provider / network errors
+        raise HTTPException(502, f"AI request failed: {e}")
+
+    created = BudgetCreated()
+    for action in plan.get("actions", []):
+        kind = (action.get("kind") or "").strip()
+        if kind == "goal":
+            name = action.get("name")
+            target_amount = action.get("target_amount")
+            if not name or not target_amount or target_amount <= 0:
+                continue
+            target_date = _parse_iso_date(action.get("target_date"))
+            goal = create_savings_goal(
+                db, name, float(target_amount), target_date, action.get("account")
+            )
+            created.goals.append(_goal_out(db, goal))
+        elif kind == "category_limit":
+            category = action.get("category")
+            limit_amount = action.get("limit_amount")
+            if not category or not limit_amount or limit_amount <= 0:
+                continue
+            budget_obj = create_category_budget(db, category, float(limit_amount))
+            created.category_limits.append(_category_out(db, budget_obj))
+
+    reply = plan.get("reply") or "Done."
+    return BudgetChatResponse(reply=reply, created=created)
 
 
 @router.post("/categorize")

@@ -2,6 +2,7 @@
 Expense Tracker — FastAPI backend
 Run: uvicorn src.api.main:app --reload --port 8000
 """
+import logging
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -18,14 +19,30 @@ from sqlalchemy.orm import Session
 
 from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
-from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates
+from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets
+from . import plaid_client
+from . import auth
+from .auth import require_user
+
+logger = logging.getLogger("expense_tracker.auth")
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Expense Tracker API", version="1.0.0")
 
+# CORS origins are env-driven (CORS_ORIGINS, comma-separated). We do NOT use "*"
+# because allow_credentials=True with a wildcard is both unsafe and rejected by
+# browsers. Defaults to the local Vite dev origin. In single-origin prod (SPA
+# served by FastAPI) CORS is not exercised at all.
+_cors_origins_raw = (os.environ.get("CORS_ORIGINS") or "").strip()
+_cors_origins = (
+    [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    if _cors_origins_raw
+    else ["http://localhost:3000"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,17 +51,26 @@ app.add_middleware(
 # ── Routers ──────────────────────────────────────────────────────────────────
 API_PREFIX = "/api"
 
-app.include_router(transactions.router, prefix=API_PREFIX)
-app.include_router(csv_import.router, prefix=API_PREFIX)   # /api/transactions/csv*
-app.include_router(stats.router, prefix=API_PREFIX)
-app.include_router(assistant.router, prefix=API_PREFIX)
-app.include_router(rules.router, prefix=API_PREFIX)
-app.include_router(imports.router, prefix=API_PREFIX)
-app.include_router(duplicates.router, prefix=API_PREFIX)
+# Auth (Clerk) is GATED: with no Clerk env set, require_user is a no-op and every
+# request is allowed (keeps local dev + the existing test suite green). When Clerk
+# is configured it verifies the session JWT + email allowlist. Applied to every
+# feature router below; /api/health and the static SPA catch-all stay OPEN.
+_auth = [Depends(require_user)]
+
+app.include_router(transactions.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(csv_import.router, prefix=API_PREFIX, dependencies=_auth)   # /api/transactions/csv*
+app.include_router(stats.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(assistant.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(rules.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(imports.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(duplicates.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(plaid_routes.router, prefix=API_PREFIX, dependencies=_auth)   # /api/plaid/* (v8)
+app.include_router(budgets.router, prefix=API_PREFIX, dependencies=_auth)        # /api/budgets/* (v9b)
 
 
 # ── Standalone endpoints ──────────────────────────────────────────────────────
 
+# LEFT OPEN (no auth) for Render health checks — do not protect this.
 @app.get(f"{API_PREFIX}/health")
 def health():
     return {"status": "ok"}
@@ -58,7 +84,7 @@ DEFAULT_CATEGORIES = [
 ]
 
 
-@app.get(f"{API_PREFIX}/categories", response_model=list[str])
+@app.get(f"{API_PREFIX}/categories", response_model=list[str], dependencies=_auth)
 def get_categories(db: Session = Depends(get_db)):
     """Return distinct categories from DB, merged with sensible defaults."""
     rows = db.execute(
@@ -70,7 +96,7 @@ def get_categories(db: Session = Depends(get_db)):
     return merged
 
 
-@app.get(f"{API_PREFIX}/accounts", response_model=list[str])
+@app.get(f"{API_PREFIX}/accounts", response_model=list[str], dependencies=_auth)
 def get_accounts(db: Session = Depends(get_db)):
     """Return distinct non-empty accounts/cards seen in the DB (v4)."""
     rows = db.execute(
@@ -181,6 +207,26 @@ def _migrate_add_dup_dismissed_column() -> None:
     _add_column_if_missing("transactions", "dup_dismissed", "BOOLEAN NOT NULL DEFAULT FALSE")
 
 
+def _migrate_add_plaid_columns() -> None:
+    """v8 migration: add Plaid provenance columns to transactions (portable).
+    `plaid_items` is created automatically by create_all()."""
+    _add_column_if_missing("transactions", "plaid_transaction_id", "VARCHAR")
+    _add_column_if_missing("transactions", "plaid_account_id", "VARCHAR")
+    _add_column_if_missing("transactions", "plaid_item_id", "INTEGER")
+
+
+def _migrate_add_v9_enrichment_columns() -> None:
+    """v9 migration: add Plaid transaction-enrichment columns to transactions and
+    institution-branding columns to plaid_items (portable)."""
+    _add_column_if_missing("transactions", "merchant_name", "VARCHAR")
+    _add_column_if_missing("transactions", "logo_url", "VARCHAR")
+    _add_column_if_missing("transactions", "pending", "BOOLEAN NOT NULL DEFAULT FALSE")
+    _add_column_if_missing("transactions", "pending_transaction_id", "VARCHAR")
+    _add_column_if_missing("transactions", "category_icon_url", "VARCHAR")
+    _add_column_if_missing("plaid_items", "institution_logo", "TEXT")
+    _add_column_if_missing("plaid_items", "institution_color", "VARCHAR")
+
+
 def seed_data(db: Session) -> None:
     """Insert ~19 realistic transactions if the table is empty."""
     count = db.execute(sqlalchemy.text("SELECT COUNT(*) FROM transactions")).scalar()
@@ -219,17 +265,141 @@ def seed_data(db: Session) -> None:
     print(f"[seed] Inserted {len(samples)} sample transactions.")
 
 
+def _require_auth_in_prod() -> bool:
+    """True when this looks like a production deploy that must not run wide-open:
+    an explicit REQUIRE_AUTH=true, or the presence of Render's own RENDER env var."""
+    if (os.environ.get("REQUIRE_AUTH") or "").strip().lower() == "true":
+        return True
+    return bool(os.environ.get("RENDER"))
+
+
+def _enforce_auth_policy() -> None:
+    """Fix 1: never silently deploy wide-open.
+
+    * If this is a production deploy (REQUIRE_AUTH=true or Render) AND auth is
+      disabled (no CLERK_ISSUER/CLERK_JWKS_URL), REFUSE to boot.
+    * Otherwise just log loudly whether auth is on or off. Under the test suite
+      neither REQUIRE_AUTH nor RENDER is set, so the hard-fail never triggers —
+      only the warning is logged.
+    """
+    if auth.is_auth_enabled():
+        logger.info("[auth] enabled (issuer=%s)", auth._issuer() or "<jwks-url>")
+        return
+    if _require_auth_in_prod():
+        raise RuntimeError(
+            "[auth] REFUSING TO BOOT: authentication is DISABLED but this is a "
+            "production deploy (REQUIRE_AUTH=true or RENDER set). Set CLERK_ISSUER "
+            "(or CLERK_JWKS_URL) to enable auth, or unset REQUIRE_AUTH/RENDER."
+        )
+    logger.warning(
+        "[auth] DISABLED — all /api routes are OPEN. Set CLERK_ISSUER to enable."
+    )
+
+
 @app.on_event("startup")
 def startup():
+    _enforce_auth_policy()
     Base.metadata.create_all(bind=engine)
     _migrate_add_account_column()       # v4: ensure `account` column exists on legacy DBs
     _migrate_add_needs_review_column()  # v5: ensure needs_review/review_reason exist
     _migrate_add_batch_id_column()      # v5.2: ensure batch_id exists
     _migrate_add_statement_type_column()  # v5.3: ensure import_batches.statement_type exists
     _migrate_add_dup_dismissed_column()   # v7: ensure transactions.dup_dismissed exists
+    _migrate_add_plaid_columns()          # v8: ensure transactions.plaid_* columns exist
+    _migrate_add_v9_enrichment_columns()  # v9: ensure enrichment + branding columns exist
     # Auto-seeding is OPT-IN. By default the DB starts empty so real user data
     # is never re-created on restart. Set SEED_DB=1 (for dev/demo) to seed the
     # sample transactions into an empty DB.
     if os.getenv("SEED_DB") in {"1", "true", "True", "yes"}:
         with SessionLocal() as db:
             seed_data(db)
+    _maybe_start_plaid_scheduler()        # v8: optional in-process auto-sync
+    _maybe_start_keepalive()              # feature/performance: optional Neon keep-warm
+
+
+# ── Plaid auto-sync scheduler (v8) ─────────────────────────────────────────────
+# In-process APScheduler job that periodically calls sync_items(). GATED: only
+# starts when Plaid is configured AND PLAID_AUTOSYNC_INTERVAL_MINUTES is a
+# positive int. Never runs in tests (env unset) and never breaks startup — any
+# failure is swallowed. On Render's free tier (which sleeps) use a Cron Job
+# hitting POST /api/plaid/sync-all instead (see docs/api-contract.md).
+
+_plaid_scheduler = None
+
+
+def _maybe_start_plaid_scheduler() -> None:
+    global _plaid_scheduler
+    try:
+        if not plaid_client.is_configured():
+            return
+        raw = (os.getenv("PLAID_AUTOSYNC_INTERVAL_MINUTES") or "").strip()
+        if not raw:
+            return
+        try:
+            interval = int(raw)
+        except ValueError:
+            return
+        if interval <= 0:
+            return
+
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from .routes.plaid_routes import sync_items
+
+        def _job():
+            try:
+                with SessionLocal() as db:
+                    sync_items(db)
+            except Exception as e:  # never let a sync failure crash the scheduler
+                print(f"[plaid] auto-sync failed: {e}")
+
+        _plaid_scheduler = BackgroundScheduler(daemon=True)
+        _plaid_scheduler.add_job(_job, "interval", minutes=interval, id="plaid_autosync")
+        _plaid_scheduler.start()
+        print(f"[plaid] auto-sync scheduler started ({interval} min interval).")
+    except Exception as e:
+        print(f"[plaid] scheduler not started: {e}")
+
+
+# ── Neon keep-warm ping (feature/performance) ──────────────────────────────────
+# Optional in-process APScheduler job that issues a lightweight `SELECT 1` on an
+# interval to keep Neon's serverless compute from scaling to zero (which is what
+# causes the multi-second cold-start stall on the first request after idle) while
+# THIS server process is alive. GATED like the Plaid scheduler: only starts when
+# the DB is Postgres AND DB_KEEPALIVE_SECONDS is a positive int. On SQLite (local
+# dev + tests, env unset) it NEVER starts, so nothing changes there. LIMITATION:
+# it only keeps Neon warm while this process runs — on a host that itself sleeps
+# (e.g. Render free tier) it does nothing until the instance is back up.
+
+_keepalive_scheduler = None
+
+
+def _maybe_start_keepalive() -> None:
+    global _keepalive_scheduler
+    try:
+        if engine.dialect.name == "sqlite":
+            return  # SQLite (local/tests): never keep-warm
+        raw = (os.getenv("DB_KEEPALIVE_SECONDS") or "").strip()
+        if not raw:
+            return
+        try:
+            seconds = int(raw)
+        except ValueError:
+            return
+        if seconds <= 0:
+            return
+
+        from apscheduler.schedulers.background import BackgroundScheduler
+
+        def _job():
+            try:
+                with SessionLocal() as db:
+                    db.execute(sqlalchemy.text("SELECT 1"))
+            except Exception as e:  # never let a transient DB blip crash the scheduler
+                print(f"[keepalive] ping failed: {e}")
+
+        _keepalive_scheduler = BackgroundScheduler(daemon=True)
+        _keepalive_scheduler.add_job(_job, "interval", seconds=seconds, id="neon_keepalive")
+        _keepalive_scheduler.start()
+        print(f"[keepalive] Neon keep-warm every {seconds}s")
+    except Exception as e:
+        print(f"[keepalive] not started: {e}")

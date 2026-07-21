@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AreaChart,
   Area,
@@ -20,14 +21,16 @@ import {
   getStatsByCategory,
   getStatsOverTime,
   getStatsByAccount,
-  getAccounts,
   getInsights,
   getAssistantStatus,
   getDuplicates,
 } from '../lib/api'
-import type { StatsSummary, StatsByCategory, StatsOverTime, AccountStat, Granularity, DuplicateGroup } from '../lib/types'
+import type { Granularity } from '../lib/types'
 import DatePicker from './DatePicker'
 import DuplicatesModal from './DuplicatesModal'
+import { useAccountSelection } from '../lib/accountSelection'
+import { acctKey } from '../lib/queryKeys'
+import { iconForCategory } from '../lib/categoryIcons'
 
 // Ledger palette — inks, greens, ochres pulled from the design system.
 const PIE_COLORS = [
@@ -138,35 +141,63 @@ export default function Dashboard() {
   const [granularity, setGranularity] = useState<Granularity>(initial.granularity)
   const [activePreset, setActivePreset] = useState<PresetKey | null>('30d')
 
-  // Account filter: '' = All cards (aggregate across everything).
-  const [accountFilter, setAccountFilter] = useState('')
-  const [accounts, setAccounts] = useState<string[]>([])
+  const queryClient = useQueryClient()
 
-  const [summary, setSummary] = useState<StatsSummary | null>(null)
-  const [byCategory, setByCategory] = useState<StatsByCategory[]>([])
-  const [overTime, setOverTime] = useState<StatsOverTime[]>([])
-  const [byAccount, setByAccount] = useState<AccountStat[]>([])
+  // Which accounts are in view is driven globally by the header selector.
+  const { accountsParam, isSelected, toggle, balanceOf } = useAccountSelection()
+  // The account selection is stringified into every stats/duplicates key so
+  // cached data is never shown for the wrong filter.
+  const accounts = accountsParam()
+  const acctPart = acctKey(accounts)
 
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  // Headline stats. by-account is the per-card breakdown — always across all
+  // cards (date range only), so its key omits the account selection.
+  const summaryQ = useQuery({
+    queryKey: ['stats', 'summary', { start_date: startDate, end_date: endDate, accounts: acctPart }],
+    queryFn: () => getStatsSummary({ start_date: startDate, end_date: endDate, accounts }),
+  })
+  const byCategoryQ = useQuery({
+    queryKey: ['stats', 'by-category', { start_date: startDate, end_date: endDate, accounts: acctPart }],
+    queryFn: () => getStatsByCategory({ start_date: startDate, end_date: endDate, accounts }),
+  })
+  const overTimeQ = useQuery({
+    queryKey: ['stats', 'over-time', { start_date: startDate, end_date: endDate, accounts: acctPart, granularity }],
+    queryFn: () => getStatsOverTime(granularity, { start_date: startDate, end_date: endDate, accounts }),
+  })
+  const byAccountQ = useQuery({
+    queryKey: ['stats', 'by-account', { start_date: startDate, end_date: endDate }],
+    queryFn: () => getStatsByAccount({ start_date: startDate, end_date: endDate }),
+  })
+
+  const summary = summaryQ.data ?? null
+  const byCategory = byCategoryQ.data ?? []
+  const overTime = overTimeQ.data ?? []
+  const byAccount = byAccountQ.data ?? []
+  const loading = summaryQ.isPending || byCategoryQ.isPending || overTimeQ.isPending || byAccountQ.isPending
+  const firstError = summaryQ.error ?? byCategoryQ.error ?? overTimeQ.error ?? byAccountQ.error
+  const error = firstError instanceof Error ? firstError.message : firstError ? 'Failed to load data' : null
+
+  // Refresh/retry forces every filtered stats + duplicates variant to refetch.
+  const loadData = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ['stats'] })
+    void queryClient.invalidateQueries({ queryKey: ['duplicates'] })
+  }, [queryClient])
 
   // Duplicate detection (v7) — respects the current date/account filters.
-  const [duplicates, setDuplicates] = useState<DuplicateGroup[]>([])
+  // Non-critical: on error we just show nothing (data ?? []).
+  const duplicatesQ = useQuery({
+    queryKey: ['duplicates', { start_date: startDate, end_date: endDate, accounts: acctPart }],
+    queryFn: () => getDuplicates({ start_date: startDate, end_date: endDate, accounts }),
+  })
+  const duplicates = duplicatesQ.data ?? []
   const [dupModalOpen, setDupModalOpen] = useState(false)
 
-  const [aiEnabled, setAiEnabled] = useState(false)
+  const assistantStatusQ = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
+  const aiEnabled = assistantStatusQ.data?.enabled ?? false
+
   const [insights, setInsights] = useState<string | null>(null)
   const [insightsLoading, setInsightsLoading] = useState(false)
   const [insightsError, setInsightsError] = useState<string | null>(null)
-
-  useEffect(() => {
-    getAssistantStatus()
-      .then((s) => setAiEnabled(s.enabled))
-      .catch(() => setAiEnabled(false))
-    getAccounts()
-      .then(setAccounts)
-      .catch(() => { /* no accounts yet */ })
-  }, [])
 
   const loadInsights = useCallback(async () => {
     setInsightsLoading(true)
@@ -187,61 +218,12 @@ export default function Dashboard() {
     setInsightsError(null)
   }, [startDate, endDate])
 
-  const loadData = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      // account filter drives the headline stats; '' => omit (aggregate all).
-      const params = {
-        start_date: startDate,
-        end_date: endDate,
-        ...(accountFilter ? { account: accountFilter } : {}),
-      }
-      // by-account is the per-card breakdown — always across all cards (date range only).
-      const [s, cat, ot, acct] = await Promise.all([
-        getStatsSummary(params),
-        getStatsByCategory(params),
-        getStatsOverTime(granularity, params),
-        getStatsByAccount({ start_date: startDate, end_date: endDate }),
-      ])
-      setSummary(s)
-      setByCategory(cat)
-      setOverTime(ot)
-      setByAccount(acct)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load data')
-    } finally {
-      setLoading(false)
-    }
-  }, [startDate, endDate, granularity, accountFilter])
-
-  useEffect(() => {
-    void loadData()
-  }, [loadData])
-
-  // Duplicate params track the same window/account as the headline stats.
+  // Duplicate params track the same window/accounts as the headline stats.
   const dupParams = {
     start_date: startDate,
     end_date: endDate,
-    ...(accountFilter ? { account: accountFilter } : {}),
+    accounts,
   }
-
-  const loadDuplicates = useCallback(async () => {
-    try {
-      const rows = await getDuplicates({
-        start_date: startDate,
-        end_date: endDate,
-        ...(accountFilter ? { account: accountFilter } : {}),
-      })
-      setDuplicates(rows)
-    } catch {
-      setDuplicates([]) // non-critical — never block the dashboard on this
-    }
-  }, [startDate, endDate, accountFilter])
-
-  useEffect(() => {
-    void loadDuplicates()
-  }, [loadDuplicates])
 
   const dupTotalExtra = duplicates.reduce((sum, g) => sum + g.total_extra, 0)
 
@@ -304,20 +286,6 @@ export default function Dashboard() {
               {g.charAt(0).toUpperCase() + g.slice(1)}
             </button>
           ))}
-        </div>
-        <div className="filter-group">
-          <label className="filter-label" htmlFor="dash-account">Card</label>
-          <select
-            id="dash-account"
-            className="filter-select"
-            value={accountFilter}
-            onChange={(e) => setAccountFilter(e.target.value)}
-          >
-            <option value="">All cards</option>
-            {accounts.map((a) => (
-              <option key={a} value={a}>{a}</option>
-            ))}
-          </select>
         </div>
         <button className="btn btn-primary btn-sm" onClick={() => void loadData()}>
           Refresh
@@ -417,22 +385,25 @@ export default function Dashboard() {
             <section className="bycard">
               <div className="bycard-head">
                 <div className="chart-title">Spending by card</div>
-                <span className="chart-note">{byAccount.length} account{byAccount.length === 1 ? '' : 's'} · click to filter</span>
+                <span className="chart-note">{byAccount.length} account{byAccount.length === 1 ? '' : 's'} · click to toggle</span>
               </div>
               <div className="bycard-list">
                 {(() => {
                   const maxExpense = Math.max(...byAccount.map((a) => a.expense), 1)
                   return byAccount.map((a) => {
-                    const active = accountFilter === a.account
+                    // Clicking a card toggles its membership in the global selection.
+                    const on = isSelected(a.account)
                     const pct = Math.round((a.expense / maxExpense) * 100)
+                    const bal = balanceOf(a.account)
+                    const balAmt = bal?.current ?? bal?.available
                     return (
                       <button
                         key={a.account}
                         type="button"
-                        className={`bycard-row${active ? ' active' : ''}`}
-                        onClick={() => setAccountFilter(active ? '' : a.account)}
-                        aria-pressed={active}
-                        title={active ? 'Clear card filter' : `Filter dashboard to ${a.account}`}
+                        className={`bycard-row${on ? ' active' : ' off'}`}
+                        onClick={() => toggle(a.account)}
+                        aria-pressed={on}
+                        title={on ? `Hide ${a.account} everywhere` : `Show ${a.account} again`}
                       >
                         <div className="bycard-row-top">
                           <span className="bycard-name">{a.account}</span>
@@ -444,7 +415,9 @@ export default function Dashboard() {
                         <div className="bycard-meta">
                           <span>Income {fmt(a.income)}</span>
                           <span className={a.net >= 0 ? 'pos' : 'neg'}>Net {fmtSigned(a.net)}</span>
-                          <span>{a.count} {a.count === 1 ? 'entry' : 'entries'}</span>
+                          {balAmt !== null && balAmt !== undefined
+                            ? <span>Balance {fmt(balAmt)}</span>
+                            : <span>{a.count} {a.count === 1 ? 'entry' : 'entries'}</span>}
                         </div>
                       </button>
                     )
@@ -554,7 +527,14 @@ export default function Dashboard() {
                     </Pie>
                     <Tooltip content={<PieTooltip />} />
                     <Legend
-                      formatter={(value) => <span style={{ fontSize: 12, color: C.inkFaint }}>{value}</span>}
+                      formatter={(value) => {
+                        const Icon = iconForCategory(String(value))
+                        return (
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: C.inkFaint, verticalAlign: 'middle' }}>
+                            <Icon size={12} /> {value}
+                          </span>
+                        )
+                      }}
                     />
                   </PieChart>
                 </ResponsiveContainer>
@@ -602,7 +582,7 @@ export default function Dashboard() {
         <DuplicatesModal
           params={dupParams}
           onClose={() => setDupModalOpen(false)}
-          onChanged={() => void loadDuplicates()}
+          onChanged={() => void queryClient.invalidateQueries({ queryKey: ['duplicates'] })}
         />
       )}
     </div>

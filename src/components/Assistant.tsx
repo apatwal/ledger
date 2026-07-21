@@ -1,18 +1,46 @@
 import { useEffect, useRef, useState } from 'react'
-import { Sparkles, X, ArrowUp } from 'lucide-react'
-import { getAssistantStatus, assistantChat } from '../lib/api'
-import type { ChatMessage } from '../lib/types'
+import { Link } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Sparkles, X, ArrowUp, Check, ArrowRight } from 'lucide-react'
+import { getAssistantStatus, assistantBudget } from '../lib/api'
+import type { ChatMessage, BudgetChatResponse } from '../lib/types'
 
 const SUGGESTIONS = [
   'How much did I spend on dining this year?',
-  'What are my biggest expense categories?',
-  'Am I in the black or the red?',
+  'Save $2,000 for a Japan trip by December',
+  'Cap my Food & Drink spending at $400 a month',
 ]
 
+// A rendered chat entry — the assistant may also have `created` budgets attached.
+interface ChatEntry {
+  role: 'user' | 'assistant'
+  content: string
+  created?: BudgetChatResponse['created']
+}
+
+function fmt(n: number): string {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    maximumFractionDigits: 0,
+  }).format(n)
+}
+
+function monthYear(iso: string | null): string {
+  if (!iso) return ''
+  const d = new Date(`${iso}T00:00:00`)
+  if (isNaN(d.getTime())) return iso
+  return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
+}
+
+function hasCreations(c?: BudgetChatResponse['created']): boolean {
+  return !!c && (c.goals.length > 0 || c.category_limits.length > 0)
+}
+
 export default function Assistant() {
-  const [enabled, setEnabled] = useState(false)
+  const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [entries, setEntries] = useState<ChatEntry[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -20,15 +48,12 @@ export default function Assistant() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  useEffect(() => {
-    getAssistantStatus()
-      .then((s) => setEnabled(s.enabled))
-      .catch(() => setEnabled(false))
-  }, [])
+  const { data: status } = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
+  const enabled = status?.enabled ?? false
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
-  }, [messages, loading])
+  }, [entries, loading])
 
   useEffect(() => {
     if (open) inputRef.current?.focus()
@@ -38,13 +63,18 @@ export default function Assistant() {
     const trimmed = text.trim()
     if (!trimmed || loading) return
     setError(null)
-    const next: ChatMessage[] = [...messages, { role: 'user', content: trimmed }]
-    setMessages(next)
+    const next: ChatEntry[] = [...entries, { role: 'user', content: trimmed }]
+    setEntries(next)
     setInput('')
     setLoading(true)
     try {
-      const res = await assistantChat(next)
-      setMessages([...next, { role: 'assistant', content: res.reply }])
+      // The budget endpoint answers like normal chat AND creates goals/limits when
+      // the message expresses that intent — so it cleanly covers both cases.
+      const history: ChatMessage[] = next.map((e) => ({ role: e.role, content: e.content }))
+      const res = await assistantBudget(history)
+      setEntries([...next, { role: 'assistant', content: res.reply, created: res.created }])
+      // The assistant may have created goals/limits — refresh the Budget views.
+      if (hasCreations(res.created)) void queryClient.invalidateQueries({ queryKey: ['budgets'] })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Something went wrong')
     } finally {
@@ -76,9 +106,9 @@ export default function Assistant() {
           </div>
 
           <div className="assistant-body" ref={scrollRef}>
-            {messages.length === 0 && (
+            {entries.length === 0 && (
               <div className="assistant-intro">
-                <p>Ask anything about your spending. I read your real transactions to answer.</p>
+                <p>Ask anything about your spending, or tell me a savings goal or category limit and I'll set it up.</p>
                 <div className="assistant-suggestions">
                   {SUGGESTIONS.map((s) => (
                     <button key={s} className="assistant-chip" onClick={() => void send(s)}>
@@ -89,9 +119,35 @@ export default function Assistant() {
               </div>
             )}
 
-            {messages.map((m, i) => (
-              <div key={i} className={`chat-row ${m.role}`}>
-                <div className={`chat-bubble ${m.role}`}>{m.content}</div>
+            {entries.map((m, i) => (
+              <div key={i}>
+                <div className={`chat-row ${m.role}`}>
+                  <div className={`chat-bubble ${m.role}`}>{m.content}</div>
+                </div>
+                {m.role === 'assistant' && hasCreations(m.created) && (
+                  <div className="budget-confirm">
+                    {m.created!.goals.map((g) => (
+                      <div key={`g-${g.id}`} className="budget-confirm-item">
+                        <Check size={13} className="budget-confirm-check" />
+                        <span>
+                          Created goal <strong>'{g.name}'</strong> — {fmt(g.target_amount)}
+                          {g.target_date ? ` by ${monthYear(g.target_date)}` : ''}
+                        </span>
+                      </div>
+                    ))}
+                    {m.created!.category_limits.map((c) => (
+                      <div key={`c-${c.id}`} className="budget-confirm-item">
+                        <Check size={13} className="budget-confirm-check" />
+                        <span>
+                          <strong>{c.category}</strong> capped at {fmt(c.limit_amount)}/mo
+                        </span>
+                      </div>
+                    ))}
+                    <Link to="/budget" className="budget-confirm-link" onClick={() => setOpen(false)}>
+                      View in Budget <ArrowRight size={13} />
+                    </Link>
+                  </div>
+                )}
               </div>
             ))}
 
@@ -110,7 +166,7 @@ export default function Assistant() {
             <textarea
               ref={inputRef}
               rows={1}
-              placeholder="Ask about your money…"
+              placeholder="Ask, or set a goal or limit…"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}

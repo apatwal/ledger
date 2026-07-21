@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { X, Sparkles } from 'lucide-react'
 import {
   createTransaction,
@@ -11,6 +12,7 @@ import {
   previewRule,
   applyRules,
 } from '../lib/api'
+import { invalidateLedger } from '../lib/queryKeys'
 import type { Transaction, TransactionCreate, TransactionType, RuleCreate } from '../lib/types'
 
 // Derive a sensible match token from a description (longest alphabetic word, e.g. "STARBUCKS").
@@ -42,6 +44,7 @@ const DEFAULT_CATEGORIES = [
 
 export default function TransactionModal({ transaction, onClose, onSaved }: Props) {
   const isEdit = Boolean(transaction)
+  const queryClient = useQueryClient()
 
   const [date, setDate] = useState(transaction?.date ?? new Date().toISOString().split('T')[0])
   const [amount, setAmount] = useState(transaction?.amount?.toString() ?? '')
@@ -50,32 +53,21 @@ export default function TransactionModal({ transaction, onClose, onSaved }: Prop
   const [customCategory, setCustomCategory] = useState('')
   const [description, setDescription] = useState(transaction?.description ?? '')
   const [account, setAccount] = useState(transaction?.account ?? '')
-  const [categories, setCategories] = useState<string[]>(DEFAULT_CATEGORIES)
-  const [accounts, setAccounts] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
 
-  const [aiEnabled, setAiEnabled] = useState(false)
   const [suggesting, setSuggesting] = useState(false)
+
+  const { data: fetchedCategories } = useQuery({ queryKey: ['categories'], queryFn: getCategories })
+  const { data: accounts = [] } = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
+  const { data: assistantStatus } = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
+  const categories = fetchedCategories && fetchedCategories.length > 0 ? fetchedCategories : DEFAULT_CATEGORIES
+  const aiEnabled = assistantStatus?.enabled ?? false
 
   // "Learn a rule" from an edit (v5): when editing and category/type changes.
   const [learnRule, setLearnRule] = useState(false)
   const [ruleMatchCount, setRuleMatchCount] = useState<number | null>(null)
   const ruleToken = ruleTokenFrom(transaction?.description ?? '')
-
-  useEffect(() => {
-    getCategories()
-      .then((cats) => {
-        if (cats.length > 0) setCategories(cats)
-      })
-      .catch(() => { /* use defaults */ })
-    getAccounts()
-      .then(setAccounts)
-      .catch(() => { /* no accounts yet */ })
-    getAssistantStatus()
-      .then((s) => setAiEnabled(s.enabled))
-      .catch(() => setAiEnabled(false))
-  }, [])
 
   async function handleAutoCategorize() {
     if (suggesting) return
@@ -175,11 +167,15 @@ export default function TransactionModal({ transaction, onClose, onSaved }: Prop
           try {
             await createRule(buildLearnedRule())
             await applyRules({})
+            void queryClient.invalidateQueries({ queryKey: ['rules'] })
           } catch { /* rule creation is best-effort; the edit already saved */ }
         }
       } else {
         await createTransaction(data)
       }
+      // The ledger changed — refresh transactions, all stats, duplicates,
+      // accounts, plaid, holdings and budgets (any of which may derive from it).
+      invalidateLedger(queryClient)
       onSaved()
     } catch (err) {
       setErrors({ submit: err instanceof Error ? err.message : 'Failed to save' })

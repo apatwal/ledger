@@ -1,8 +1,11 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import { Link } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Upload, Download, FileText, CheckCircle, AlertTriangle, XCircle, X, ArrowLeftRight, CreditCard, Eye, Sparkles, History, Trash2, Check, Landmark } from 'lucide-react'
 import { importCsv, getCsvTemplateUrl, getAccounts, getAssistantStatus, categorizeBatch, getImports, reassignImport, deleteImport } from '../lib/api'
 import type { CsvImportResult, ImportBatch, StatementType } from '../lib/types'
+import PlaidConnect from './PlaidConnect'
+import { invalidateLedger } from '../lib/queryKeys'
 
 // Lightweight client-side peek: does the file look like a bank/checking export
 // (a header row with a running-balance / balance column)? If so, pre-select "bank".
@@ -20,46 +23,35 @@ async function detectBankStatement(f: File): Promise<boolean> {
 }
 
 export default function CsvImport() {
+  const queryClient = useQueryClient()
   const [dragOver, setDragOver] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [account, setAccount] = useState('')
-  const [accounts, setAccounts] = useState<string[]>([])
   const [statementType, setStatementType] = useState<StatementType>('card')
   const [autoDetectedBank, setAutoDetectedBank] = useState(false)
   const [importing, setImporting] = useState(false)
   const [result, setResult] = useState<CsvImportResult | null>(null)
   const [importedAccount, setImportedAccount] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [aiEnabled, setAiEnabled] = useState(false)
   const [categorizing, setCategorizing] = useState(false)
   const [aiMsg, setAiMsg] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
+  const { data: accounts = [] } = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
+  const { data: imports = [] } = useQuery({ queryKey: ['imports'], queryFn: getImports })
+  const { data: assistantStatus } = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
+  const aiEnabled = assistantStatus?.enabled ?? false
+
   // Import history (v5.2)
-  const [imports, setImports] = useState<ImportBatch[]>([])
   const [batchBusyId, setBatchBusyId] = useState<number | null>(null)
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null)
   const [batchMsg, setBatchMsg] = useState<string | null>(null)
 
-  const loadImports = useCallback(() => {
-    getImports()
-      .then(setImports)
-      .catch(() => { /* ignore */ })
-  }, [])
-
-  function refreshAccounts() {
-    getAccounts()
-      .then(setAccounts)
-      .catch(() => { /* no accounts yet */ })
+  // A reassign/undo/import changes the ledger and the import list itself.
+  const invalidateAfterImportChange = () => {
+    invalidateLedger(queryClient)
+    void queryClient.invalidateQueries({ queryKey: ['imports'] })
   }
-
-  useEffect(() => {
-    refreshAccounts()
-    loadImports()
-    getAssistantStatus()
-      .then((s) => setAiEnabled(s.enabled))
-      .catch(() => setAiEnabled(false))
-  }, [loadImports])
 
   async function handleReassign(batch: ImportBatch, account: string) {
     setBatchBusyId(batch.id)
@@ -67,8 +59,7 @@ export default function CsvImport() {
     try {
       const { updated } = await reassignImport(batch.id, account || null)
       setBatchMsg(`Reassigned ${updated} transaction${updated === 1 ? '' : 's'} to ${account.trim() || 'Unassigned'}.`)
-      loadImports()
-      refreshAccounts()
+      invalidateAfterImportChange()
     } catch (e) {
       setBatchMsg(e instanceof Error ? e.message : 'Reassign failed')
     } finally {
@@ -83,8 +74,7 @@ export default function CsvImport() {
       await deleteImport(id)
       setDeleteConfirmId(null)
       setBatchMsg('Import undone — its transactions were removed.')
-      loadImports()
-      refreshAccounts()
+      invalidateAfterImportChange()
     } catch (e) {
       setBatchMsg(e instanceof Error ? e.message : 'Delete failed')
     } finally {
@@ -101,6 +91,8 @@ export default function CsvImport() {
         ...(importedAccount ? { account: importedAccount } : {}),
       })
       setAiMsg(`AI categorized ${results.length} transaction${results.length === 1 ? '' : 's'}.`)
+      void queryClient.invalidateQueries({ queryKey: ['transactions'] })
+      void queryClient.invalidateQueries({ queryKey: ['stats'] })
     } catch (e) {
       setAiMsg(e instanceof Error ? e.message : 'Auto-categorize failed')
     } finally {
@@ -145,8 +137,7 @@ export default function CsvImport() {
       setImportedAccount(account.trim())
       setFile(null)
       if (inputRef.current) inputRef.current.value = ''
-      loadImports()
-      refreshAccounts()
+      invalidateAfterImportChange()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Import failed')
     } finally {
@@ -163,19 +154,34 @@ export default function CsvImport() {
 
   return (
     <div>
-      <div className="page-header" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-        <div>
-          <div className="page-eyebrow">Bulk entry</div>
-          <h1 className="page-title">Import from CSV</h1>
-          <p className="page-subtitle">Post many entries to the ledger at once.</p>
-        </div>
+      <div className="page-header">
+        <div className="page-eyebrow">Bulk entry</div>
+        <h1 className="page-title">Import transactions</h1>
+        <p className="page-subtitle">Connect a bank for automatic sync, or import a CSV.</p>
+      </div>
+
+      {/* Bank sync (v8) */}
+      <div className="import-section-label">
+        <Landmark size={14} />
+        Connect a bank (auto-sync)
+      </div>
+      <div style={{ marginBottom: 24 }}>
+        <PlaidConnect />
+      </div>
+
+      {/* CSV import */}
+      <div className="import-section-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          <FileText size={14} />
+          Or import a CSV
+        </span>
         <a
           href={getCsvTemplateUrl()}
           download
-          className="btn btn-secondary"
-          style={{ textDecoration: 'none' }}
+          className="btn btn-secondary btn-sm"
+          style={{ textDecoration: 'none', textTransform: 'none', letterSpacing: 0 }}
         >
-          <Download size={15} />
+          <Download size={14} />
           Download template
         </a>
       </div>

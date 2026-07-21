@@ -49,6 +49,13 @@ _TMP_DB_FD, _TMP_DB_PATH = tempfile.mkstemp(suffix="_test_expense.db")
 os.close(_TMP_DB_FD)
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMP_DB_PATH}"
 
+# Import the app ONCE now, at collection time, so main.py's module-level
+# load_dotenv() runs here — not lazily inside the first test's `client` fixture.
+# Otherwise the first test would run the auth-disable fixture (deleting CLERK_*),
+# then trigger the app's first import, and load_dotenv() would re-populate CLERK_*
+# from the real .env AFTER the fixture ran — re-enabling auth for that one test.
+import src.api.main  # noqa: E402,F401
+
 
 def _import_app():
     """Import and return the FastAPI app from src.api.main."""
@@ -83,6 +90,29 @@ def pytest_unconfigure(config):
         os.unlink(_TMP_DB_PATH)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Disable gated Clerk auth for the whole suite.
+#
+# The real .env may set CLERK_ISSUER / CLERK_JWKS_URL / CLERK_SECRET_KEY /
+# ALLOWED_EMAILS, and src/api/main.py calls load_dotenv() at import time, so
+# those values leak into os.environ during the test run. Because
+# src.api.auth.is_auth_enabled() reads os.environ at CALL time (not import
+# time), deleting these vars before each test disables auth even though main.py
+# has already been imported — matching a clean CI environment.
+#
+# Function-scoped + autouse so it runs before every test. It only DELETES the
+# vars, so test_auth.py (which re-sets its own values per-test via monkeypatch
+# after this fixture runs) still exercises the enabled-auth cases correctly.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _disable_clerk_auth(monkeypatch):
+    """Remove any Clerk auth env vars so the gate is OFF by default."""
+    for var in ("CLERK_ISSUER", "CLERK_JWKS_URL", "CLERK_SECRET_KEY",
+                "ALLOWED_EMAILS"):
+        monkeypatch.delenv(var, raising=False)
+    yield
 
 
 # ---------------------------------------------------------------------------
