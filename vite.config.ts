@@ -4,10 +4,13 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 3000,
+    // Port + API proxy target are env-overridable so an isolated e2e stack can
+    // run the frontend on a different port pointed at a test backend. Defaults
+    // are unchanged for normal dev.
+    port: Number(process.env.VITE_PORT) || 3000,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: process.env.VITE_API_TARGET || 'http://localhost:8000',
         changeOrigin: true,
       },
     },
