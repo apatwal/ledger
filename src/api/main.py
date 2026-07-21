@@ -20,6 +20,7 @@ from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
 from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets
 from . import plaid_client
+from .auth import require_user
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Expense Tracker API", version="1.0.0")
@@ -35,19 +36,26 @@ app.add_middleware(
 # ── Routers ──────────────────────────────────────────────────────────────────
 API_PREFIX = "/api"
 
-app.include_router(transactions.router, prefix=API_PREFIX)
-app.include_router(csv_import.router, prefix=API_PREFIX)   # /api/transactions/csv*
-app.include_router(stats.router, prefix=API_PREFIX)
-app.include_router(assistant.router, prefix=API_PREFIX)
-app.include_router(rules.router, prefix=API_PREFIX)
-app.include_router(imports.router, prefix=API_PREFIX)
-app.include_router(duplicates.router, prefix=API_PREFIX)
-app.include_router(plaid_routes.router, prefix=API_PREFIX)   # /api/plaid/* (v8)
-app.include_router(budgets.router, prefix=API_PREFIX)        # /api/budgets/* (v9b)
+# Auth (Clerk) is GATED: with no Clerk env set, require_user is a no-op and every
+# request is allowed (keeps local dev + the existing test suite green). When Clerk
+# is configured it verifies the session JWT + email allowlist. Applied to every
+# feature router below; /api/health and the static SPA catch-all stay OPEN.
+_auth = [Depends(require_user)]
+
+app.include_router(transactions.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(csv_import.router, prefix=API_PREFIX, dependencies=_auth)   # /api/transactions/csv*
+app.include_router(stats.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(assistant.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(rules.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(imports.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(duplicates.router, prefix=API_PREFIX, dependencies=_auth)
+app.include_router(plaid_routes.router, prefix=API_PREFIX, dependencies=_auth)   # /api/plaid/* (v8)
+app.include_router(budgets.router, prefix=API_PREFIX, dependencies=_auth)        # /api/budgets/* (v9b)
 
 
 # ── Standalone endpoints ──────────────────────────────────────────────────────
 
+# LEFT OPEN (no auth) for Render health checks — do not protect this.
 @app.get(f"{API_PREFIX}/health")
 def health():
     return {"status": "ok"}
@@ -61,7 +69,7 @@ DEFAULT_CATEGORIES = [
 ]
 
 
-@app.get(f"{API_PREFIX}/categories", response_model=list[str])
+@app.get(f"{API_PREFIX}/categories", response_model=list[str], dependencies=_auth)
 def get_categories(db: Session = Depends(get_db)):
     """Return distinct categories from DB, merged with sensible defaults."""
     rows = db.execute(
@@ -73,7 +81,7 @@ def get_categories(db: Session = Depends(get_db)):
     return merged
 
 
-@app.get(f"{API_PREFIX}/accounts", response_model=list[str])
+@app.get(f"{API_PREFIX}/accounts", response_model=list[str], dependencies=_auth)
 def get_accounts(db: Session = Depends(get_db)):
     """Return distinct non-empty accounts/cards seen in the DB (v4)."""
     rows = db.execute(

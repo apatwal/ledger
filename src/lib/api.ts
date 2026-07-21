@@ -40,14 +40,39 @@ import type {
 
 const BASE = '/api'
 
+// ─── Auth (Clerk) ──────────────────────────────────────────────────────────────
+// The Clerk session-token getter is registered at runtime by <AuthGate> (which has
+// React context via useAuth). When set, every request carries `Authorization:
+// Bearer <token>`. When unset (Clerk not configured), requests go out unauthenticated
+// and the gated backend behaves exactly as before.
+let authTokenGetter: (() => Promise<string | null>) | null = null
+
+export function setAuthTokenGetter(fn: (() => Promise<string | null>) | null): void {
+  authTokenGetter = fn
+}
+
+// Single choke-point for all network calls: injects the bearer token when available.
+async function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers as HeadersInit | undefined)
+  if (authTokenGetter) {
+    try {
+      const token = await authTokenGetter()
+      if (token) headers.set('Authorization', `Bearer ${token}`)
+    } catch {
+      // Token fetch failed — let the request proceed; the backend will 401 if it must.
+    }
+  }
+  return fetch(url, { ...init, headers })
+}
+
 // A query value can be a scalar, or a string[] (serialized comma-joined, e.g. `accounts`).
 type QueryValue = string | number | boolean | string[] | undefined
 type QueryParams = Record<string, QueryValue>
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await authFetch(`${BASE}${path}`, {
     ...init,
+    headers: { 'Content-Type': 'application/json', ...(init.headers as Record<string, string> | undefined) },
   })
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
@@ -99,7 +124,7 @@ export async function updateTransaction(id: number, data: TransactionUpdate): Pr
 }
 
 export async function deleteTransaction(id: number): Promise<void> {
-  await fetch(`${BASE}/transactions/${id}`, { method: 'DELETE' })
+  await authFetch(`${BASE}/transactions/${id}`, { method: 'DELETE' })
 }
 
 // ─── CSV ─────────────────────────────────────────────────────────────────────
@@ -113,7 +138,7 @@ export async function importCsv(
   form.append('file', file)
   if (account && account.trim()) form.append('account', account.trim())
   if (statementType) form.append('statement_type', statementType)
-  const res = await fetch(`${BASE}/transactions/csv`, {
+  const res = await authFetch(`${BASE}/transactions/csv`, {
     method: 'POST',
     body: form,
   })
@@ -142,7 +167,7 @@ export async function reassignImport(id: number, account: string | null): Promis
 }
 
 export async function deleteImport(id: number): Promise<void> {
-  await fetch(`${BASE}/imports/${id}`, { method: 'DELETE' })
+  await authFetch(`${BASE}/imports/${id}`, { method: 'DELETE' })
 }
 
 // ─── Duplicate detection (v7) ────────────────────────────────────────────────
@@ -202,7 +227,7 @@ export async function getHoldings(): Promise<Holding[]> {
 }
 
 export async function deletePlaidItem(id: number): Promise<void> {
-  const res = await fetch(`${BASE}/plaid/items/${id}`, { method: 'DELETE' })
+  const res = await authFetch(`${BASE}/plaid/items/${id}`, { method: 'DELETE' })
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`${res.status} ${res.statusText}: ${text}`)
@@ -328,7 +353,7 @@ export async function updateRule(id: number, data: RuleUpdate): Promise<Rule> {
 }
 
 export async function deleteRule(id: number): Promise<void> {
-  await fetch(`${BASE}/rules/${id}`, { method: 'DELETE' })
+  await authFetch(`${BASE}/rules/${id}`, { method: 'DELETE' })
 }
 
 export async function applyRules(payload?: { account?: string; only_review?: boolean }): Promise<ApplyRulesResult> {
@@ -366,7 +391,7 @@ export async function updateCategoryBudget(id: number, data: CategoryBudgetUpdat
 }
 
 export async function deleteCategoryBudget(id: number): Promise<void> {
-  const res = await fetch(`${BASE}/budgets/categories/${id}`, { method: 'DELETE' })
+  const res = await authFetch(`${BASE}/budgets/categories/${id}`, { method: 'DELETE' })
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`${res.status} ${res.statusText}: ${text}`)
@@ -394,7 +419,7 @@ export async function updateSavingsGoal(id: number, data: SavingsGoalUpdate): Pr
 }
 
 export async function deleteSavingsGoal(id: number): Promise<void> {
-  const res = await fetch(`${BASE}/budgets/goals/${id}`, { method: 'DELETE' })
+  const res = await authFetch(`${BASE}/budgets/goals/${id}`, { method: 'DELETE' })
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`${res.status} ${res.statusText}: ${text}`)

@@ -1,9 +1,14 @@
 import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import { LayoutDashboard, List, Upload, BookText, Wand2, LineChart, PiggyBank } from 'lucide-react'
+import { UserButton } from '@clerk/react'
 import { getHealth } from '../lib/api'
 import Assistant from './Assistant'
 import AccountSelect from './AccountSelect'
+
+// When Clerk isn't configured, the app renders outside <ClerkProvider>, so the
+// UserButton (which needs Clerk context) must be hidden.
+const AUTH_ENABLED = Boolean(import.meta.env.VITE_CLERK_PUBLISHABLE_KEY)
 
 interface LayoutProps {
   children: React.ReactNode
@@ -100,6 +105,11 @@ export default function Layout({ children }: LayoutProps) {
         <div className="topbar">
           <div className="topbar-label">Viewing</div>
           <AccountSelect />
+          {AUTH_ENABLED && (
+            <div className="topbar-user">
+              <UserButton />
+            </div>
+          )}
         </div>
         {children}
       </main>

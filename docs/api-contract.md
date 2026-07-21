@@ -243,6 +243,54 @@ The app must run on **SQLite (local dev/tests) AND Postgres (Neon, for real pers
 ## Health
 - `GET /api/health` → `{ "status": "ok" }`
 
+## Authentication (Clerk)
+
+All `/api/*` routes are protected by Clerk session-JWT verification plus a
+single-user email allowlist — but this is **GATED**. With no Clerk env set, auth
+is **DISABLED**: the app behaves exactly as before, every `/api` route is open,
+local dev works, and the full test suite passes. Auth turns **ON** only when
+configured. (Same "gated by env var" pattern as the AI assistant and Plaid.)
+
+### What enables it
+Auth is enabled when **`CLERK_ISSUER`** (or **`CLERK_JWKS_URL`**) is set. Until
+then, `is_auth_enabled()` is `False` and the `require_user` dependency is a no-op.
+
+### Config (environment — see `.env.example`)
+| var | default | purpose |
+| --- | --- | --- |
+| `CLERK_ISSUER` | — | Clerk Frontend API URL, e.g. `https://<subdomain>.clerk.accounts.dev`. Presence enables auth; the JWT `iss` must equal it. |
+| `CLERK_JWKS_URL` | `${CLERK_ISSUER}/.well-known/jwks.json` | Signing-key endpoint (RS256). Set only to override. |
+| `CLERK_SECRET_KEY` | — | Optional `sk_...`; enables a server-side email lookup (`GET https://api.clerk.com/v1/users/{sub}`) when the token carries no `email` claim. |
+| `ALLOWED_EMAILS` | — | Comma-separated allowlist (case-insensitive). Empty = any authenticated Clerk user is allowed. Single-user: set to your email. |
+| `PLAID_SYNC_TOKEN` | — | Shared secret (also used by `sync-all`). A matching `X-Plaid-Sync-Token` header is exempt from Clerk auth. |
+| `VITE_CLERK_PUBLISHABLE_KEY` | — | **Frontend** key (`pk_...`), consumed by the React app, not the API. Set on the frontend build/host. |
+
+### Verification steps (`require_user`)
+When enabled, each protected request must send `Authorization: Bearer <clerk-session-jwt>`. The dependency:
+1. If auth disabled → allow (return `None`), no checks.
+2. If a valid `X-Plaid-Sync-Token` matches `PLAID_SYNC_TOKEN` → allow (cron exemption).
+3. Missing/malformed `Authorization` header → **401**.
+4. Verify the JWT with PyJWT (RS256) using a cached `PyJWKClient(CLERK_JWKS_URL)`: signature, `exp`/`nbf`, and `iss == CLERK_ISSUER`. Invalid/expired/network error → **401** (fails closed). `azp` is not hard-failed.
+5. Resolve email: prefer an `email` claim; else, if `CLERK_SECRET_KEY` is set, look it up via the Clerk API (cached per `sub`).
+6. If `ALLOWED_EMAILS` is non-empty and the email is missing or not in the list → **403**.
+7. Returns `{sub, email}`.
+
+### 401 vs 403
+- **401 Unauthorized** — no/malformed token, or the token fails verification (bad signature, expired, wrong issuer). *"You are not authenticated."*
+- **403 Forbidden** — the token is valid but the user's email is not on `ALLOWED_EMAILS` (or can't be resolved while an allowlist is set). *"You are authenticated but not allowed."*
+
+### Exemptions (always open)
+- `GET /api/health` — never protected (Render health checks).
+- The static SPA / catch-all — serves the login page.
+- `POST /api/plaid/sync-all` — reachable via `X-Plaid-Sync-Token` (Render cron), no Clerk user needed.
+
+### How to configure
+1. Create a Clerk application at <https://dashboard.clerk.com>.
+2. Copy the **Frontend API URL** → `CLERK_ISSUER` (JWKS URL is derived; override with `CLERK_JWKS_URL` if needed).
+3. Copy the **Secret key** (`sk_...`) → `CLERK_SECRET_KEY` (optional; only needed for the email-lookup fallback).
+4. Set `ALLOWED_EMAILS` to your email (single-user allowlist).
+5. Set `VITE_CLERK_PUBLISHABLE_KEY` (`pk_...`) on the frontend so the React app can sign the user in and attach the session token.
+
 ## Plaid Integration (v8)
 
 Pull transactions + investment transactions directly from banks via Plaid Link,
