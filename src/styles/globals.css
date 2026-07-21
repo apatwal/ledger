@@ -3487,6 +3487,73 @@ td.num {
   }
 }
 
+/* Once-per-session intro overlay. Fixed above every app layer (sidebar 100,
+   modals 300), on paper; covers the app while the pen writes one full cycle,
+   then fades out over 300ms (matches FADE_MS in IntroSplash) and unmounts.
+   display:flex so the LedgerLoader overlay (flex:1) fills and centers. */
+.intro-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  background: var(--paper);
+  opacity: 1;
+  transition: opacity 300ms ease;
+}
+.intro-splash-leaving {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Slim navigation/data-load bar — a 3px track pinned to the top edge with an
+   indeterminate ink→green fill sliding across. Below the intro (10000), above
+   content and modals so it's always visible during a genuine fetch. */
+.top-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 9500;
+  overflow: hidden;
+  background: var(--green-wash);
+  pointer-events: none;
+}
+.top-progress-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -40%;
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--ink) 35%,
+    var(--green) 70%,
+    transparent 100%
+  );
+  animation: topProgressSlide 1.1s ease-in-out infinite;
+}
+@keyframes topProgressSlide {
+  0% { left: -40%; }
+  100% { left: 100%; }
+}
+
+/* Reduced motion: no slide / no fade. The intro is skipped entirely in JS;
+   the top bar degrades to a static, dimmed full-width ink of the track. */
+@media (prefers-reduced-motion: reduce) {
+  .intro-splash {
+    transition: none;
+  }
+  .top-progress-fill {
+    left: 0;
+    width: 100%;
+    background: var(--green);
+    opacity: 0.6;
+    animation: none;
+  }
+}
+
 .topbar-user {
   margin-left: auto;
   display: flex;

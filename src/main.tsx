@@ -5,6 +5,8 @@ import ReactDOM from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import AuthGate from './components/AuthGate'
+import IntroSplash from './components/IntroSplash'
+import TopProgressBar from './components/TopProgressBar'
 import './styles/globals.css'
 
 // One client for the whole app. Reads are cached for 30s (fresh), kept for 5min
@@ -72,7 +74,14 @@ const tree = publishableKey ? (
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>{tree}</BrowserRouter>
+      {/* Slim top bar while any query is in flight — needs the query context. */}
+      <TopProgressBar />
+      <BrowserRouter>
+        {tree}
+        {/* Once-per-session pen intro; fixed overlay above both the Clerk and
+            non-Clerk branches, lifts itself after one write cycle. */}
+        <IntroSplash />
+      </BrowserRouter>
     </QueryClientProvider>
   </React.StrictMode>,
 )

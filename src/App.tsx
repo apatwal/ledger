@@ -1,7 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
-import LedgerLoader from './components/LedgerLoader'
 import Layout from './components/Layout'
+import { TopBar } from './components/TopProgressBar'
 import { AccountSelectionProvider } from './lib/accountSelection'
 
 // Route-level code splitting: each page (and its heavy deps — Recharts on the
@@ -14,9 +14,10 @@ const Rules = lazy(() => import('./components/Rules'))
 const Holdings = lazy(() => import('./components/Holdings'))
 const Budget = lazy(() => import('./components/Budget'))
 
-// On-theme placeholder shown while a route chunk is fetched.
+// First-ever load of a route downloads its chunk; show just the slim top bar
+// (same visual as in-app fetches) rather than the heavy full-screen pen.
 function RouteFallback() {
-  return <LedgerLoader variant="inline" />
+  return <TopBar />
 }
 
 export default function App() {
