@@ -521,7 +521,7 @@ class TestItemsCrud:
         items = client.get("/api/plaid/items").json()
         assert {i["item_id"] for i in items} == {"item-A", "item-B"}
 
-    def test_delete_keeps_transactions_nulls_item_id(self, client, test_session, monkeypatch):
+    def test_delete_removes_transactions(self, client, test_session, monkeypatch):
         # Unconfigured -> delete skips the best-effort Plaid item/remove call.
         monkeypatch.delenv("PLAID_CLIENT_ID", raising=False)
         monkeypatch.delenv("PLAID_SECRET", raising=False)
@@ -543,11 +543,9 @@ class TestItemsCrud:
         # Item is gone.
         assert client.get("/api/plaid/items").json() == []
 
-        # Transaction survives, detached from the deleted item.
+        # Unlinking deletes that item's transactions too.
         all_txns = client.get("/api/transactions").json()
-        kept = next(t for t in all_txns if t["id"] == txn_id)
-        assert kept["plaid_item_id"] is None
-        assert kept["plaid_transaction_id"] == "p-keep"
+        assert all(t["id"] != txn_id for t in all_txns)
 
     def test_delete_missing_item_404(self, client):
         assert client.delete("/api/plaid/items/424242").status_code == 404

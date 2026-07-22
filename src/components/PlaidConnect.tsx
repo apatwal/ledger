@@ -76,7 +76,11 @@ export default function PlaidConnect() {
   const [linkToken, setLinkToken] = useState<string | null>(null)
   const [preparing, setPreparing] = useState(false) // generating link token
   const [finishing, setFinishing] = useState(false) // exchange + first sync
-  const shouldOpen = useRef(false)
+  const [pendingOpen, setPendingOpen] = useState(false) // want to auto-open Link once the fresh token's handler is ready
+  // The open() handler that was live when we requested a new token. usePlaidLink
+  // keeps the old handler (and `ready`) around until the new token's handler is
+  // built, so we only auto-open once `open` has actually changed away from this.
+  const openAtRequest = useRef<Function | null>(null)
 
   // Per-action state
   const [syncingId, setSyncingId] = useState<number | 'all' | null>(null)
@@ -92,6 +96,7 @@ export default function PlaidConnect() {
   const onLinkSuccess = useCallback(
     async (publicToken: string, _metadata: PlaidLinkOnSuccessMetadata) => {
       setLinkToken(null)
+      setPendingOpen(false)
       setFinishing(true)
       setMsg(null)
       setActionError(null)
@@ -113,20 +118,24 @@ export default function PlaidConnect() {
     token: linkToken,
     onSuccess: (public_token, metadata) => void onLinkSuccess(public_token, metadata),
     onExit: () => {
-      // User bailed out of Link; drop the one-shot token.
+      // User bailed out of Link; drop the one-shot token and cancel the pending open.
       setLinkToken(null)
-      shouldOpen.current = false
+      setPendingOpen(false)
     },
   })
 
-  // Token must exist before we can open Link — so we fetch a token, store it,
-  // and open as soon as usePlaidLink reports ready.
+  // Auto-open Link once the token's handler is ready. We must wait for `open` to
+  // be rebuilt for the CURRENT token: usePlaidLink leaves `ready` true and keeps
+  // the previous token's (now-destroyed) `open` between connects, so firing on
+  // `ready` alone would call a stale handler and never open the new one. Gating
+  // on `open !== openAtRequest.current` ties the auto-open to the correct
+  // handler transition, so every click reliably opens Link with its fresh token.
   useEffect(() => {
-    if (ready && shouldOpen.current && linkToken) {
-      shouldOpen.current = false
+    if (pendingOpen && ready && linkToken && open !== openAtRequest.current) {
+      setPendingOpen(false)
       open()
     }
-  }, [ready, linkToken, open])
+  }, [pendingOpen, ready, linkToken, open])
 
   async function handleConnect() {
     setPreparing(true)
@@ -134,7 +143,8 @@ export default function PlaidConnect() {
     setMsg(null)
     try {
       const { link_token } = await createPlaidLinkToken()
-      shouldOpen.current = true
+      openAtRequest.current = open // remember the current (soon-to-be-stale) handler
+      setPendingOpen(true)
       setLinkToken(link_token)
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Could not start bank connection')
@@ -165,7 +175,7 @@ export default function PlaidConnect() {
     try {
       await deletePlaidItem(id)
       setConfirmId(null)
-      setMsg('Bank disconnected. Its imported transactions were kept.')
+      setMsg('Bank disconnected. Its imported transactions were removed.')
       refresh()
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Could not disconnect')

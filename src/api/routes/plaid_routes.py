@@ -44,6 +44,10 @@ router = APIRouter(prefix="/plaid", tags=["plaid"])
 
 CLIENT_NAME = "Expense Tracker"
 CLIENT_USER_ID = "local-user"
+# Products every linked institution MUST support (sent in Link `products`).
+# Anything else in PLAID_PRODUCTS (e.g. "investments") is requested only if the
+# institution supports it, so cards/banks aren't rejected at Link time.
+BASELINE_PRODUCTS = frozenset({"transactions"})
 # Rolling window for investments/transactions/get (~2 years).
 INVESTMENTS_WINDOW_DAYS = 730
 _TXN_SYNC_COUNT = 500
@@ -191,13 +195,32 @@ def create_link_token():
     from plaid.model.country_code import CountryCode
 
     client = plaid_client.get_client()
+
+    # Plaid requires the chosen institution to support EVERY product in `products`,
+    # so requesting "investments" up front rejects credit-card/bank-only banks with
+    # "not an investment account". Keep only baseline products (transactions) as
+    # required, and request the rest via `required_if_supported_products` so cards/
+    # banks link fine while brokerages still return holdings. Config-driven: whatever
+    # PLAID_PRODUCTS lists that isn't a baseline product is treated as optional.
+    all_products = plaid_client.get_products()
+    products = [p for p in all_products if p in BASELINE_PRODUCTS]
+    if not products:  # never send an empty `products`; fall back to transactions
+        products = ["transactions"]
+    supported_if_possible = [
+        p for p in all_products if p not in BASELINE_PRODUCTS and p not in products
+    ]
+
     kwargs = dict(
-        products=[Products(p) for p in plaid_client.get_products()],
+        products=[Products(p) for p in products],
         client_name=CLIENT_NAME,
         country_codes=[CountryCode(c) for c in plaid_client.get_country_codes()],
         language="en",
         user=LinkTokenCreateRequestUser(client_user_id=CLIENT_USER_ID),
     )
+    if supported_if_possible:
+        kwargs["required_if_supported_products"] = [
+            Products(p) for p in supported_if_possible
+        ]
     redirect_uri = plaid_client.get_redirect_uri()
     if redirect_uri:
         kwargs["redirect_uri"] = redirect_uri
@@ -568,8 +591,8 @@ def list_holdings(db: Session = Depends(get_db)):
 
 @router.delete("/items/{item_id}", status_code=204)
 def delete_item(item_id: int, db: Session = Depends(get_db)):
-    """Unlink an item: best-effort Plaid item/remove, then delete the PlaidItem
-    row. KEEPS the imported transactions (just nulls their plaid_item_id)."""
+    """Unlink an item: best-effort Plaid item/remove, then DELETE that item's
+    imported transactions and the PlaidItem row."""
     item = db.get(PlaidItem, item_id)
     if item is None:
         raise HTTPException(404, f"Plaid item {item_id} not found")
@@ -583,11 +606,11 @@ def delete_item(item_id: int, db: Session = Depends(get_db)):
         except Exception:
             pass  # best-effort — always remove our local row
 
-    # Keep the transactions; just detach them from the deleted item.
+    # Delete the transactions imported for this item, then the item itself.
     for txn in db.execute(
         select(Transaction).where(Transaction.plaid_item_id == item_id)
     ).scalars().all():
-        txn.plaid_item_id = None
+        db.delete(txn)
 
     db.delete(item)
     db.commit()
