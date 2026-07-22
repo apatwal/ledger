@@ -8,6 +8,12 @@ COPY package.json package-lock.json ./
 RUN npm ci
 # Build the SPA -> /app/dist
 COPY . .
+# The Clerk publishable key is PUBLIC (it ships in the client bundle) and Vite
+# inlines it at BUILD time. Render passes service env vars as Docker build args,
+# so declaring the ARG lets the deployed SPA render its sign-in gate + attach the
+# session token. Do NOT bake CLERK_SECRET_KEY here — secrets stay runtime-only.
+ARG VITE_CLERK_PUBLISHABLE_KEY
+ENV VITE_CLERK_PUBLISHABLE_KEY=$VITE_CLERK_PUBLISHABLE_KEY
 RUN npm run build
 
 # ── Stage 2: Python API that also serves the built SPA ───────────────────────
