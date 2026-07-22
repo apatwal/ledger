@@ -160,6 +160,17 @@ def map_transaction(plaid_txn: Any, account_label: str) -> dict:
 
     category = PFC_CATEGORY_LABELS.get(pfc, FALLBACK_CATEGORY)
 
+    # Hardcoded override for credit-card payments. Plaid inconsistently tags these
+    # — sometimes LOAN_PAYMENTS (handled above), but often with an empty/other PFC,
+    # in which case the money-in sign would mis-type them as a `refund` that counts
+    # against spend. "Payment Thank You" is the near-universal card-payment memo, so
+    # always classify it as a payment -> transfer (excluded from spend) + "Payments
+    # & Credits". Runs on every sync, so it survives re-syncs (unlike a manual edit).
+    _memo = f"{_get(txn, 'name', '')} {_get(txn, 'merchant_name', '')}".lower()
+    if "payment thank you" in _memo:
+        tx_type = "transfer"
+        category = "Payments & Credits"
+
     # description: merchant_name preferred, else name.
     description = _get(txn, "merchant_name") or _get(txn, "name") or None
     if description is not None:

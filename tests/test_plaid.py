@@ -196,6 +196,16 @@ class TestMapTransaction:
         assert m["category"] == "Shopping"
         assert m["amount"] == pytest.approx(30.0)  # stored positive
 
+    def test_payment_thank_you_is_transfer_even_without_loan_pfc(self):
+        """"Payment Thank You" is a credit-card payment. Plaid often sends it with
+        an empty/other PFC + money-in sign, which would mis-type it as a `refund`
+        counted against spend; the hardcoded override forces transfer (excluded)."""
+        m = map_transaction(
+            _plaid_txn(None, -146.84, name="Payment Thank You-Mobile"), "Card"
+        )
+        assert m["type"] == "transfer"
+        assert m["category"] == "Payments & Credits"
+
     def test_amount_is_absolute_value(self):
         assert map_transaction(_plaid_txn("FOOD_AND_DRINK", -12.5), "x")["amount"] == pytest.approx(12.5)
         assert map_transaction(_plaid_txn("FOOD_AND_DRINK", 12.5), "x")["amount"] == pytest.approx(12.5)
