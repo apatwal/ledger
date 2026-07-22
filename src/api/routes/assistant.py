@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import Transaction
+from ..plaid_mapping import CANONICAL_CATEGORIES
 from ..schemas import BudgetChatRequest, BudgetChatResponse, BudgetCreated
 from .. import ai
 from .budgets import (
@@ -30,11 +31,10 @@ CATEGORIZE_CONFIDENCE_THRESHOLD = 0.6
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
 
-_FALLBACK_CATEGORIES = [
-    "Salary", "Freelance", "Investment Returns", "Rent", "Groceries", "Dining",
-    "Transport", "Utilities", "Healthcare", "Entertainment", "Clothing",
-    "Savings", "Investment", "Other",
-]
+# Vocabulary handed to the AI categorizer when the DB has no categories yet.
+# Alias the canonical Plaid-derived list (single source of truth) so the AI can
+# never reintroduce the pre-canonical duplicate category names.
+_FALLBACK_CATEGORIES = CANONICAL_CATEGORIES
 
 
 def _parse_iso_date(value: Optional[str]) -> Optional[date]:

@@ -13,7 +13,7 @@ test.describe('transactions', () => {
 
     await modal.getByRole('spinbutton', { name: 'Amount ($)' }).fill('12.50')
     await modal.getByRole('button', { name: 'expense', exact: true }).click()
-    await modal.getByRole('combobox', { name: 'Category' }).selectOption('Dining')
+    await modal.getByRole('combobox', { name: 'Category' }).selectOption('Food & Drink')
     await modal.getByRole('textbox', { name: 'Description (optional)' }).fill(marker)
     await modal.getByRole('button', { name: 'Add Transaction' }).click()
 
@@ -30,7 +30,7 @@ test.describe('transactions', () => {
     const modal = page.locator('.modal')
     await modal.getByRole('spinbutton', { name: 'Amount ($)' }).fill('2000')
     await modal.getByRole('button', { name: 'income', exact: true }).click()
-    await modal.getByRole('combobox', { name: 'Category' }).selectOption('Salary')
+    await modal.getByRole('combobox', { name: 'Category' }).selectOption('Income')
     await modal.getByRole('textbox', { name: 'Description (optional)' }).fill(marker)
     await modal.getByRole('button', { name: 'Add Transaction' }).click()
     await expect(page.getByText(marker)).toBeVisible()

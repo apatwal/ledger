@@ -586,12 +586,14 @@ class TestCategories:
         """Sensible default categories are present even with empty DB."""
         resp = client.get("/api/categories")
         categories = resp.json()
-        # At least some defaults from the contract (Salary, Rent, Groceries, etc.)
-        expected_defaults = {"Salary", "Rent", "Groceries", "Investment", "Savings"}
-        found = expected_defaults & set(categories)
-        assert len(found) > 0, (
-            f"Expected at least one default category from {expected_defaults}, "
-            f"got: {categories}"
+        # Canonical Plaid-derived defaults (Food & Drink, Shopping, ...).
+        expected_defaults = {
+            "Food & Drink", "Shopping", "Transportation", "Investment", "Uncategorized",
+        }
+        missing = expected_defaults - set(categories)
+        assert not missing, (
+            f"Expected canonical default categories {expected_defaults} to be present, "
+            f"missing: {missing}; got: {categories}"
         )
 
     def test_categories_includes_user_created(self, client):

@@ -21,6 +21,7 @@ from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
 from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets
 from . import plaid_client
+from .plaid_mapping import CANONICAL_CATEGORIES
 from . import auth
 from .auth import require_user
 
@@ -76,12 +77,8 @@ def health():
     return {"status": "ok"}
 
 
-DEFAULT_CATEGORIES = [
-    "Salary", "Freelance", "Investment Returns",
-    "Rent", "Groceries", "Dining", "Transport",
-    "Utilities", "Healthcare", "Entertainment",
-    "Clothing", "Savings", "Investment", "Other",
-]
+# Canonical Plaid-derived vocabulary is the single source of truth.
+DEFAULT_CATEGORIES = CANONICAL_CATEGORIES
 
 
 @app.get(f"{API_PREFIX}/categories", response_model=list[str], dependencies=_auth)

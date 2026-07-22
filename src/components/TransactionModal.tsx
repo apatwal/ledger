@@ -28,18 +28,22 @@ interface Props {
 }
 
 const DEFAULT_CATEGORIES = [
-  'Food & Dining',
-  'Transportation',
-  'Housing',
-  'Entertainment',
-  'Healthcare',
+  'Food & Drink',
   'Shopping',
-  'Utilities',
-  'Education',
-  'Salary',
-  'Freelance',
+  'Transportation',
+  'Travel',
+  'Bills & Utilities',
+  'Entertainment',
+  'Health',
+  'Personal Care',
+  'Services',
+  'Government',
+  'Income',
+  'Transfer',
+  'Payments & Credits',
+  'Fees',
   'Investment',
-  'Other',
+  'Uncategorized',
 ]
 
 export default function TransactionModal({ transaction, onClose, onSaved }: Props) {

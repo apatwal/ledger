@@ -191,6 +191,7 @@ def create_link_token():
     _require_configured()
     from plaid.model.link_token_create_request import LinkTokenCreateRequest
     from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
+    from plaid.model.link_token_transactions import LinkTokenTransactions
     from plaid.model.products import Products
     from plaid.model.country_code import CountryCode
 
@@ -221,6 +222,13 @@ def create_link_token():
         kwargs["required_if_supported_products"] = [
             Products(p) for p in supported_if_possible
         ]
+    # Ask for the full history window (Plaid's max, 730 days / 24 months) instead
+    # of the default 90 days, so the initial sync backfills well over a year of
+    # spend. The window is fixed at Link time, so this only affects NEW links —
+    # existing items must be re-linked to backfill. Only meaningful when
+    # transactions is requested (it always is, as the baseline product).
+    if "transactions" in products:
+        kwargs["transactions"] = LinkTokenTransactions(days_requested=730)
     redirect_uri = plaid_client.get_redirect_uri()
     if redirect_uri:
         kwargs["redirect_uri"] = redirect_uri

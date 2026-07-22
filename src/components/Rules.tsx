@@ -307,7 +307,7 @@ function RuleModal({ rule, onClose, onSaved }: { rule: Rule | null; onClose: () 
             <div className="form-row">
               <div className="form-group">
                 <label htmlFor="r-name">Name (optional)</label>
-                <input id="r-name" type="text" placeholder="e.g. Starbucks → Dining" value={name} onChange={(e) => setName(e.target.value)} />
+                <input id="r-name" type="text" placeholder="e.g. Starbucks → Food & Drink" value={name} onChange={(e) => setName(e.target.value)} />
               </div>
               <div className="form-group">
                 <label htmlFor="r-priority">Priority</label>

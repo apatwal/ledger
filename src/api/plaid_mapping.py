@@ -42,6 +42,37 @@ TRANSFER_PFCS = {"TRANSFER_IN", "TRANSFER_OUT", "LOAN_PAYMENTS"}
 
 FALLBACK_CATEGORY = "Uncategorized"
 
+# Canonical category vocabulary — the Plaid-derived single source of truth used
+# across the app (built from PFC_CATEGORY_LABELS.values() + "Investment" from the
+# investment mapping + the "Uncategorized" fallback). Defined as an explicit
+# ordered literal: naive dedup of PFC_CATEGORY_LABELS.values() would put Income
+# last, but canonical order puts Income before Transfer and appends
+# Investment + Uncategorized.
+CANONICAL_CATEGORIES: list[str] = [
+    "Food & Drink",
+    "Shopping",
+    "Transportation",
+    "Travel",
+    "Bills & Utilities",
+    "Entertainment",
+    "Health",
+    "Personal Care",
+    "Services",
+    "Government",
+    "Income",
+    "Transfer",
+    "Payments & Credits",
+    "Fees",
+    "Investment",
+    "Uncategorized",
+]
+
+# Drift guard: every mapped label + Investment + fallback must be canonical.
+assert set(CANONICAL_CATEGORIES) >= set(PFC_CATEGORY_LABELS.values()) | {
+    "Investment",
+    FALLBACK_CATEGORY,
+}
+
 
 def _to_dict(obj: Any) -> dict:
     """Normalize a plaid model object OR a dict to a plain dict."""

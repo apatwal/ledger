@@ -1824,7 +1824,10 @@ td.num {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 18px;
+  /* Extra right padding reserves the bottom-right corner for the fixed
+     .assistant-fab (right 26px + 54px = clears an 80px zone) so the Next
+     control never sits under it, regardless of scroll position. */
+  padding: 14px 48px 14px 18px;
   border-top: 2px solid var(--rule-ink);
 }
 
@@ -2380,6 +2383,10 @@ td.num {
   .main-content {
     margin-left: 0;
     padding: 24px 18px;
+  }
+  .pagination {
+    /* Narrower page padding (18px) needs more clearance to clear the FAB. */
+    padding-right: 68px;
   }
   .charts-grid {
     grid-template-columns: 1fr;
