@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Plus, Pencil, Trash2, X, Wand2, AlertCircle, Check } from 'lucide-react'
+import { Plus, Pencil, Trash2, X, Wand2, AlertCircle, Check, ListChecks } from 'lucide-react'
 import {
   getRules,
   createRule,
   updateRule,
   deleteRule,
+  bulkDeleteRules,
   applyRules,
   previewRule,
   getCategories,
@@ -39,6 +40,70 @@ export default function Rules() {
 
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null)
   const [busyId, setBusyId] = useState<number | null>(null)
+
+  // ─── Multi-select delete ─────────────────────────────────────────────────
+  const [selectMode, setSelectMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [bulkConfirm, setBulkConfirm] = useState(false)
+  const [bulkBusy, setBulkBusy] = useState(false)
+
+  const allSelected = rules.length > 0 && rules.every((r) => selectedIds.has(r.id))
+  const someSelected = selectedIds.size > 0
+  const partiallySelected = someSelected && !allSelected
+
+  // Prune the selection to ids that still exist whenever the list changes
+  // underneath us (e.g. a rule was created/deleted elsewhere or refetched).
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev
+      const valid = new Set<number>()
+      for (const r of rules) if (prev.has(r.id)) valid.add(r.id)
+      return valid.size === prev.size ? prev : valid
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rulesQuery.data])
+
+  function enterSelectMode() {
+    setDeleteConfirmId(null)
+    setSelectMode(true)
+  }
+
+  function exitSelectMode() {
+    setSelectMode(false)
+    setSelectedIds(new Set())
+    setBulkConfirm(false)
+  }
+
+  function toggleSelect(id: number) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+    setBulkConfirm(false)
+  }
+
+  function toggleSelectAll() {
+    setSelectedIds(() => (allSelected ? new Set<number>() : new Set(rules.map((r) => r.id))))
+    setBulkConfirm(false)
+  }
+
+  async function handleBulkDelete() {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) return
+    setBulkBusy(true)
+    setActionError(null)
+    try {
+      await bulkDeleteRules(ids)
+      invalidateRules()
+      exitSelectMode()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Bulk delete failed')
+    } finally {
+      setBulkBusy(false)
+    }
+  }
 
   const [applying, setApplying] = useState(false)
   const [applyMsg, setApplyMsg] = useState<string | null>(null)
@@ -96,6 +161,19 @@ export default function Rules() {
           <p className="page-subtitle">Auto-classify transactions as they're imported. First matching rule wins.</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          {rules.length > 0 && (
+            selectMode ? (
+              <button className="btn btn-secondary" onClick={exitSelectMode}>
+                <X size={15} />
+                Cancel
+              </button>
+            ) : (
+              <button className="btn btn-secondary" onClick={enterSelectMode}>
+                <ListChecks size={15} />
+                Select
+              </button>
+            )
+          )}
           <button className="btn btn-secondary" onClick={() => void handleReapply()} disabled={applying}>
             {applying ? <span className="spinner" style={{ width: 14, height: 14 }} /> : <Wand2 size={15} />}
             Re-apply to existing
@@ -121,6 +199,41 @@ export default function Rules() {
         </div>
       )}
 
+      {selectMode && (
+        <div
+          className="card card-sm"
+          style={{ marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}
+        >
+          <span style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
+            {selectedIds.size} selected
+          </span>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            {bulkConfirm ? (
+              <>
+                <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                  Delete {selectedIds.size} rule{selectedIds.size === 1 ? '' : 's'}?
+                </span>
+                <button className="btn btn-danger btn-sm" onClick={() => void handleBulkDelete()} disabled={bulkBusy}>
+                  {bulkBusy ? <span className="spinner" style={{ width: 12, height: 12 }} /> : 'Delete'}
+                </button>
+                <button className="btn btn-ghost btn-sm" onClick={() => setBulkConfirm(false)} disabled={bulkBusy}>
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button
+                className="btn btn-danger btn-sm"
+                onClick={() => setBulkConfirm(true)}
+                disabled={!someSelected}
+              >
+                <Trash2 size={14} />
+                Delete selected ({selectedIds.size})
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="table-wrapper">
         {loading ? (
           <div className="loading-state">
@@ -141,6 +254,17 @@ export default function Rules() {
           <table>
             <thead>
               <tr>
+                {selectMode && (
+                  <th style={{ width: 40, textAlign: 'center' }}>
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      ref={(el) => { if (el) el.indeterminate = partiallySelected }}
+                      onChange={toggleSelectAll}
+                      aria-label="Select all rules"
+                    />
+                  </th>
+                )}
                 <th style={{ width: 70 }}>Priority</th>
                 <th>Rule</th>
                 <th>Match</th>
@@ -152,6 +276,16 @@ export default function Rules() {
             <tbody>
               {rules.map((r) => (
                 <tr key={r.id} style={{ opacity: r.enabled ? 1 : 0.55 }}>
+                  {selectMode && (
+                    <td style={{ textAlign: 'center' }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(r.id)}
+                        onChange={() => toggleSelect(r.id)}
+                        aria-label={`Select rule ${r.name || r.id}`}
+                      />
+                    </td>
+                  )}
                   <td className="mono" style={{ color: 'var(--text-secondary)' }}>{r.priority}</td>
                   <td style={{ fontWeight: 500 }}>{r.name || <span style={{ color: 'var(--text-muted)' }}>Untitled</span>}</td>
                   <td style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
@@ -177,6 +311,7 @@ export default function Rules() {
                     </button>
                   </td>
                   <td>
+                    {selectMode ? null : (
                     <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
                       <button className="btn btn-ghost btn-icon btn-sm" onClick={() => { setEditing(r); setModalOpen(true) }} title="Edit">
                         <Pencil size={14} />
@@ -194,6 +329,7 @@ export default function Rules() {
                         </button>
                       )}
                     </div>
+                    )}
                   </td>
                 </tr>
               ))}

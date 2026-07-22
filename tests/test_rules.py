@@ -121,6 +121,38 @@ class TestRuleCRUD:
     def test_delete_rule_404(self, client):
         assert client.delete("/api/rules/999999").status_code == 404
 
+    def test_bulk_delete_multiple(self, client):
+        """Bulk-delete removes every listed rule and returns the count deleted."""
+        a = _post_rule(client, match_value="A")
+        b = _post_rule(client, match_value="B")
+        c = _post_rule(client, match_value="C")
+        resp = client.post("/api/rules/bulk-delete", json={"ids": [a["id"], b["id"]]})
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] == 2
+        remaining = client.get("/api/rules").json()
+        ids = [r["id"] for r in remaining]
+        assert a["id"] not in ids and b["id"] not in ids
+        assert c["id"] in ids                     # untouched
+
+    def test_bulk_delete_empty_ids(self, client):
+        """An empty ids list deletes nothing and returns {deleted: 0}."""
+        a = _post_rule(client, match_value="KEEP")
+        resp = client.post("/api/rules/bulk-delete", json={"ids": []})
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] == 0
+        assert client.get(f"/api/rules/{a['id']}").status_code == 200
+
+    def test_bulk_delete_mixed_valid_and_unknown(self, client):
+        """Unknown ids are ignored; deleted count reflects only real matches."""
+        a = _post_rule(client, match_value="A")
+        b = _post_rule(client, match_value="B")
+        resp = client.post("/api/rules/bulk-delete",
+                           json={"ids": [a["id"], b["id"], 999999]})
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] == 2       # only the two real rules
+        assert client.get(f"/api/rules/{a['id']}").status_code == 404
+        assert client.get(f"/api/rules/{b['id']}").status_code == 404
+
     # --- validation (422) ---
 
     def test_create_empty_match_value(self, client):

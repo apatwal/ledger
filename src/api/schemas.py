@@ -175,6 +175,14 @@ class RuleOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RuleBulkDeleteRequest(BaseModel):
+    ids: list[int]
+
+
+class RuleBulkDeleteResponse(BaseModel):
+    deleted: int
+
+
 # ── Duplicate detection (v7) ─────────────────────────────────────────────────
 
 class DuplicateGroup(BaseModel):

@@ -356,6 +356,13 @@ export async function deleteRule(id: number): Promise<void> {
   await authFetch(`${BASE}/rules/${id}`, { method: 'DELETE' })
 }
 
+export async function bulkDeleteRules(ids: number[]): Promise<{ deleted: number }> {
+  return request<{ deleted: number }>('/rules/bulk-delete', {
+    method: 'POST',
+    body: JSON.stringify({ ids }),
+  })
+}
+
 export async function applyRules(payload?: { account?: string; only_review?: boolean }): Promise<ApplyRulesResult> {
   return request<ApplyRulesResult>('/rules/apply', {
     method: 'POST',

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import Rule, Transaction
-from ..schemas import RuleCreate, RuleUpdate, RuleOut
+from ..schemas import RuleCreate, RuleUpdate, RuleOut, RuleBulkDeleteRequest, RuleBulkDeleteResponse
 from .. import rules_engine
 
 router = APIRouter(prefix="/rules", tags=["rules"])
@@ -38,6 +38,21 @@ def list_rules(enabled: Optional[bool] = Query(None), db: Session = Depends(get_
     if enabled is not None:
         stmt = stmt.where(Rule.enabled == enabled)
     return db.execute(stmt).scalars().all()
+
+
+@router.post("/bulk-delete", response_model=RuleBulkDeleteResponse)
+def bulk_delete_rules(body: RuleBulkDeleteRequest, db: Session = Depends(get_db)):
+    """Delete every Rule whose id is in `ids`, in one query. Empty list deletes
+    nothing; unknown ids are silently ignored. Returns the count actually deleted."""
+    if not body.ids:
+        return RuleBulkDeleteResponse(deleted=0)
+    matched = db.execute(
+        select(Rule).where(Rule.id.in_(body.ids))
+    ).scalars().all()
+    for obj in matched:
+        db.delete(obj)
+    db.commit()
+    return RuleBulkDeleteResponse(deleted=len(matched))
 
 
 @router.get("/{rule_id}", response_model=RuleOut)
