@@ -129,6 +129,13 @@ function ExcludeFilter({
   const count = excludedTypes.size + excludedCategories.size
   const label = count === 0 ? 'Nothing hidden' : `${count} hidden`
 
+  // "Income"/"Transfer" are Plaid category labels that duplicate transaction
+  // TYPES, so they'd otherwise show twice in this popover (once per section).
+  // Drop any category that collides with a type label — the Types row already
+  // hides those rows.
+  const typeLabels = new Set(TYPE_OPTIONS.map((t) => t.label.toLowerCase()))
+  const excludableCategories = categories.filter((c) => !typeLabels.has(c.toLowerCase()))
+
   return (
     <div className="exclude-filter" ref={rootRef}>
       <button
@@ -179,11 +186,11 @@ function ExcludeFilter({
             })}
           </div>
 
-          {categories.length > 0 && (
+          {excludableCategories.length > 0 && (
             <>
               <div className="exclude-group-label">Categories</div>
               <div className="exclude-list">
-                {categories.map((c) => {
+                {excludableCategories.map((c) => {
                   const on = excludedCategories.has(c)
                   const Icon = iconForCategory(c)
                   return (
