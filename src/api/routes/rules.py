@@ -2,7 +2,7 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -46,13 +46,11 @@ def bulk_delete_rules(body: RuleBulkDeleteRequest, db: Session = Depends(get_db)
     nothing; unknown ids are silently ignored. Returns the count actually deleted."""
     if not body.ids:
         return RuleBulkDeleteResponse(deleted=0)
-    matched = db.execute(
-        select(Rule).where(Rule.id.in_(body.ids))
-    ).scalars().all()
-    for obj in matched:
-        db.delete(obj)
+    # Single bulk DELETE (one round-trip) instead of load-then-delete-per-row —
+    # rowcount is the number actually removed; unknown ids are simply not matched.
+    result = db.execute(delete(Rule).where(Rule.id.in_(body.ids)))
     db.commit()
-    return RuleBulkDeleteResponse(deleted=len(matched))
+    return RuleBulkDeleteResponse(deleted=result.rowcount or 0)
 
 
 @router.get("/{rule_id}", response_model=RuleOut)
