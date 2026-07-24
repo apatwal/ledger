@@ -149,10 +149,6 @@ export async function importCsv(
   return res.json() as Promise<CsvImportResult>
 }
 
-export function getCsvTemplateUrl(): string {
-  return `${BASE}/transactions/csv/template`
-}
-
 // ─── Import history (v5.2) ──────────────────────────────────────────────────────
 
 export async function getImports(): Promise<ImportBatch[]> {

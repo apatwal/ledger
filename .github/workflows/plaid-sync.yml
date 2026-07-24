@@ -1,0 +1,61 @@
+name: Plaid sync
+
+# Scheduled cron that triggers a Plaid transaction sync on the live app by
+# POSTing to /api/plaid/sync-all with the shared-secret header. The endpoint is
+# exempt from Clerk auth ONLY for this route when the X-Plaid-Sync-Token matches
+# PLAID_SYNC_TOKEN (see src/api/auth.py). No app code runs here — this is purely
+# a scheduler hitting a URL.
+#
+# Setup (one-time, in GitHub repo Settings -> Secrets and variables -> Actions):
+#   - Secret  PLAID_SYNC_TOKEN  = the same value set on Render
+#   - Variable SYNC_BASE_URL    = https://expense-tracker-2kfq.onrender.com
+#     (falls back to the hardcoded default below if the variable is unset)
+
+on:
+  schedule:
+    # Every 6 hours, on the hour (UTC). GitHub may delay scheduled runs a few
+    # minutes under load; that's fine for a ledger refresh.
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {} # manual "Run workflow" button for on-demand syncs
+
+concurrency:
+  group: plaid-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Trigger Plaid sync-all
+        env:
+          BASE_URL: ${{ vars.SYNC_BASE_URL || 'https://expense-tracker-2kfq.onrender.com' }}
+          SYNC_TOKEN: ${{ secrets.PLAID_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SYNC_TOKEN}" ]; then
+            echo "::error::PLAID_SYNC_TOKEN secret is not set on this repo."
+            exit 1
+          fi
+
+          # Render free-tier web services sleep when idle, so the first request
+          # after a quiet period pays a cold-start cost. Warm the service first
+          # (best-effort) so the sync POST doesn't time out on a cold boot.
+          echo "Warming service at ${BASE_URL} ..."
+          curl -fsS --max-time 90 --retry 5 --retry-all-errors --retry-delay 10 \
+            "${BASE_URL}/api/health" > /dev/null || echo "warm-up ping failed (continuing)"
+
+          echo "Triggering /api/plaid/sync-all ..."
+          # Capture body + status; retry transient failures. Fail the run on any
+          # non-2xx so a broken sync surfaces as a failed-workflow email.
+          http_code=$(curl -sS --max-time 120 --retry 3 --retry-delay 15 --retry-all-errors \
+            -o /tmp/sync_body.txt -w '%{http_code}' \
+            -X POST "${BASE_URL}/api/plaid/sync-all" \
+            -H "X-Plaid-Sync-Token: ${SYNC_TOKEN}")
+
+          echo "HTTP ${http_code}"
+          echo "Response: $(cat /tmp/sync_body.txt)"
+          case "${http_code}" in
+            2*) echo "Sync succeeded." ;;
+            *)  echo "::error::sync-all returned HTTP ${http_code}"; exit 1 ;;
+          esac

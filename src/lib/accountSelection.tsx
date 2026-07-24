@@ -32,6 +32,14 @@ async function fetchAccountUniverse(): Promise<AccountInfo[]> {
 
 const STORAGE_KEY = 'expense.deselectedAccounts'
 
+// When the user deselects EVERY account, the intended result is "show nothing".
+// An empty `accounts` list can't express that — the query serializer omits empty
+// arrays, and the server treats an absent filter as "all accounts". So we send a
+// sentinel label that no real account can equal; the server's `account IN (...)`
+// filter then matches zero rows across every endpoint (stats, transactions,
+// duplicates), which is exactly "none". Kept implausible on purpose.
+const NONE_SELECTED_SENTINEL = '__none_selected__'
+
 export interface AccountInfo {
   label: string
   available?: number | null
@@ -124,9 +132,10 @@ export function AccountSelectionProvider({ children }: { children: ReactNode }) 
   const noneSelected = selected.length === 0 && allLabels.length > 0
 
   const accountsParam = useCallback((): string[] | undefined => {
+    if (noneSelected) return [NONE_SELECTED_SENTINEL] // explicit "none" → matches no rows
     if (allSelected) return undefined // absent → server aggregates everything
     return selected
-  }, [allSelected, selected])
+  }, [noneSelected, allSelected, selected])
 
   const balanceOf = useCallback(
     (label: string) => accounts.find((a) => a.label === label),

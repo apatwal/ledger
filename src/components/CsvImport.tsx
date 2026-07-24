@@ -1,8 +1,8 @@
 import { useState, useRef, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Upload, Download, FileText, CheckCircle, AlertTriangle, XCircle, X, ArrowLeftRight, CreditCard, Eye, Sparkles, History, Trash2, Check, Landmark } from 'lucide-react'
-import { importCsv, getCsvTemplateUrl, getAccounts, getAssistantStatus, categorizeBatch, getImports, reassignImport, deleteImport } from '../lib/api'
+import { Upload, FileText, CheckCircle, AlertTriangle, XCircle, X, ArrowLeftRight, CreditCard, Eye, Sparkles, History, Trash2, Check, Landmark } from 'lucide-react'
+import { importCsv, getAccounts, getAssistantStatus, categorizeBatch, getImports, reassignImport, deleteImport } from '../lib/api'
 import type { CsvImportResult, ImportBatch, StatementType } from '../lib/types'
 import PlaidConnect from './PlaidConnect'
 import { invalidateLedger } from '../lib/queryKeys'
@@ -170,20 +170,11 @@ export default function CsvImport() {
       </div>
 
       {/* CSV import */}
-      <div className="import-section-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+      <div className="import-section-label">
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
           <FileText size={14} />
           Or import a CSV
         </span>
-        <a
-          href={getCsvTemplateUrl()}
-          download
-          className="btn btn-secondary btn-sm"
-          style={{ textDecoration: 'none', textTransform: 'none', letterSpacing: 0 }}
-        >
-          <Download size={14} />
-          Download template
-        </a>
       </div>
 
       {/* Instructions */}
