@@ -54,3 +54,8 @@ services:
       # Comma-separated Plaid products, e.g. transactions,investments
       - key: PLAID_PRODUCTS
         sync: false
+      # Shared secret protecting POST /api/plaid/sync-all (the scheduled cron in
+      # .github/workflows/plaid-sync.yml sends it as the X-Plaid-Sync-Token
+      # header). Must match the PLAID_SYNC_TOKEN GitHub Actions secret.
+      - key: PLAID_SYNC_TOKEN
+        sync: false
