@@ -3137,6 +3137,42 @@ td.num {
 .chart-note.gl-pos { color: var(--green); font-weight: 600; }
 .chart-note.gl-neg { color: var(--red); font-weight: 600; }
 
+/* Compact donut legend — wrapping chips of "swatch · short label · pct". */
+.viz-legend {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  justify-content: center;
+}
+.viz-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  max-width: 190px;
+}
+.viz-legend-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.viz-legend-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.viz-legend-pct {
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
 /* ─── Clerk auth ─────────────────────────────────────────────────────────────── */
 .auth-screen {
   flex: 1;              /* #root is display:flex (row) — fill it so centering works */

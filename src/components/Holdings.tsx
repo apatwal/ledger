@@ -109,8 +109,76 @@ function hasBasis(h: Holding): boolean {
   return h.cost_basis !== null && h.cost_basis !== undefined
 }
 
-function holdingName(h: Holding): string {
-  return h.security_name ?? h.ticker_symbol ?? 'Unknown'
+// Collapse Plaid's redundant "X - Y" names (where the halves are equal or nested)
+// down to the distinct/shorter half, and squash repeated whitespace.
+function cleanName(raw: string): string {
+  const s = raw.replace(/\s+/g, ' ').trim()
+  const parts = s.split(/\s+-\s+/)
+  if (parts.length === 2) {
+    const a = parts[0].trim()
+    const b = parts[1].trim()
+    const la = a.toLowerCase()
+    const lb = b.toLowerCase()
+    if (la === lb) return a
+    if (la.includes(lb)) return b
+    if (lb.includes(la)) return a
+  }
+  return s
+}
+
+function truncate(s: string, n = 22): string {
+  return s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s
+}
+
+// Concise chip label: ticker when present, else a cleaned + truncated name.
+function shortSecurityLabel(h: Pick<Holding, 'ticker_symbol' | 'security_name'>): string {
+  const t = (h.ticker_symbol ?? '').trim()
+  if (t) return t.toUpperCase()
+  const name = (h.security_name ?? '').trim()
+  return name ? truncate(cleanName(name)) : 'Unknown'
+}
+
+// Full (but de-duplicated) name for tooltips.
+function fullSecurityName(h: Pick<Holding, 'ticker_symbol' | 'security_name'>): string {
+  const name = (h.security_name ?? '').trim()
+  if (name) return cleanName(name)
+  const t = (h.ticker_symbol ?? '').trim()
+  return t ? t.toUpperCase() : 'Unknown'
+}
+
+// Grouping key so the same security held in multiple accounts collapses to one:
+// ticker (uppercased) when present, else the cleaned name.
+function securityKey(h: Holding): string {
+  const t = (h.ticker_symbol ?? '').trim().toUpperCase()
+  if (t) return t
+  return cleanName(h.security_name ?? '').toLowerCase() || 'unknown'
+}
+
+interface Security {
+  key: string
+  short: string
+  full: string
+  value: number
+  quantity: number
+  cost_basis: number | null
+}
+
+// Sum value / quantity / cost_basis across every lot of each security.
+function aggregateSecurities(holdings: Holding[]): Security[] {
+  const map = new Map<string, Security>()
+  for (const h of holdings) {
+    const key = securityKey(h)
+    const prev = map.get(key) ?? { key, short: shortSecurityLabel(h), full: fullSecurityName(h), value: 0, quantity: 0, cost_basis: null }
+    prev.value += h.value ?? 0
+    prev.quantity += h.quantity ?? 0
+    if (hasBasis(h)) prev.cost_basis = (prev.cost_basis ?? 0) + (h.cost_basis ?? 0)
+    map.set(key, prev)
+  }
+  return [...map.values()]
+}
+
+function securityGain(s: Security): number | null {
+  return s.cost_basis !== null ? s.value - s.cost_basis : null
 }
 
 // ── Shared chart chrome ─────────────────────────────────────────────────────────
@@ -149,13 +217,13 @@ function MoneyTooltip({ active, payload, label }: {
 
 function PieTooltip({ active, payload }: {
   active?: boolean
-  payload?: Array<{ name?: string; value?: number; payload?: { pct?: number } }>
+  payload?: Array<{ name?: string; value?: number; payload?: { pct?: number; full?: string } }>
 }) {
   if (!active || !payload?.length) return null
   const d = payload[0]
   return (
     <div style={TOOLTIP_STYLE}>
-      <div style={{ fontWeight: 600, marginBottom: 4 }}>{d.name}</div>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>{d.payload?.full ?? d.name}</div>
       <div style={{ color: C.ink, fontSize: 13 }}>{fmtMoney(d.value)}</div>
       {d.payload?.pct !== undefined && (
         <div style={{ color: C.inkFaint, fontSize: 12 }}>{d.payload.pct.toFixed(1)}%</div>
@@ -164,10 +232,10 @@ function PieTooltip({ active, payload }: {
   )
 }
 
-// Tooltip for the signed gain/loss bars (green/red per sign).
+// Tooltip for the signed gain/loss bars (green/red per sign). Shows the full name.
 function GainTooltip({ active, payload }: {
   active?: boolean
-  payload?: Array<{ payload?: { name?: string; gain?: number } }>
+  payload?: Array<{ payload?: { name?: string; full?: string; gain?: number } }>
 }) {
   if (!active || !payload?.length) return null
   const d = payload[0]?.payload
@@ -175,9 +243,30 @@ function GainTooltip({ active, payload }: {
   const g = d.gain ?? 0
   return (
     <div style={TOOLTIP_STYLE}>
-      <div style={{ fontWeight: 600, marginBottom: 4 }}>{d.name}</div>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>{d.full ?? d.name}</div>
       <div style={{ color: g >= 0 ? C.green : C.red, fontSize: 13, fontWeight: 600 }}>{fmtSigned(g)}</div>
     </div>
+  )
+}
+
+// Compact donut legend — a wrapping row of "swatch · short label · pct" chips,
+// so long full names never blow the legend across the whole card.
+function PctLegend({ payload }: {
+  payload?: Array<{ value?: string; color?: string; payload?: { pct?: number } }>
+}) {
+  if (!payload?.length) return null
+  return (
+    <ul className="viz-legend">
+      {payload.map((entry, i) => (
+        <li key={i} className="viz-legend-item" title={entry.value}>
+          <span className="viz-legend-swatch" style={{ background: entry.color }} />
+          <span className="viz-legend-label">{entry.value}</span>
+          {entry.payload?.pct !== undefined && (
+            <span className="viz-legend-pct">{Math.round(entry.payload.pct)}%</span>
+          )}
+        </li>
+      ))}
+    </ul>
   )
 }
 
@@ -242,14 +331,15 @@ export default function Holdings() {
       .map(([acct, value]) => ({ name: acct === 'Unassigned' ? 'Unassigned' : displayLabel(acct), value, pct: total > 0 ? (value / total) * 100 : 0 }))
       .sort((a, b) => b.value - a.value)
 
-    // Allocation by holding — top 8 by value, remainder folded into "Other".
-    const sorted = holdings
-      .map((h) => ({ name: holdingName(h), value: h.value ?? 0 }))
-      .sort((a, b) => b.value - a.value)
+    // Aggregate lots into one row per security (same holding across accounts collapses).
+    const securities = aggregateSecurities(holdings)
+
+    // Allocation by holding — top 8 securities by value, remainder folded into "Other".
+    const sorted = [...securities].sort((a, b) => b.value - a.value)
     const TOP = 8
-    const top = sorted.slice(0, TOP)
+    const top = sorted.slice(0, TOP).map((s) => ({ name: s.short, full: s.full, value: s.value }))
     const restVal = sorted.slice(TOP).reduce((s, r) => s + r.value, 0)
-    const byHolding = (restVal > 0 ? [...top, { name: 'Other', value: restVal }] : top)
+    const byHolding = (restVal > 0 ? [...top, { name: 'Other', full: 'Other securities', value: restVal }] : top)
       .map((r) => ({ ...r, pct: total > 0 ? (r.value / total) * 100 : 0 }))
 
     // Asset-class mix by security_type.
@@ -261,12 +351,16 @@ export default function Holdings() {
     }
     const byClass = [...byClassMap.entries()].map(([type, value]) => ({ type, value })).sort((a, b) => b.value - a.value)
 
-    // Per-position gain/loss (only holdings with a cost basis), largest → smallest.
-    const gainRows = basisHoldings
-      .map((h) => ({ name: holdingName(h), gain: gainOf(h) ?? 0 }))
+    // Per-security gain/loss (only securities with a cost basis): the top 12 movers
+    // by absolute gain/loss, then sorted by signed value for display.
+    const gainRows = securities
+      .filter((s) => s.cost_basis !== null)
+      .map((s) => ({ name: s.short, full: s.full, gain: securityGain(s) ?? 0 }))
+      .sort((a, b) => Math.abs(b.gain) - Math.abs(a.gain))
+      .slice(0, 12)
       .sort((a, b) => b.gain - a.gain)
 
-    return { total, accounts: accountSet.size, totalGain, totalGainPct, byAccount, byHolding, byClass, gainRows, hasBasisData: basisHoldings.length > 0 }
+    return { total, accounts: accountSet.size, positions: securities.length, totalGain, totalGainPct, byAccount, byHolding, byClass, gainRows, hasBasisData: basisHoldings.length > 0 }
   }, [holdings, displayLabel])
 
   // Portfolio value over time — aggregate per-account snapshots to a portfolio total.
@@ -358,8 +452,8 @@ export default function Holdings() {
                 <span className="kpi-label">Positions</span>
                 <span className="kpi-icon accent"><Layers size={16} /></span>
               </div>
-              <div className="kpi-value default mono">{holdings.length}</div>
-              <div className="kpi-sub">distinct holdings</div>
+              <div className="kpi-value default mono">{derived.positions}</div>
+              <div className="kpi-sub">distinct securities · {holdings.length} lot{holdings.length === 1 ? '' : 's'}</div>
             </div>
 
             <div className="kpi-card">
@@ -385,7 +479,7 @@ export default function Holdings() {
                     {derived.byAccount.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
                   </Pie>
                   <Tooltip content={<PieTooltip />} />
-                  <Legend wrapperStyle={{ fontSize: 12, color: C.inkFaint, fontFamily: 'IBM Plex Mono' }} />
+                  <Legend content={<PctLegend />} />
                 </PieChart>
               </ResponsiveContainer>
             </div>
@@ -401,7 +495,7 @@ export default function Holdings() {
                     {derived.byHolding.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
                   </Pie>
                   <Tooltip content={<PieTooltip />} />
-                  <Legend wrapperStyle={{ fontSize: 12, color: C.inkFaint, fontFamily: 'IBM Plex Mono' }} />
+                  <Legend content={<PctLegend />} />
                 </PieChart>
               </ResponsiveContainer>
             </div>
@@ -431,15 +525,18 @@ export default function Holdings() {
             <div className="chart-card" style={{ marginBottom: 16 }}>
               <div className="chart-title-row">
                 <div className="chart-title">Unrealized gain / loss</div>
-                <span className={`chart-note ${derived.totalGain >= 0 ? 'gl-pos' : 'gl-neg'}`}>
-                  Total {fmtSigned(derived.totalGain, currency)}{derived.totalGainPct !== null ? ` · ${fmtPctSigned(derived.totalGainPct)}` : ''}
+                <span className="chart-note">
+                  top {derived.gainRows.length} mover{derived.gainRows.length === 1 ? '' : 's'} ·{' '}
+                  <span style={{ color: derived.totalGain >= 0 ? C.green : C.red, fontWeight: 600 }}>
+                    Total {fmtSigned(derived.totalGain, currency)}{derived.totalGainPct !== null ? ` (${fmtPctSigned(derived.totalGainPct)})` : ''}
+                  </span>
                 </span>
               </div>
-              <ResponsiveContainer width="100%" height={Math.max(180, derived.gainRows.length * 34)}>
+              <ResponsiveContainer width="100%" height={Math.min(430, Math.max(190, derived.gainRows.length * 32))}>
                 <BarChart data={derived.gainRows} layout="vertical" margin={{ top: 4, right: 24, left: 8, bottom: 4 }}>
                   <CartesianGrid strokeDasharray="2 4" stroke={C.rule} horizontal={false} />
                   <XAxis type="number" tick={AXIS_TICK} axisLine={false} tickLine={false} tickFormatter={(v: number) => fmtMoney0(v, currency)} />
-                  <YAxis type="category" dataKey="name" tick={AXIS_TICK} axisLine={{ stroke: C.ink }} tickLine={false} width={140} />
+                  <YAxis type="category" dataKey="name" tick={AXIS_TICK} axisLine={{ stroke: C.ink }} tickLine={false} width={112} interval={0} />
                   <Tooltip content={<GainTooltip />} cursor={{ fill: C.ink, fillOpacity: 0.04 }} />
                   <Bar dataKey="gain" name="Gain/Loss" radius={[0, 2, 2, 0]} isAnimationActive={false} barSize={18}>
                     {derived.gainRows.map((r, i) => <Cell key={i} fill={r.gain >= 0 ? C.green : C.red} />)}
