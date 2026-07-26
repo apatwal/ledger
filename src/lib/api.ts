@@ -37,6 +37,7 @@ import type {
   SavingsGoalUpdate,
   BudgetChatResponse,
   AccountNickname,
+  NetWorth,
   Snapshot,
   InvestmentFlowPoint,
 } from './types'
@@ -265,6 +266,12 @@ export async function getStatsOverTime(
   return request<StatsOverTime[]>(`/stats/over-time${qs}`)
 }
 
+// Net worth / total balance across all accounts (assets − liabilities). May be
+// absent while the backend endpoint is still coming up — callers handle errors.
+export async function getNetWorth(): Promise<NetWorth> {
+  return request<NetWorth>('/stats/net-worth')
+}
+
 // by-account is the per-card breakdown — it does NOT take an account filter,
 // only the date range. Strip any stray account param.
 export async function getStatsByAccount(params?: { start_date?: string; end_date?: string }): Promise<AccountStat[]> {
@@ -301,6 +308,15 @@ export async function upsertNickname(label: string, nickname: string): Promise<v
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`${res.status} ${res.statusText}: ${text}`)
   }
+}
+
+// Mark (or unmark) an account as a savings destination. Returns the full,
+// updated nickname list so callers can refresh the cache from the response.
+export async function setSavingsAccount(label: string, is_savings: boolean): Promise<AccountNickname[]> {
+  return request<AccountNickname[]>('/accounts/savings', {
+    method: 'PUT',
+    body: JSON.stringify({ label, is_savings }),
+  })
 }
 
 export async function deleteNickname(label: string): Promise<void> {

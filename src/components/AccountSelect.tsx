@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { Wallet, ChevronDown, Check, Pencil, X } from 'lucide-react'
+import { Wallet, ChevronDown, Check, Pencil, X, PiggyBank } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAccountSelection } from '../lib/accountSelection'
 import type { AccountInfo } from '../lib/accountSelection'
 import { useAccountLabels } from '../lib/accountLabels'
-import { upsertNickname } from '../lib/api'
+import { upsertNickname, setSavingsAccount } from '../lib/api'
 
 function fmtBalance(a: AccountInfo): string | null {
   const amount = a.current ?? a.available
@@ -23,10 +23,13 @@ function fmtBalance(a: AccountInfo): string | null {
 // Global account multi-select — drives every data view in the app.
 export default function AccountSelect() {
   const { accounts, selected, isSelected, toggle, selectAll, clear, allSelected } = useAccountSelection()
-  const { displayLabel, nicknameOf } = useAccountLabels()
+  const { displayLabel, nicknameOf, isSavings } = useAccountLabels()
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
+
+  // Which label's savings flag is currently being toggled (for a subtle pending look).
+  const [savingBusy, setSavingBusy] = useState<string | null>(null)
 
   // Inline nickname editing — which raw label is being renamed, plus the draft.
   const [editing, setEditing] = useState<string | null>(null)
@@ -84,6 +87,23 @@ export default function AccountSelect() {
     }
   }
 
+  // Flip an account's savings designation, then refresh the shared caches so the
+  // "Savings" tag and the savings-rate math both pick it up.
+  async function toggleSavings(label: string, next: boolean) {
+    setSavingBusy(label)
+    try {
+      await setSavingsAccount(label, next)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['accounts', 'nicknames'] }),
+        queryClient.invalidateQueries({ queryKey: ['accounts', 'universe'] }),
+      ])
+    } catch {
+      // Endpoint may not be live yet — leave state untouched; nothing crashes.
+    } finally {
+      setSavingBusy(null)
+    }
+  }
+
   const label = allSelected
     ? 'All accounts'
     : selected.length === 0
@@ -119,6 +139,8 @@ export default function AccountSelect() {
               const on = isSelected(a.label)
               const bal = fmtBalance(a)
               const isEditing = editing === a.label
+              const sav = isSavings(a.label)
+              const savBusy = savingBusy === a.label
 
               if (isEditing) {
                 return (
@@ -159,7 +181,7 @@ export default function AccountSelect() {
               }
 
               return (
-                <div key={a.label} className={`account-select-row${on ? ' on' : ''}`}>
+                <div key={a.label} className={`account-select-row${on ? ' on' : ''}${sav ? ' savings' : ''}`}>
                   <button
                     type="button"
                     role="option"
@@ -171,7 +193,22 @@ export default function AccountSelect() {
                       {on && <Check size={11} strokeWidth={3} />}
                     </span>
                     <span className="account-select-name" title={a.label}>{displayLabel(a.label)}</span>
+                    {sav && <span className="account-select-savings-tag">Savings</span>}
                     {bal && <span className="account-select-balance mono">{bal}</span>}
+                  </button>
+                  <button
+                    type="button"
+                    className={`account-select-icon-btn savings${sav ? ' on' : ''}`}
+                    title={sav
+                      ? 'Savings account — money moved in counts toward your savings rate. Click to unmark.'
+                      : 'Mark as a savings account — money moved in counts toward your savings rate'}
+                    aria-pressed={sav}
+                    disabled={savBusy}
+                    onClick={(e) => { e.stopPropagation(); void toggleSavings(a.label, !sav) }}
+                  >
+                    {savBusy
+                      ? <span className="spinner" style={{ width: 12, height: 12 }} />
+                      : <PiggyBank size={13} fill={sav ? 'currentColor' : 'none'} />}
                   </button>
                   <button
                     type="button"

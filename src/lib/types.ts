@@ -269,6 +269,18 @@ export interface InvestmentFlowPoint {
 export interface AccountNickname {
   label: string
   nickname: string
+  // ── Savings designation (investments-viz) ─────────────────────────────────
+  // When true, money moved into this account counts toward the savings rate.
+  is_savings: boolean
+}
+
+// ── Net worth / total balance (investments-viz) ───────────────────────────────
+export interface NetWorth {
+  net_worth: number
+  assets: number
+  liabilities: number
+  currency: string
+  as_of: string | null
 }
 
 export interface PlaidStatus {

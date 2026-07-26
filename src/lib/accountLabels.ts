@@ -15,6 +15,8 @@ export interface AccountLabels {
   displayLabel: (label: string) => string
   /** the nickname alone, or undefined when none is set — for edit pre-fill. */
   nicknameOf: (label: string) => string | undefined
+  /** whether an account is designated as a savings destination. */
+  isSavings: (label: string) => boolean
   isLoading: boolean
 }
 
@@ -36,8 +38,16 @@ export function useAccountLabels(): AccountLabels {
     return m
   }, [nicknames])
 
+  // Derived from the same cached read: the set of labels flagged as savings.
+  const savingsSet = useMemo(() => {
+    const s = new Set<string>()
+    for (const n of nicknames) if (n.is_savings) s.add(n.label)
+    return s
+  }, [nicknames])
+
   const displayLabel = useCallback((label: string) => map.get(label) ?? label, [map])
   const nicknameOf = useCallback((label: string) => map.get(label), [map])
+  const isSavings = useCallback((label: string) => savingsSet.has(label), [savingsSet])
 
-  return { nicknames, displayLabel, nicknameOf, isLoading: isPending }
+  return { nicknames, displayLabel, nicknameOf, isSavings, isLoading: isPending }
 }

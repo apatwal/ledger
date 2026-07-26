@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Transaction, PlaidItem
+from ..models import Transaction, PlaidItem, AccountNickname
 from ..schemas import (
     PlaidAccount,
     PlaidItemOut,
@@ -323,11 +323,26 @@ def exchange_public_token(body: ExchangeRequest, db: Session = Depends(get_db)):
 
 # ── Sync (shared by the route + scheduler) ───────────────────────────────────
 
-def _sync_transactions_for_item(client, db: Session, item: PlaidItem) -> dict:
+def _savings_labels(db: Session) -> set[str]:
+    """Set of account labels designated as savings destinations (v11b). Loaded
+    ONCE per sync; transfers INTO these accounts are re-mapped as savings
+    contributions by map_transaction(..., is_savings_account=True)."""
+    rows = db.execute(
+        select(AccountNickname.label).where(AccountNickname.is_savings.is_(True))
+    ).scalars().all()
+    return set(rows)
+
+
+def _sync_transactions_for_item(
+    client, db: Session, item: PlaidItem, savings_labels: set[str] | None = None
+) -> dict:
     """Incrementally sync /transactions/sync for one item. UPSERT by
-    plaid_transaction_id; delete removed rows. Persists the new cursor."""
+    plaid_transaction_id; delete removed rows. Persists the new cursor.
+    `savings_labels` (v11b): accounts whose inflows re-map to savings contributions."""
     from plaid.model.transactions_sync_request import TransactionsSyncRequest
 
+    if savings_labels is None:
+        savings_labels = _savings_labels(db)
     accounts = _accounts_map(item)
     fallback = item.institution_name or "Plaid"
     added = modified = removed = 0
@@ -342,11 +357,13 @@ def _sync_transactions_for_item(client, db: Session, item: PlaidItem) -> dict:
 
         for txn in resp.get("added", []):
             label = _account_label(accounts, txn.get("account_id"), fallback)
-            if _upsert_transaction(db, item, map_transaction(txn, label)):
+            mapped = map_transaction(txn, label, is_savings_account=label in savings_labels)
+            if _upsert_transaction(db, item, mapped):
                 added += 1
         for txn in resp.get("modified", []):
             label = _account_label(accounts, txn.get("account_id"), fallback)
-            _upsert_transaction(db, item, map_transaction(txn, label))
+            mapped = map_transaction(txn, label, is_savings_account=label in savings_labels)
+            _upsert_transaction(db, item, mapped)
             modified += 1
         for removed_txn in resp.get("removed", []):
             tid = removed_txn.get("transaction_id")
@@ -467,13 +484,16 @@ def sync_items(db: Session, item_id: int | None = None) -> dict:
         stmt = stmt.where(PlaidItem.id == item_id)
     items = db.execute(stmt.order_by(PlaidItem.id.asc())).scalars().all()
 
+    # v11b: load designated savings labels ONCE for the whole sync.
+    savings_labels = _savings_labels(db)
+
     items_synced = 0
     added = modified = removed = 0
     for item in items:
         # v9: refresh per-account balances (best-effort — never fails the sync).
         _refresh_account_balances(client, item)
 
-        txn_res = _sync_transactions_for_item(client, db, item)
+        txn_res = _sync_transactions_for_item(client, db, item, savings_labels)
         added += txn_res["added"]
         modified += txn_res["modified"]
         removed += txn_res["removed"]

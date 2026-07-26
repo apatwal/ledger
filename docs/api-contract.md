@@ -602,7 +602,10 @@ routers are gated by `require_user` like the other feature routers.
 **`account_nicknames`** — a user-supplied friendly name for a connected account.
 `id` (PK), `label` (unique, not-null, indexed — the canonical account label /
 `app_account` string stored on transactions + holdings), `nickname` (not-null),
-`created_at`, `updated_at` (`onupdate`). Upsert is keyed by `label`.
+`is_savings` (Bool, not-null, default `false` — v11b: when true the account is a
+designated savings destination), `created_at`, `updated_at` (`onupdate`). Upsert
+is keyed by `label`. (The `is_savings` column is created by `create_all` — the
+table was new in v11 and not yet deployed, so no ALTER migration is needed.)
 
 **`portfolio_snapshots`** — a point-in-time investment portfolio value. `id` (PK),
 `captured_at` (DateTime, indexed, default `utcnow`), `account` (nullable, indexed —
@@ -615,15 +618,39 @@ row per `(account, calendar day)`.
 Coexists with the standalone `GET /api/accounts` endpoint (nicknames live under
 `/api/accounts/nicknames`, so there is no path collision).
 
-- `GET /api/accounts/nicknames` → `AccountNicknameOut[]` (`{ label, nickname }`),
-  ordered by label.
+- `GET /api/accounts/nicknames` → `AccountNicknameOut[]`
+  (`{ label, nickname, is_savings }`), ordered by label.
 - `PUT /api/accounts/nicknames` — body `AccountNicknameIn` `{ label, nickname }`.
   Upsert by `label`; the nickname is **trimmed**. **If the nickname is blank /
-  whitespace-only, the row is DELETED instead** (revert to the raw label).
+  whitespace-only, the row is DELETED** (revert to the raw label) — **UNLESS the
+  row is a designated savings account (`is_savings` true)**, in which case the row
+  is kept with the nickname cleared so the savings flag is never wiped (v11b).
   Returns **200** with the FULL current `AccountNicknameOut[]` list (a blank-delete
   is reflected by that label's absence from the list).
+- `PUT /api/accounts/savings` — body `SavingsToggleIn` `{ label, is_savings }`
+  (v11b). Upserts the row's `is_savings` (creating a row with `nickname=""` if
+  none exists). If the result is `is_savings` false **and** the nickname is blank,
+  the row is deleted. Returns **200** with the FULL current `AccountNicknameOut[]`
+  list. **Backfill:** after the toggle, best-effort (try/except, never raises; only
+  when Plaid is configured) it re-maps that account's transaction history so
+  existing rows pick up the new savings logic — for each `PlaidItem` whose
+  `accounts_json` contains an account with `app_account == label` it resets the
+  item cursor and re-runs that item's `/transactions/sync`. Because upserts match
+  on `plaid_transaction_id` and overwrite `type`/`category`, the re-map is
+  idempotent (no duplicates).
 - `DELETE /api/accounts/nicknames/{label}` → **204**, idempotent (204 whether or
   not the label existed).
+
+**Savings-contribution mapping rule (v11b):** at sync time the set of designated
+savings labels is loaded ONCE (`SELECT label FROM account_nicknames WHERE
+is_savings = true`) and `map_transaction(txn, label, is_savings_account=...)` is
+called per row. When `is_savings_account` is true **and the row is an inflow into
+that account** (PFC primary `TRANSFER_IN`, i.e. money moving IN), the row is
+recategorized as a savings contribution: `type="expense"`, `category="Savings"`.
+This mirrors how investment cash contributions are handled, so bank-savings
+inflows now count in the savings rate (`savings = Σ expense in
+Savings/Investment`). Interest INCOME rows and OUTFLOWS (`TRANSFER_OUT`) are left
+untouched. `"Savings"` is added to the canonical category vocabulary.
 
 ### Holdings enrichment — `GET /api/plaid/holdings`
 
@@ -676,3 +703,26 @@ transaction is assigned `category="Investment"`):
   `category = "Investment"` AND `type = "income"` (dividend / interest cash rows).
 - Portfolio buy/sell churn (mapped to `transfer`) is intentionally counted in
   neither series.
+
+### Net worth — `GET /api/stats/net-worth`
+
+→ `NetWorthOut` `{ net_worth, assets, liabilities, currency, as_of }`. Derived
+from each linked `PlaidItem`'s `accounts_json` balances plus live holdings
+(`compute_holdings(db)`).
+
+- **assets** = Σ depository `current` (fallback `available`) **+** the total
+  holdings value.
+- **liabilities** = Σ `current` for credit / loan accounts.
+- **net_worth** = `assets − liabilities`. `currency` defaults `"USD"` (first
+  account currency seen otherwise). `as_of` = now.
+- Returns **200 with zeros** (NOT 503) when Plaid is unconfigured or there are no
+  linked items, so the UI tile can show a graceful empty state.
+
+**No-double-count rule:** an investment/brokerage account's cash `current` balance
+usually already equals the sum of that account's holdings, so we pick ONE source
+per account type — depository accounts use their cash `current`
+(fallback `available`); investment/brokerage accounts **ignore** their cash
+`current` and are represented **only** by the holdings-derived total (added once,
+in full); credit/loan `current` is a liability; any other type is ignored. The
+holdings total is best-effort (a Plaid error yields `0` rather than failing the
+endpoint).

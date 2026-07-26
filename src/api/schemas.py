@@ -82,6 +82,15 @@ class AccountStat(BaseModel):
     count: int
 
 
+class NetWorthOut(BaseModel):
+    """Net worth snapshot derived from linked Plaid account balances + holdings (v11b)."""
+    net_worth: float
+    assets: float
+    liabilities: float
+    currency: str = "USD"
+    as_of: Optional[datetime] = None
+
+
 # ── CSV import response ──────────────────────────────────────────────────────
 
 class CSVErrorRow(BaseModel):
@@ -394,8 +403,15 @@ class AccountNicknameIn(BaseModel):
 class AccountNicknameOut(BaseModel):
     label: str
     nickname: str
+    is_savings: bool = False   # v11b: designated savings destination
 
     model_config = {"from_attributes": True}
+
+
+class SavingsToggleIn(BaseModel):
+    """Designate (or un-designate) an account as a savings destination (v11b)."""
+    label: str
+    is_savings: bool
 
 
 # ── Investments visualizations (v11) ───────────────────────────────────────────

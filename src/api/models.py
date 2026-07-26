@@ -116,6 +116,10 @@ class AccountNickname(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     label: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
     nickname: Mapped[str] = mapped_column(String(200), nullable=False)
+    # v11b: when true, transfers INTO this account are recategorized at sync time
+    # as savings contributions (type=expense, category=Savings) so they count in
+    # the savings rate. Column created by create_all (table not yet deployed).
+    is_savings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow

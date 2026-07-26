@@ -64,12 +64,14 @@ CANONICAL_CATEGORIES: list[str] = [
     "Payments & Credits",
     "Fees",
     "Investment",
+    "Savings",
     "Uncategorized",
 ]
 
-# Drift guard: every mapped label + Investment + fallback must be canonical.
+# Drift guard: every mapped label + Investment + Savings + fallback must be canonical.
 assert set(CANONICAL_CATEGORIES) >= set(PFC_CATEGORY_LABELS.values()) | {
     "Investment",
+    "Savings",
     FALLBACK_CATEGORY,
 }
 
@@ -130,12 +132,19 @@ def _logo_url(txn: dict) -> Optional[str]:
     return None
 
 
-def map_transaction(plaid_txn: Any, account_label: str) -> dict:
+def map_transaction(
+    plaid_txn: Any, account_label: str, is_savings_account: bool = False
+) -> dict:
     """Map one Plaid /transactions/sync transaction to Transaction fields.
 
     Returns a dict with: date, amount, type, category, description, account,
     plaid_transaction_id, plaid_account_id, plus v9 enrichment: merchant_name,
     logo_url, pending, pending_transaction_id, category_icon_url.
+
+    v11b: when `is_savings_account` is True and this is an INFLOW into that
+    account (a TRANSFER_IN — money moved INTO savings), the row is recategorized
+    as a savings contribution (type=expense, category=Savings) so it counts in
+    the savings rate, mirroring how investment cash contributions are handled.
     """
     txn = _to_dict(plaid_txn)
 
@@ -170,6 +179,17 @@ def map_transaction(plaid_txn: Any, account_label: str) -> dict:
     if "payment thank you" in _memo:
         tx_type = "transfer"
         category = "Payments & Credits"
+
+    # v11b savings-account rule: if THIS account is a designated savings
+    # destination and money is flowing INTO it (a TRANSFER_IN — equivalently a
+    # transfer whose raw Plaid amount is < 0, i.e. money in), treat it as a
+    # savings CONTRIBUTION: type=expense, category=Savings. This mirrors how
+    # investment cash contributions are handled and makes the transfer count in
+    # the savings rate. Only inflows are recategorized — interest INCOME rows and
+    # OUTFLOWS (TRANSFER_OUT) are left untouched.
+    if is_savings_account and pfc == "TRANSFER_IN":
+        tx_type = "expense"
+        category = "Savings"
 
     # description: merchant_name preferred, else name.
     description = _get(txn, "merchant_name") or _get(txn, "name") or None

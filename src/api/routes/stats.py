@@ -1,19 +1,21 @@
-from datetime import date
+from datetime import date, datetime
 from typing import Optional, Literal
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func, and_, case
 
 from ..database import get_db
-from ..models import Transaction
+from ..models import Transaction, PlaidItem
 from ..schemas import (
     SummaryResponse,
     CategoryStat,
     OverTimeStat,
     AccountStat,
+    NetWorthOut,
     InvestmentFlowPoint,
 )
 from ..account_filter import account_filter_condition
+from .. import plaid_client
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
@@ -335,3 +337,82 @@ def get_investment_flows(
         )
         for r in rows
     ]
+
+
+# ── Net worth (v11b) ────────────────────────────────────────────────────────────
+# Derived from each linked PlaidItem's accounts_json balances + live holdings.
+#
+# No-double-count rule: an investment/brokerage account's `current` balance
+# usually ALREADY equals the sum of that account's holdings. To avoid counting
+# the money twice we pick ONE source per account type:
+#   * depository (checking/savings) -> use the cash balance `current`
+#     (fallback `available`).
+#   * investment / brokerage         -> IGNORE the cash `current` and instead use
+#     the holdings-derived total from compute_holdings(db) (added ONCE, in full).
+#   * credit / loan                  -> `current` counts as a LIABILITY.
+#   * anything else                  -> ignored (neither asset nor liability).
+# assets      = Σ depository current  +  Σ all holdings value
+# liabilities = Σ (credit + loan) current
+# net_worth   = assets − liabilities
+_ASSET_DEPOSITORY = {"depository"}
+_ASSET_INVESTMENT = {"investment", "brokerage"}
+_LIABILITY_TYPES = {"credit", "loan"}
+
+
+@router.get("/net-worth", response_model=NetWorthOut)
+def get_net_worth(db: Session = Depends(get_db)):
+    """Net worth from linked Plaid account balances + holdings. Returns 200 with
+    zeros when Plaid is unconfigured / there are no items (graceful empty state,
+    NOT 503). See the module comment above for the no-double-count rule."""
+    now = datetime.utcnow()
+
+    items = db.execute(select(PlaidItem)).scalars().all()
+    if not plaid_client.is_configured() or not items:
+        return NetWorthOut(
+            net_worth=0.0, assets=0.0, liabilities=0.0, currency="USD", as_of=now
+        )
+
+    from .plaid_routes import _accounts_map, compute_holdings
+
+    assets = 0.0
+    liabilities = 0.0
+    currency: Optional[str] = None
+
+    for item in items:
+        for info in _accounts_map(item).values():
+            if not isinstance(info, dict):
+                continue
+            acct_type = str(info.get("type") or "").strip().lower()
+            if currency is None and info.get("currency"):
+                currency = info.get("currency")
+            # investment/brokerage cash balance is intentionally skipped — the
+            # holdings total (added below) is the single source for those.
+            if acct_type in _ASSET_INVESTMENT:
+                continue
+            current = info.get("current")
+            balance = current if current is not None else info.get("available")
+            if balance is None:
+                continue
+            try:
+                balance = float(balance)
+            except (TypeError, ValueError):
+                continue
+            if acct_type in _ASSET_DEPOSITORY:
+                assets += balance
+            elif acct_type in _LIABILITY_TYPES:
+                liabilities += balance
+
+    # Holdings total (best-effort — never fail the endpoint on a Plaid error).
+    try:
+        holdings_total = sum(h.value for h in compute_holdings(db) if h.value is not None)
+    except Exception:
+        holdings_total = 0.0
+    assets += holdings_total
+
+    return NetWorthOut(
+        net_worth=round(assets - liabilities, 2),
+        assets=round(assets, 2),
+        liabilities=round(liabilities, 2),
+        currency=currency or "USD",
+        as_of=now,
+    )
