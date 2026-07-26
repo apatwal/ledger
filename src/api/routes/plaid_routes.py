@@ -492,6 +492,16 @@ def sync_items(db: Session, item_id: int | None = None) -> dict:
         items_synced += 1
         db.commit()
 
+    # v11: record a portfolio snapshot on every sync (best-effort — a snapshot
+    # failure must NEVER break the sync). Both /plaid/sync and /plaid/sync-all
+    # (plus the scheduler) route through sync_items, so all sync flows get it.
+    try:
+        from .investments import record_portfolio_snapshot
+
+        record_portfolio_snapshot(db)
+    except Exception as e:
+        print(f"[plaid] portfolio snapshot skipped: {e}")
+
     return {
         "items_synced": items_synced,
         "added": added,
@@ -548,12 +558,11 @@ def list_items(db: Session = Depends(get_db)):
     return [_item_to_out(i) for i in items]
 
 
-@router.get("/holdings", response_model=list[HoldingOut])
-def list_holdings(db: Session = Depends(get_db)):
-    """Investment holdings across all items with the investments product, computed
-    on demand (no storage). Joins holdings→securities. 503 if unconfigured; empty
-    list if no investment accounts. Items without investments are skipped."""
-    _require_configured()
+def compute_holdings(db: Session) -> list[HoldingOut]:
+    """Compute investment holdings across all items with the investments product
+    (no storage). Joins holdings→securities. Assumes Plaid is configured (callers
+    gate first). Items without investments are skipped. Reused by GET /plaid/holdings
+    AND the portfolio-snapshot recorder (v11)."""
     from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetRequest
 
     client = plaid_client.get_client()
@@ -582,6 +591,18 @@ def list_holdings(db: Session = Depends(get_db)):
             price = h.get("institution_price")
             value = h.get("institution_value")
             currency = h.get("iso_currency_code") or sec.get("iso_currency_code")
+            # v11: cost basis + security type + unrealized gain.
+            cost_basis = h.get("cost_basis")
+            cost_basis = float(cost_basis) if cost_basis is not None else None
+            value_f = float(value) if value is not None else None
+            security_type = sec.get("type")
+            security_type = str(security_type) if security_type is not None else None
+            unrealized_gain = None
+            unrealized_gain_pct = None
+            if value_f is not None and cost_basis is not None:
+                unrealized_gain = round(value_f - cost_basis, 2)
+                if cost_basis > 0:
+                    unrealized_gain_pct = round((value_f - cost_basis) / cost_basis * 100, 2)
             out.append(
                 HoldingOut(
                     account=label,
@@ -590,11 +611,24 @@ def list_holdings(db: Session = Depends(get_db)):
                     ticker_symbol=sec.get("ticker_symbol"),
                     quantity=float(quantity) if quantity is not None else None,
                     price=float(price) if price is not None else None,
-                    value=float(value) if value is not None else None,
+                    value=value_f,
                     currency=currency,
+                    cost_basis=cost_basis,
+                    security_type=security_type,
+                    unrealized_gain=unrealized_gain,
+                    unrealized_gain_pct=unrealized_gain_pct,
                 )
             )
     return out
+
+
+@router.get("/holdings", response_model=list[HoldingOut])
+def list_holdings(db: Session = Depends(get_db)):
+    """Investment holdings across all items with the investments product, computed
+    on demand (no storage). Joins holdings→securities. 503 if unconfigured; empty
+    list if no investment accounts. Items without investments are skipped."""
+    _require_configured()
+    return compute_holdings(db)
 
 
 @router.delete("/items/{item_id}", status_code=204)

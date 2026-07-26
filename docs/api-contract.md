@@ -586,3 +586,93 @@ and the endpoint returns:
 ```
 When no budget intent is detected the model returns empty `actions` — nothing is
 created and only `reply` is populated (plain-chat behavior preserved).
+
+---
+
+## Investments visualizations + account nicknames (v11)
+
+Adds portfolio value-over-time tracking, investment cash-flow charting,
+cost-basis/gain enrichment on holdings, and user-editable account nicknames. Two
+NEW tables (`account_nicknames`, `portfolio_snapshots`) are created automatically
+by `Base.metadata.create_all` on startup — no ALTER migration needed. All new
+routers are gated by `require_user` like the other feature routers.
+
+### New tables
+
+**`account_nicknames`** — a user-supplied friendly name for a connected account.
+`id` (PK), `label` (unique, not-null, indexed — the canonical account label /
+`app_account` string stored on transactions + holdings), `nickname` (not-null),
+`created_at`, `updated_at` (`onupdate`). Upsert is keyed by `label`.
+
+**`portfolio_snapshots`** — a point-in-time investment portfolio value. `id` (PK),
+`captured_at` (DateTime, indexed, default `utcnow`), `account` (nullable, indexed —
+**NULL means the grand total across all accounts**; a non-null value is that
+account's label), `value` (Float, not-null), `currency` (nullable). At most one
+row per `(account, calendar day)`.
+
+### Account nicknames — `prefix=/api/accounts`
+
+Coexists with the standalone `GET /api/accounts` endpoint (nicknames live under
+`/api/accounts/nicknames`, so there is no path collision).
+
+- `GET /api/accounts/nicknames` → `AccountNicknameOut[]` (`{ label, nickname }`),
+  ordered by label.
+- `PUT /api/accounts/nicknames` — body `AccountNicknameIn` `{ label, nickname }`.
+  Upsert by `label`; the nickname is **trimmed**. **If the nickname is blank /
+  whitespace-only, the row is DELETED instead** (revert to the raw label).
+  Returns **200** with the FULL current `AccountNicknameOut[]` list (a blank-delete
+  is reflected by that label's absence from the list).
+- `DELETE /api/accounts/nicknames/{label}` → **204**, idempotent (204 whether or
+  not the label existed).
+
+### Holdings enrichment — `GET /api/plaid/holdings`
+
+`HoldingOut` gains four optional fields (all `null` when Plaid omits the source
+data):
+- `cost_basis` — from the Plaid holding's `cost_basis`.
+- `security_type` — from the joined security's `type`.
+- `unrealized_gain` = `value − cost_basis` (only when both present).
+- `unrealized_gain_pct` = `unrealized_gain / cost_basis * 100` (only when
+  `cost_basis > 0`).
+
+Existing fields (account, institution, security_name, ticker_symbol, quantity,
+price, value, currency) are unchanged.
+
+### Investments — `prefix=/api/investments`
+
+- `POST /api/investments/snapshot` — capture NOW. Computes current holdings,
+  aggregates value per account + a grand total, and upserts TODAY's rows: one per
+  account **plus one total row** (`account=NULL`). At most one point per
+  `(account, calendar day)` — re-recording the same day updates the value in
+  place. Returns `{ captured: int, total_value: float }`. **503** when Plaid is
+  unconfigured.
+- `GET /api/investments/snapshots?account=&days=` → `SnapshotOut[]`
+  (`{ captured_at, account, value, currency }`) ordered by `captured_at` asc.
+  With **no** `account` param it returns the **TOTAL series** (`account IS NULL`);
+  `?account=<label>` returns that account's series. `days` limits to the last N
+  days. Returns `[]` when there are no snapshots.
+
+A snapshot is also recorded **best-effort on every Plaid sync** — the recorder
+`record_portfolio_snapshot(db)` is called at the end of `sync_items()` (which
+backs both `POST /api/plaid/sync` and `POST /api/plaid/sync-all`, plus the
+in-process scheduler) inside a try/except, so a snapshot failure never breaks a
+sync.
+
+### Investment flows — `GET /api/stats/investment-flows`
+
+`?granularity=month&start_date=&end_date=` → `InvestmentFlowPoint[]`
+(`{ period, contributions, dividends }`). `granularity` supports the same values
+as `/api/stats/over-time` (`year` → `YYYY`, `month` → `YYYY-MM`, `week` →
+`YYYY-Www`, `day` → `YYYY-MM-DD`). Grouped by period, ordered ascending, and
+(mirroring `/over-time`) **only periods with data are returned — no zero-fill**.
+
+**Definitions** (derived from `plaid_mapping.py`, where every investment
+transaction is assigned `category="Investment"`):
+- **`contributions`** = money directed INTO investments = `Σ amount` for rows
+  where `category = "Investment"` AND `type = "expense"`. Per the mapping, cash
+  contributions/deposits map to `expense` (they count toward savings); manual
+  `Investment`/expense rows (e.g. an ETF purchase) are included too.
+- **`dividends`** = investment income = `Σ amount` for rows where
+  `category = "Investment"` AND `type = "income"` (dividend / interest cash rows).
+- Portfolio buy/sell churn (mapped to `transfer`) is intentionally counted in
+  neither series.

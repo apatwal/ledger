@@ -377,3 +377,39 @@ class HoldingOut(BaseModel):
     price: Optional[float] = None
     value: Optional[float] = None
     currency: Optional[str] = None
+    # v11 cost-basis + gain enrichment (null when Plaid omits cost_basis / type).
+    cost_basis: Optional[float] = None
+    security_type: Optional[str] = None
+    unrealized_gain: Optional[float] = None
+    unrealized_gain_pct: Optional[float] = None
+
+
+# ── Account nicknames (v11) ────────────────────────────────────────────────────
+
+class AccountNicknameIn(BaseModel):
+    label: str
+    nickname: str
+
+
+class AccountNicknameOut(BaseModel):
+    label: str
+    nickname: str
+
+    model_config = {"from_attributes": True}
+
+
+# ── Investments visualizations (v11) ───────────────────────────────────────────
+
+class SnapshotOut(BaseModel):
+    captured_at: datetime
+    account: Optional[str] = None
+    value: float
+    currency: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class InvestmentFlowPoint(BaseModel):
+    period: str            # YYYY (year) / YYYY-MM (month)
+    contributions: float   # money INTO investments (category=Investment, type=expense)
+    dividends: float       # investment income (category=Investment, type=income)

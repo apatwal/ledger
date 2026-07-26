@@ -106,6 +106,38 @@ class SavingsGoal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 
+class AccountNickname(Base):
+    """A user-supplied friendly nickname for a connected account (v11). `label` is
+    the canonical account label (the app_account string stored on transactions /
+    holdings); `nickname` is what the UI displays instead. NEW table — picked up
+    automatically by create_all(); no ALTER migration needed. Upsert by `label`."""
+    __tablename__ = "account_nicknames"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
+    nickname: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class PortfolioSnapshot(Base):
+    """A point-in-time investment portfolio value (v11), recorded on every Plaid
+    sync + on demand. One row per (account, calendar day): `account` NULL means the
+    grand total across all accounts, a non-null value is that account's label.
+    NEW table — picked up automatically by create_all(); no ALTER migration needed."""
+    __tablename__ = "portfolio_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, index=True, default=datetime.utcnow
+    )
+    account: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)  # NULL = total
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+
 class ImportBatch(Base):
     """One CSV import (v5.2). Records the file + resulting counts; transactions
     link back via Transaction.batch_id so an import can be reassigned or undone."""

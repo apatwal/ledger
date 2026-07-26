@@ -29,6 +29,7 @@ import type { Granularity } from '../lib/types'
 import DatePicker from './DatePicker'
 import DuplicatesModal from './DuplicatesModal'
 import { useAccountSelection } from '../lib/accountSelection'
+import { useAccountLabels } from '../lib/accountLabels'
 import { acctKey } from '../lib/queryKeys'
 import { iconForCategory } from '../lib/categoryIcons'
 
@@ -145,6 +146,7 @@ export default function Dashboard() {
 
   // Which accounts are in view is driven globally by the header selector.
   const { accountsParam, isSelected, toggle, balanceOf } = useAccountSelection()
+  const { displayLabel } = useAccountLabels()
   // The account selection is stringified into every stats/duplicates key so
   // cached data is never shown for the wrong filter.
   const accounts = accountsParam()
@@ -406,7 +408,7 @@ export default function Dashboard() {
                         title={on ? `Hide ${a.account} everywhere` : `Show ${a.account} again`}
                       >
                         <div className="bycard-row-top">
-                          <span className="bycard-name">{a.account}</span>
+                          <span className="bycard-name">{displayLabel(a.account)}</span>
                           <span className="bycard-expense">{fmt(a.expense)}</span>
                         </div>
                         <div className="bycard-bar-track">

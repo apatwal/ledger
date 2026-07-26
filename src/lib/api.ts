@@ -36,6 +36,9 @@ import type {
   SavingsGoalInput,
   SavingsGoalUpdate,
   BudgetChatResponse,
+  AccountNickname,
+  Snapshot,
+  InvestmentFlowPoint,
 } from './types'
 
 const BASE = '/api'
@@ -277,6 +280,61 @@ export async function getCategories(): Promise<string[]> {
 
 export async function getAccounts(): Promise<string[]> {
   return request<string[]>('/accounts')
+}
+
+// ─── Account nicknames (investments-viz) ──────────────────────────────────────
+// Display-only friendly names. Filtering/query params always use the raw label.
+
+export async function getNicknames(): Promise<AccountNickname[]> {
+  return request<AccountNickname[]>('/accounts/nicknames')
+}
+
+// Upsert a nickname. A blank nickname reverts/deletes it server-side. Uses
+// authFetch directly so an empty (204) response body doesn't trip JSON parsing.
+export async function upsertNickname(label: string, nickname: string): Promise<void> {
+  const res = await authFetch(`${BASE}/accounts/nicknames`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label, nickname }),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`${res.status} ${res.statusText}: ${text}`)
+  }
+}
+
+export async function deleteNickname(label: string): Promise<void> {
+  const res = await authFetch(`${BASE}/accounts/nicknames/${encodeURIComponent(label)}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`${res.status} ${res.statusText}: ${text}`)
+  }
+}
+
+// ─── Investments: snapshots & flows (investments-viz) ─────────────────────────
+
+// Portfolio value snapshots. Omit `account` for portfolio-level points. May 503
+// when Plaid is unconfigured; [] when nothing has been recorded yet.
+export async function getSnapshots(account?: string): Promise<Snapshot[]> {
+  const qs = toQuery({ account })
+  return request<Snapshot[]>(`/investments/snapshots${qs}`)
+}
+
+// Records the current portfolio value as a new snapshot.
+export async function captureSnapshot(): Promise<Snapshot> {
+  return request<Snapshot>('/investments/snapshot', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
+// Contributions vs. dividends bucketed over time.
+export async function getInvestmentFlows(
+  granularity: Granularity = 'month',
+  range?: { start_date?: string; end_date?: string },
+): Promise<InvestmentFlowPoint[]> {
+  const qs = toQuery({ granularity, ...((range as QueryParams) ?? {}) })
+  return request<InvestmentFlowPoint[]>(`/stats/investment-flows${qs}`)
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────

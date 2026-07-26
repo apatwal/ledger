@@ -2676,18 +2676,66 @@ td.num {
 .account-select-row {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 4px;
   width: 100%;
-  text-align: left;
-  padding: 7px 8px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  background: none;
-  cursor: pointer;
   color: var(--ink);
   transition: background var(--transition);
 }
 .account-select-row:hover { background: var(--paper-stripe); }
+/* The toggle area is the primary hit target; the pencil sits alongside it. */
+.account-select-hit {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  padding: 7px 8px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: inherit;
+}
+/* Small square icon buttons (pencil / save / cancel) inside a row. */
+.account-select-icon-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  border-radius: var(--radius-sm);
+  color: var(--ink-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--transition), color var(--transition), background var(--transition);
+}
+.account-select-row:hover .account-select-icon-btn { opacity: 1; }
+.account-select-icon-btn:hover { background: var(--paper-sunk); color: var(--ink); }
+.account-select-icon-btn.save { color: var(--green); opacity: 1; }
+.account-select-icon-btn.cancel { color: var(--red); opacity: 1; }
+.account-select-icon-btn:disabled { cursor: default; opacity: 0.6; }
+.account-select-row.editing { padding: 4px 6px; gap: 6px; }
+.account-select-edit-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--rule-ink);
+  border-radius: var(--radius-sm);
+  background: var(--paper-sunk);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.account-select-edit-input:focus {
+  outline: none;
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px var(--green-wash);
+}
 .account-select-check {
   width: 16px;
   height: 16px;
@@ -2987,6 +3035,18 @@ td.num {
   gap: 12px;
   background: var(--paper-sunk);
 }
+
+/* ─── Investments charts (investments-viz) ──────────────────────────────────── */
+/* Two allocation donuts side-by-side; collapses to one column when tight. */
+.holdings-charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+/* Colored variants of the small chart-note figure (gain vs loss totals). */
+.chart-note.gl-pos { color: var(--green); font-weight: 600; }
+.chart-note.gl-neg { color: var(--red); font-weight: 600; }
 
 /* ─── Clerk auth ─────────────────────────────────────────────────────────────── */
 .auth-screen {
