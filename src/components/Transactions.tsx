@@ -8,6 +8,7 @@ import TransactionModal from './TransactionModal'
 import DatePicker from './DatePicker'
 import { todayISO, toISO, addDays } from '../lib/date'
 import { useAccountSelection } from '../lib/accountSelection'
+import { useAccountLabels } from '../lib/accountLabels'
 import { acctKey, invalidateLedger } from '../lib/queryKeys'
 import { iconForCategory } from '../lib/categoryIcons'
 
@@ -225,6 +226,7 @@ export default function Transactions() {
 
   // Which accounts are in view is driven globally by the header selector.
   const { accountsParam, allSelected, selected } = useAccountSelection()
+  const { displayLabel } = useAccountLabels()
   const accountsSel = accountsParam()
   const acctPart = acctKey(accountsSel)
 
@@ -709,7 +711,7 @@ export default function Transactions() {
                   </td>
                   <td>
                     {tx.account
-                      ? <span className="badge badge-account">{tx.account}</span>
+                      ? <span className="badge badge-account" title={tx.account}>{displayLabel(tx.account)}</span>
                       : <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>Unassigned</span>}
                   </td>
                   <td style={{ maxWidth: 240 }}>

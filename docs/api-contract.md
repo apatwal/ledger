@@ -586,3 +586,143 @@ and the endpoint returns:
 ```
 When no budget intent is detected the model returns empty `actions` — nothing is
 created and only `reply` is populated (plain-chat behavior preserved).
+
+---
+
+## Investments visualizations + account nicknames (v11)
+
+Adds portfolio value-over-time tracking, investment cash-flow charting,
+cost-basis/gain enrichment on holdings, and user-editable account nicknames. Two
+NEW tables (`account_nicknames`, `portfolio_snapshots`) are created automatically
+by `Base.metadata.create_all` on startup — no ALTER migration needed. All new
+routers are gated by `require_user` like the other feature routers.
+
+### New tables
+
+**`account_nicknames`** — a user-supplied friendly name for a connected account.
+`id` (PK), `label` (unique, not-null, indexed — the canonical account label /
+`app_account` string stored on transactions + holdings), `nickname` (not-null),
+`is_savings` (Bool, not-null, default `false` — v11b: when true the account is a
+designated savings destination), `created_at`, `updated_at` (`onupdate`). Upsert
+is keyed by `label`. (The `is_savings` column is created by `create_all` — the
+table was new in v11 and not yet deployed, so no ALTER migration is needed.)
+
+**`portfolio_snapshots`** — a point-in-time investment portfolio value. `id` (PK),
+`captured_at` (DateTime, indexed, default `utcnow`), `account` (nullable, indexed —
+**NULL means the grand total across all accounts**; a non-null value is that
+account's label), `value` (Float, not-null), `currency` (nullable). At most one
+row per `(account, calendar day)`.
+
+### Account nicknames — `prefix=/api/accounts`
+
+Coexists with the standalone `GET /api/accounts` endpoint (nicknames live under
+`/api/accounts/nicknames`, so there is no path collision).
+
+- `GET /api/accounts/nicknames` → `AccountNicknameOut[]`
+  (`{ label, nickname, is_savings }`), ordered by label.
+- `PUT /api/accounts/nicknames` — body `AccountNicknameIn` `{ label, nickname }`.
+  Upsert by `label`; the nickname is **trimmed**. **If the nickname is blank /
+  whitespace-only, the row is DELETED** (revert to the raw label) — **UNLESS the
+  row is a designated savings account (`is_savings` true)**, in which case the row
+  is kept with the nickname cleared so the savings flag is never wiped (v11b).
+  Returns **200** with the FULL current `AccountNicknameOut[]` list (a blank-delete
+  is reflected by that label's absence from the list).
+- `PUT /api/accounts/savings` — body `SavingsToggleIn` `{ label, is_savings }`
+  (v11b). Upserts the row's `is_savings` (creating a row with `nickname=""` if
+  none exists). If the result is `is_savings` false **and** the nickname is blank,
+  the row is deleted. Returns **200** with the FULL current `AccountNicknameOut[]`
+  list. **Backfill:** after the toggle, best-effort (try/except, never raises; only
+  when Plaid is configured) it re-maps that account's transaction history so
+  existing rows pick up the new savings logic — for each `PlaidItem` whose
+  `accounts_json` contains an account with `app_account == label` it resets the
+  item cursor and re-runs that item's `/transactions/sync`. Because upserts match
+  on `plaid_transaction_id` and overwrite `type`/`category`, the re-map is
+  idempotent (no duplicates).
+- `DELETE /api/accounts/nicknames/{label}` → **204**, idempotent (204 whether or
+  not the label existed).
+
+**Savings-contribution mapping rule (v11b):** at sync time the set of designated
+savings labels is loaded ONCE (`SELECT label FROM account_nicknames WHERE
+is_savings = true`) and `map_transaction(txn, label, is_savings_account=...)` is
+called per row. When `is_savings_account` is true **and the row is an inflow into
+that account** (PFC primary `TRANSFER_IN`, i.e. money moving IN), the row is
+recategorized as a savings contribution: `type="expense"`, `category="Savings"`.
+This mirrors how investment cash contributions are handled, so bank-savings
+inflows now count in the savings rate (`savings = Σ expense in
+Savings/Investment`). Interest INCOME rows and OUTFLOWS (`TRANSFER_OUT`) are left
+untouched. `"Savings"` is added to the canonical category vocabulary.
+
+### Holdings enrichment — `GET /api/plaid/holdings`
+
+`HoldingOut` gains four optional fields (all `null` when Plaid omits the source
+data):
+- `cost_basis` — from the Plaid holding's `cost_basis`.
+- `security_type` — from the joined security's `type`.
+- `unrealized_gain` = `value − cost_basis` (only when both present).
+- `unrealized_gain_pct` = `unrealized_gain / cost_basis * 100` (only when
+  `cost_basis > 0`).
+
+Existing fields (account, institution, security_name, ticker_symbol, quantity,
+price, value, currency) are unchanged.
+
+### Investments — `prefix=/api/investments`
+
+- `POST /api/investments/snapshot` — capture NOW. Computes current holdings,
+  aggregates value per account + a grand total, and upserts TODAY's rows: one per
+  account **plus one total row** (`account=NULL`). At most one point per
+  `(account, calendar day)` — re-recording the same day updates the value in
+  place. Returns `{ captured: int, total_value: float }`. **503** when Plaid is
+  unconfigured.
+- `GET /api/investments/snapshots?account=&days=` → `SnapshotOut[]`
+  (`{ captured_at, account, value, currency }`) ordered by `captured_at` asc.
+  With **no** `account` param it returns the **TOTAL series** (`account IS NULL`);
+  `?account=<label>` returns that account's series. `days` limits to the last N
+  days. Returns `[]` when there are no snapshots.
+
+A snapshot is also recorded **best-effort on every Plaid sync** — the recorder
+`record_portfolio_snapshot(db)` is called at the end of `sync_items()` (which
+backs both `POST /api/plaid/sync` and `POST /api/plaid/sync-all`, plus the
+in-process scheduler) inside a try/except, so a snapshot failure never breaks a
+sync.
+
+### Investment flows — `GET /api/stats/investment-flows`
+
+`?granularity=month&start_date=&end_date=` → `InvestmentFlowPoint[]`
+(`{ period, contributions, dividends }`). `granularity` supports the same values
+as `/api/stats/over-time` (`year` → `YYYY`, `month` → `YYYY-MM`, `week` →
+`YYYY-Www`, `day` → `YYYY-MM-DD`). Grouped by period, ordered ascending, and
+(mirroring `/over-time`) **only periods with data are returned — no zero-fill**.
+
+**Definitions** (derived from `plaid_mapping.py`, where every investment
+transaction is assigned `category="Investment"`):
+- **`contributions`** = money directed INTO investments = `Σ amount` for rows
+  where `category = "Investment"` AND `type = "expense"`. Per the mapping, cash
+  contributions/deposits map to `expense` (they count toward savings); manual
+  `Investment`/expense rows (e.g. an ETF purchase) are included too.
+- **`dividends`** = investment income = `Σ amount` for rows where
+  `category = "Investment"` AND `type = "income"` (dividend / interest cash rows).
+- Portfolio buy/sell churn (mapped to `transfer`) is intentionally counted in
+  neither series.
+
+### Net worth — `GET /api/stats/net-worth`
+
+→ `NetWorthOut` `{ net_worth, assets, liabilities, currency, as_of }`. Derived
+from each linked `PlaidItem`'s `accounts_json` balances plus live holdings
+(`compute_holdings(db)`).
+
+- **assets** = Σ depository `current` (fallback `available`) **+** the total
+  holdings value.
+- **liabilities** = Σ `current` for credit / loan accounts.
+- **net_worth** = `assets − liabilities`. `currency` defaults `"USD"` (first
+  account currency seen otherwise). `as_of` = now.
+- Returns **200 with zeros** (NOT 503) when Plaid is unconfigured or there are no
+  linked items, so the UI tile can show a graceful empty state.
+
+**No-double-count rule:** an investment/brokerage account's cash `current` balance
+usually already equals the sum of that account's holdings, so we pick ONE source
+per account type — depository accounts use their cash `current`
+(fallback `available`); investment/brokerage accounts **ignore** their cash
+`current` and are represented **only** by the holdings-derived total (added once,
+in full); credit/loan `current` is a liability; any other type is ignored. The
+holdings total is best-effort (a Plaid error yields `0` rather than failing the
+endpoint).

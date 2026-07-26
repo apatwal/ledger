@@ -456,6 +456,77 @@ td.num,
   margin-top: 4px;
 }
 
+/* ─── Total balance (net worth) tile — leads the dashboard summary ───────── */
+.networth-tile {
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--gold);
+  border-radius: var(--radius);
+  padding: 18px 22px 20px;
+  margin-bottom: 18px;
+  box-shadow: var(--shadow-card);
+}
+.networth-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 10px;
+}
+.networth-eyebrow svg { color: var(--gold); }
+.networth-figure {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  font-size: clamp(30px, 4.5vw, 42px);
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--ink);
+}
+.networth-figure.muted { color: var(--ink-faint); }
+.networth-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin-top: 10px;
+}
+.networth-sub.networth-hint { color: var(--ink-faint); font-family: var(--font-body); }
+.networth-breakdown em {
+  font-style: normal;
+  color: var(--ink-faint);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 10px;
+  margin-right: 5px;
+}
+.networth-dot { color: var(--ink-faint); }
+/* Loading placeholders */
+.networth-shimmer {
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--paper-sunk) 25%, var(--paper-stripe) 37%, var(--paper-sunk) 63%);
+  background-size: 400% 100%;
+  animation: networthShimmer 1.4s ease infinite;
+}
+.networth-shimmer-fig { height: 40px; width: min(280px, 60%); }
+.networth-shimmer-sub { height: 14px; width: min(220px, 48%); margin-top: 12px; }
+@keyframes networthShimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .networth-shimmer { animation: none; }
+}
+
 /* ─── KPI cards (kept for compatibility / secondary use) ────────────────── */
 .kpi-grid {
   display: grid;
@@ -2676,18 +2747,66 @@ td.num {
 .account-select-row {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 4px;
   width: 100%;
-  text-align: left;
-  padding: 7px 8px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  background: none;
-  cursor: pointer;
   color: var(--ink);
   transition: background var(--transition);
 }
 .account-select-row:hover { background: var(--paper-stripe); }
+/* The toggle area is the primary hit target; the pencil sits alongside it. */
+.account-select-hit {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  padding: 7px 8px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: inherit;
+}
+/* Small square icon buttons (pencil / save / cancel) inside a row. */
+.account-select-icon-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  border-radius: var(--radius-sm);
+  color: var(--ink-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--transition), color var(--transition), background var(--transition);
+}
+.account-select-row:hover .account-select-icon-btn { opacity: 1; }
+.account-select-icon-btn:hover { background: var(--paper-sunk); color: var(--ink); }
+.account-select-icon-btn.save { color: var(--green); opacity: 1; }
+.account-select-icon-btn.cancel { color: var(--red); opacity: 1; }
+.account-select-icon-btn:disabled { cursor: default; opacity: 0.6; }
+.account-select-row.editing { padding: 4px 6px; gap: 6px; }
+.account-select-edit-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--rule-ink);
+  border-radius: var(--radius-sm);
+  background: var(--paper-sunk);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.account-select-edit-input:focus {
+  outline: none;
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px var(--green-wash);
+}
 .account-select-check {
   width: 16px;
   height: 16px;
@@ -2719,6 +2838,24 @@ td.num {
   font-size: 11px;
   color: var(--ink-soft);
   font-variant-numeric: tabular-nums;
+}
+/* Savings designation — piggybank toggle stays visible when "on", tinted gold. */
+.account-select-icon-btn.savings.on {
+  color: var(--gold);
+  opacity: 1;
+}
+.account-select-icon-btn.savings.on:hover { background: var(--gold-wash); color: var(--gold); }
+/* Subtle "Savings" tag on designated rows. */
+.account-select-savings-tag {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--gold-wash);
+  color: var(--gold);
 }
 
 /* ─── Exclude filter (Transactions, v10) ────────────────────────────────── */
@@ -2986,6 +3123,54 @@ td.num {
   flex-direction: column;
   gap: 12px;
   background: var(--paper-sunk);
+}
+
+/* ─── Investments charts (investments-viz) ──────────────────────────────────── */
+/* Two allocation donuts side-by-side; collapses to one column when tight. */
+.holdings-charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+/* Colored variants of the small chart-note figure (gain vs loss totals). */
+.chart-note.gl-pos { color: var(--green); font-weight: 600; }
+.chart-note.gl-neg { color: var(--red); font-weight: 600; }
+
+/* Compact donut legend — wrapping chips of "swatch · short label · pct". */
+.viz-legend {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  justify-content: center;
+}
+.viz-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  max-width: 190px;
+}
+.viz-legend-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.viz-legend-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.viz-legend-pct {
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 
 /* ─── Clerk auth ─────────────────────────────────────────────────────────────── */

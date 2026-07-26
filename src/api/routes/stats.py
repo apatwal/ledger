@@ -1,13 +1,21 @@
-from datetime import date
+from datetime import date, datetime
 from typing import Optional, Literal
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func, and_, case
 
 from ..database import get_db
-from ..models import Transaction
-from ..schemas import SummaryResponse, CategoryStat, OverTimeStat, AccountStat
+from ..models import Transaction, PlaidItem
+from ..schemas import (
+    SummaryResponse,
+    CategoryStat,
+    OverTimeStat,
+    AccountStat,
+    NetWorthOut,
+    InvestmentFlowPoint,
+)
 from ..account_filter import account_filter_condition
+from .. import plaid_client
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
@@ -261,3 +269,150 @@ def get_by_account(
         )
         for r in rows
     ]
+
+
+# ── Investment flows (v11) ─────────────────────────────────────────────────────
+# Investment cash flow per period, derived from the "Investment" category (the
+# single category assigned to every investment transaction by plaid_mapping.py):
+#   contributions = money directed INTO investments = Σ amount for rows where
+#                   category = "Investment" AND type = "expense". Per the mapping,
+#                   buys/deposits/contributions are neutralized as `transfer` EXCEPT
+#                   cash contributions/deposits which map to `expense` (they count
+#                   toward savings). Manual "Investment"/expense rows (e.g. an ETF
+#                   purchase) are included too.
+#   dividends     = investment income = Σ amount for rows where category =
+#                   "Investment" AND type = "income" (dividend/interest cash rows).
+# Transfers (portfolio buy/sell churn) are intentionally NOT counted in either.
+# Mirrors /stats/over-time: returns ONLY periods with data (no zero-fill).
+
+INVESTMENT_CATEGORY = "Investment"
+
+_INV_CONTRIB = case(
+    (and_(Transaction.category == INVESTMENT_CATEGORY, Transaction.type == "expense"),
+     Transaction.amount),
+    else_=0.0,
+)
+_INV_DIVIDEND = case(
+    (and_(Transaction.category == INVESTMENT_CATEGORY, Transaction.type == "income"),
+     Transaction.amount),
+    else_=0.0,
+)
+
+
+@router.get("/investment-flows", response_model=list[InvestmentFlowPoint])
+def get_investment_flows(
+    granularity: Literal["year", "month", "week", "day"] = Query("month"),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Investment contributions vs dividends per period. See the module comment
+    above for the exact definitions. Grouped by period label (YYYY / YYYY-MM /
+    YYYY-Www / YYYY-MM-DD), ordered ascending, periods-with-data only."""
+    period_expr = _period_expr(db, granularity)
+
+    conditions = [Transaction.category == INVESTMENT_CATEGORY]
+    if start_date:
+        conditions.append(Transaction.date >= start_date)
+    if end_date:
+        conditions.append(Transaction.date <= end_date)
+
+    stmt = (
+        select(
+            period_expr.label("period"),
+            func.coalesce(func.sum(_INV_CONTRIB), 0.0).label("contributions"),
+            func.coalesce(func.sum(_INV_DIVIDEND), 0.0).label("dividends"),
+        )
+        .where(and_(*conditions))
+        .group_by(period_expr)
+        .order_by(period_expr)
+    )
+
+    rows = db.execute(stmt).all()
+    return [
+        InvestmentFlowPoint(
+            period=r.period,
+            contributions=round(float(r.contributions), 2),
+            dividends=round(float(r.dividends), 2),
+        )
+        for r in rows
+    ]
+
+
+# ── Net worth (v11b) ────────────────────────────────────────────────────────────
+# Derived from each linked PlaidItem's accounts_json balances + live holdings.
+#
+# No-double-count rule: an investment/brokerage account's `current` balance
+# usually ALREADY equals the sum of that account's holdings. To avoid counting
+# the money twice we pick ONE source per account type:
+#   * depository (checking/savings) -> use the cash balance `current`
+#     (fallback `available`).
+#   * investment / brokerage         -> IGNORE the cash `current` and instead use
+#     the holdings-derived total from compute_holdings(db) (added ONCE, in full).
+#   * credit / loan                  -> `current` counts as a LIABILITY.
+#   * anything else                  -> ignored (neither asset nor liability).
+# assets      = Σ depository current  +  Σ all holdings value
+# liabilities = Σ (credit + loan) current
+# net_worth   = assets − liabilities
+_ASSET_DEPOSITORY = {"depository"}
+_ASSET_INVESTMENT = {"investment", "brokerage"}
+_LIABILITY_TYPES = {"credit", "loan"}
+
+
+@router.get("/net-worth", response_model=NetWorthOut)
+def get_net_worth(db: Session = Depends(get_db)):
+    """Net worth from linked Plaid account balances + holdings. Returns 200 with
+    zeros when Plaid is unconfigured / there are no items (graceful empty state,
+    NOT 503). See the module comment above for the no-double-count rule."""
+    now = datetime.utcnow()
+
+    items = db.execute(select(PlaidItem)).scalars().all()
+    if not plaid_client.is_configured() or not items:
+        return NetWorthOut(
+            net_worth=0.0, assets=0.0, liabilities=0.0, currency="USD", as_of=now
+        )
+
+    from .plaid_routes import _accounts_map, compute_holdings
+
+    assets = 0.0
+    liabilities = 0.0
+    currency: Optional[str] = None
+
+    for item in items:
+        for info in _accounts_map(item).values():
+            if not isinstance(info, dict):
+                continue
+            acct_type = str(info.get("type") or "").strip().lower()
+            if currency is None and info.get("currency"):
+                currency = info.get("currency")
+            # investment/brokerage cash balance is intentionally skipped — the
+            # holdings total (added below) is the single source for those.
+            if acct_type in _ASSET_INVESTMENT:
+                continue
+            current = info.get("current")
+            balance = current if current is not None else info.get("available")
+            if balance is None:
+                continue
+            try:
+                balance = float(balance)
+            except (TypeError, ValueError):
+                continue
+            if acct_type in _ASSET_DEPOSITORY:
+                assets += balance
+            elif acct_type in _LIABILITY_TYPES:
+                liabilities += balance
+
+    # Holdings total (best-effort — never fail the endpoint on a Plaid error).
+    try:
+        holdings_total = sum(h.value for h in compute_holdings(db) if h.value is not None)
+    except Exception:
+        holdings_total = 0.0
+    assets += holdings_total
+
+    return NetWorthOut(
+        net_worth=round(assets - liabilities, 2),
+        assets=round(assets, 2),
+        liabilities=round(liabilities, 2),
+        currency=currency or "USD",
+        as_of=now,
+    )

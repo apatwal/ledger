@@ -240,6 +240,47 @@ export interface Holding {
   price?: number | null
   value?: number | null
   currency?: string | null
+  // ── Cost basis & performance (investments-viz) ────────────────────────────
+  cost_basis?: number | null
+  security_type?: string | null
+  unrealized_gain?: number | null
+  unrealized_gain_pct?: number | null
+}
+
+// ── Investment value snapshots (investments-viz) ──────────────────────────────
+// A recorded point-in-time value. `account` is null for a portfolio-level total.
+export interface Snapshot {
+  captured_at: string // ISO timestamp
+  account: string | null
+  value: number
+  currency: string | null
+}
+
+// ── Investment flows over time (investments-viz) ──────────────────────────────
+export interface InvestmentFlowPoint {
+  period: string
+  contributions: number
+  dividends: number
+}
+
+// ── Account display nicknames (investments-viz) ───────────────────────────────
+// A friendly name shown in place of a raw canonical account label. Filtering and
+// query params always use the raw `label`; only the display changes.
+export interface AccountNickname {
+  label: string
+  nickname: string
+  // ── Savings designation (investments-viz) ─────────────────────────────────
+  // When true, money moved into this account counts toward the savings rate.
+  is_savings: boolean
+}
+
+// ── Net worth / total balance (investments-viz) ───────────────────────────────
+export interface NetWorth {
+  net_worth: number
+  assets: number
+  liabilities: number
+  currency: string
+  as_of: string | null
 }
 
 export interface PlaidStatus {

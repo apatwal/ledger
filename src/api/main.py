@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
-from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets
+from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets, nicknames, investments
 from . import plaid_client
 from .plaid_mapping import CANONICAL_CATEGORIES
 from . import auth
@@ -67,6 +67,8 @@ app.include_router(imports.router, prefix=API_PREFIX, dependencies=_auth)
 app.include_router(duplicates.router, prefix=API_PREFIX, dependencies=_auth)
 app.include_router(plaid_routes.router, prefix=API_PREFIX, dependencies=_auth)   # /api/plaid/* (v8)
 app.include_router(budgets.router, prefix=API_PREFIX, dependencies=_auth)        # /api/budgets/* (v9b)
+app.include_router(nicknames.router, prefix=API_PREFIX, dependencies=_auth)      # /api/accounts/nicknames (v11)
+app.include_router(investments.router, prefix=API_PREFIX, dependencies=_auth)    # /api/investments/* (v11)
 
 
 # ── Standalone endpoints ──────────────────────────────────────────────────────

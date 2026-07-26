@@ -15,7 +15,7 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts'
-import { TrendingDown, Sparkles, Copy } from 'lucide-react'
+import { TrendingDown, Sparkles, Copy, Landmark } from 'lucide-react'
 import {
   getStatsSummary,
   getStatsByCategory,
@@ -24,11 +24,13 @@ import {
   getInsights,
   getAssistantStatus,
   getDuplicates,
+  getNetWorth,
 } from '../lib/api'
 import type { Granularity } from '../lib/types'
 import DatePicker from './DatePicker'
 import DuplicatesModal from './DuplicatesModal'
 import { useAccountSelection } from '../lib/accountSelection'
+import { useAccountLabels } from '../lib/accountLabels'
 import { acctKey } from '../lib/queryKeys'
 import { iconForCategory } from '../lib/categoryIcons'
 
@@ -51,6 +53,20 @@ const C = {
 
 function fmt(n: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
+}
+
+// Currency-aware format for the net-worth tile (the endpoint returns its own
+// currency); falls back to a plain rounded amount if the currency is unknown.
+function fmtCur(n: number, currency?: string | null): string {
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency || 'USD',
+      maximumFractionDigits: 0,
+    }).format(n)
+  } catch {
+    return `$${Math.round(n)}`
+  }
 }
 
 function fmtSigned(n: number): string {
@@ -145,6 +161,7 @@ export default function Dashboard() {
 
   // Which accounts are in view is driven globally by the header selector.
   const { accountsParam, isSelected, toggle, balanceOf } = useAccountSelection()
+  const { displayLabel } = useAccountLabels()
   // The account selection is stringified into every stats/duplicates key so
   // cached data is never shown for the wrong filter.
   const accounts = accountsParam()
@@ -191,6 +208,18 @@ export default function Dashboard() {
   })
   const duplicates = duplicatesQ.data ?? []
   const [dupModalOpen, setDupModalOpen] = useState(false)
+
+  // Net worth / total balance — a whole-portfolio total, independent of the
+  // date range and account filter, so it has its own key and its own graceful
+  // states. The endpoint may not be live yet; on error we fall back to "—".
+  const netWorthQ = useQuery({
+    queryKey: ['stats', 'net-worth'],
+    queryFn: getNetWorth,
+    retry: false,
+  })
+  const netWorth = netWorthQ.data ?? null
+  const netWorthReady = !netWorthQ.isPending
+  const hasNetWorth = !!netWorth && (netWorth.net_worth !== 0 || netWorth.assets !== 0 || netWorth.liabilities !== 0)
 
   const assistantStatusQ = useQuery({ queryKey: ['assistant', 'status'], queryFn: getAssistantStatus })
   const aiEnabled = assistantStatusQ.data?.enabled ?? false
@@ -328,6 +357,35 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* Total balance (net worth) — leads the summary; a whole-portfolio figure
+          that stands apart from the period stats below it. */}
+      <section className="networth-tile" aria-label="Total balance">
+        <div className="networth-eyebrow">
+          <Landmark size={13} />
+          <span>Total balance</span>
+        </div>
+        {!netWorthReady ? (
+          <>
+            <div className="networth-shimmer networth-shimmer-fig" />
+            <div className="networth-shimmer networth-shimmer-sub" />
+          </>
+        ) : hasNetWorth && netWorth ? (
+          <>
+            <div className="networth-figure">{fmtCur(netWorth.net_worth, netWorth.currency)}</div>
+            <div className="networth-sub">
+              <span className="networth-breakdown"><em>Assets</em> {fmtCur(netWorth.assets, netWorth.currency)}</span>
+              <span className="networth-dot">·</span>
+              <span className="networth-breakdown"><em>Liabilities</em> {fmtCur(netWorth.liabilities, netWorth.currency)}</span>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="networth-figure muted">—</div>
+            <div className="networth-sub networth-hint">Connect an account to see your total balance</div>
+          </>
+        )}
+      </section>
+
       {loading && (
         <div className="loading-state">
           <div className="spinner spinner-lg" />
@@ -406,7 +464,7 @@ export default function Dashboard() {
                         title={on ? `Hide ${a.account} everywhere` : `Show ${a.account} again`}
                       >
                         <div className="bycard-row-top">
-                          <span className="bycard-name">{a.account}</span>
+                          <span className="bycard-name">{displayLabel(a.account)}</span>
                           <span className="bycard-expense">{fmt(a.expense)}</span>
                         </div>
                         <div className="bycard-bar-track">
