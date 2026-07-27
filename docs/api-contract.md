@@ -829,3 +829,54 @@ Sends a test ntfy message so you can verify your setup. Returns `{"sent": bool}`
 ### Config keys
 `NTFY_TOPIC`, `NTFY_SERVER` (optional), `PLAID_WEBHOOK_URL`, `APP_URL` — all declared
 `sync: false` in `render.yaml` and present (blank, commented) in `.env.example`.
+
+---
+
+## Monthly spend recap (v12)
+
+A cron on the **1st of each month** pushes an ntfy recap of the month that just
+ended, reusing `notify.send_ntfy`. Uses the CURRENT categories (no food split).
+
+### `POST /api/reports/monthly`
+- **`month`** (optional, query **or** JSON body, `"YYYY-MM"`). **Default = the
+  PREVIOUS calendar month** relative to today (UTC). Invalid format → **422**.
+- Computes over that month's `[first_day, last_day]` with **/stats/summary
+  semantics** (transfers excluded; net-expense = `Σ expense − Σ refund`):
+  - `income` = Σ income; `spent` = Σ net expense; `net` = income − spent.
+  - `saved` = Σ amount where `type='expense' AND category='Savings'`.
+  - `invested` = Σ amount where `type='expense' AND category='Investment'`.
+  - `savings` = Σ where `category ∈ {Savings, Investment}`;
+    `savings_rate` = `savings / income` (0 when income ≤ 0).
+  - `categories` = per-category **net expense**, EXCLUDING
+    `{Savings, Investment, Transfer, Payments & Credits, Income}`, positive totals
+    only, sorted desc, **top 6**.
+- Sends one ntfy notification (Title `📊 {Month Year} recap`, `Tags: bar_chart`,
+  `Click: {APP_URL}/dashboard` when `APP_URL` is set), then returns:
+  `{month, income, spent, saved, invested, savings_rate, net, categories:[{category, amount}], sent}`.
+
+**Recap message body** (currency rounded to whole dollars, thousands-separated;
+the `(NN%)` next to Saved is `savings_rate`):
+
+```
+Income $5,000 · Spent $3,240
+Saved $600 (12%) · Invested $500
+Top spending:
+• Food & Drink $520
+• Shopping $410
+• Bills & Utilities $900
+```
+
+### Auth (cron token)
+Mirrors `POST /plaid/sync-all` **exactly**. `PLAID_SYNC_TOKEN` is the **general
+cron token**: the `/reports/monthly` path is exempt from Clerk auth in `auth.py`
+when the `X-Plaid-Sync-Token` header matches it, and the endpoint **also** checks
+the token (**401** when `PLAID_SYNC_TOKEN` is set and the header mismatches). When
+`PLAID_SYNC_TOKEN` is **unset**, the request falls through to normal Clerk auth (so
+local dev + tests with auth disabled can call it).
+
+### Cron
+`.github/workflows/monthly-report.yml` — schedule `0 13 1 * *` (1st of month, 13:00
+UTC) + `workflow_dispatch`. Warms `${BASE_URL}/api/health`, then POSTs
+`${BASE_URL}/api/reports/monthly` with `X-Plaid-Sync-Token: ${{ secrets.PLAID_SYNC_TOKEN }}`.
+`BASE_URL` = `vars.SYNC_BASE_URL` (default `https://expense-tracker-2kfq.onrender.com`).
+Fails the run on any non-2xx.
