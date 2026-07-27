@@ -3751,3 +3751,287 @@ td.num {
   display: flex;
   align-items: center;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Wallet — Accounts page. A net-worth hero band above a real WALLET: bank cards
+   (one per account) fanned horizontally and tucked into a billfold pocket.
+   Hover / focus lifts a card up and forward out of the pocket, fully revealing
+   its balance + that institution's Sync / Disconnect actions. New scoped
+   `.wallet-*` names avoid the older `.plaid-*` / `.card` specificity.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.wallet-page { display: flex; flex-direction: column; gap: 8px; }
+
+/* ── Net-worth hero band ─────────────────────────────────────────────────── */
+.wallet-hero {
+  display: flex; flex-wrap: wrap; align-items: flex-end; gap: 24px 40px;
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-top: 3px solid var(--rule-ink);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  padding: 22px 26px;
+}
+.wallet-hero-nw { flex: 1 1 320px; min-width: 0; }
+.wallet-nw-eyebrow {
+  display: flex; align-items: center; gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.13em; text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.wallet-nw-eyebrow svg { color: var(--gold); }
+.wallet-nw-figure {
+  font-family: var(--font-mono);
+  font-size: clamp(32px, 5vw, 46px);
+  font-weight: 600; line-height: 1.0;
+  letter-spacing: -0.02em; color: var(--ink);
+  margin-top: 10px; font-variant-numeric: tabular-nums;
+}
+.wallet-nw-figure.muted { color: var(--ink-faint); }
+.wallet-nw-ledger { display: flex; flex-wrap: wrap; gap: 22px; margin-top: 14px; }
+.wallet-nw-cell { display: flex; flex-direction: column; gap: 3px; }
+.wallet-nw-cell dt {
+  font-family: var(--font-mono);
+  font-size: 10px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint);
+}
+.wallet-nw-cell dd {
+  margin: 0; font-family: var(--font-mono);
+  font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink);
+}
+.wallet-nw-cell dd.pos { color: var(--green); }
+.wallet-nw-cell dd.neg { color: var(--red); }
+.wallet-nw-linked {
+  font-family: var(--font-mono); font-size: 11.5px;
+  letter-spacing: 0.03em; color: var(--ink-faint);
+  align-self: flex-end;
+}
+.wallet-nw-shimmer {
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--paper-sunk) 25%, var(--paper-stripe) 50%, var(--paper-sunk) 75%);
+  background-size: 200% 100%; animation: walletShimmer 1.4s ease infinite;
+}
+.wallet-nw-shimmer.fig { height: 40px; width: 240px; max-width: 60%; margin-top: 12px; }
+.wallet-nw-shimmer.sub { height: 14px; width: 200px; max-width: 52%; margin-top: 16px; }
+@keyframes walletShimmer { to { background-position: -200% 0; } }
+
+/* ── Controls (right side of the hero band) ──────────────────────────────── */
+.wallet-hero-controls { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.wallet-actions-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
+.wallet-env {
+  font-family: var(--font-mono);
+  font-size: 10px; font-weight: 600;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-soft);
+  background: var(--paper-sunk); border: 1px solid var(--rule);
+  border-radius: var(--radius-pill); padding: 4px 8px;
+}
+.wallet-lede { font-size: 12px; line-height: 1.5; color: var(--ink-faint); margin: 0; text-align: right; max-width: 320px; }
+
+/* ── The wallet: horizontal fan + billfold pocket ────────────────────────── */
+.wallet {
+  --card-w: 272px;
+  --card-h: 188px;
+  --overlap: 168px;   /* how much each card tucks behind the previous */
+  --lift: 116px;      /* how far a hovered card rises out of the pocket */
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: flex-end;
+  /* Top room for a lifted card comes from each card's own hit-area extension now,
+     so only a little breathing room is needed here. */
+  padding: 16px 24px 40px;
+  min-height: 300px;
+}
+.wallet-track { display: flex; justify-content: center; align-items: flex-end; }
+
+/* The card is a STATIONARY hit area, taller than the visual by --lift. Because
+   it never moves, hovering is stable (no flicker), and when the inner lifts up
+   the cursor stays inside the same target so the revealed actions stay clickable. */
+.wallet-card {
+  position: relative;
+  flex: 0 0 var(--card-w);
+  width: var(--card-w);
+  height: calc(var(--card-h) + var(--lift));
+  cursor: default;
+}
+.wallet-card + .wallet-card { margin-left: calc(-1 * var(--overlap)); }
+/* The visual card, pinned to the bottom of the hit area; only this transforms. */
+.wallet-card-inner {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: var(--card-h);
+  border-radius: 15px;
+  padding: 15px 17px;
+  color: var(--card-fg);
+  background:
+    radial-gradient(130% 120% at 16% 0%, rgba(255,255,255,0.17), rgba(255,255,255,0) 55%),
+    linear-gradient(150deg, var(--card-bg1) 0%, var(--card-bg2) 100%);
+  box-shadow: 0 1px 1px rgba(0,0,0,0.10), 0 14px 26px -14px rgba(27,28,24,0.6);
+  display: flex; flex-direction: column;
+  transform-origin: 50% 100%;
+  transform: rotate(var(--rot, 0deg));
+}
+.wallet-card-inner::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); pointer-events: none;
+}
+/* Lift on hover, and on KEYBOARD focus only (:focus-visible / :has(:focus-visible)).
+   Using focus-visible instead of focus-within means a MOUSE click doesn't leave a
+   card stuck lifted — so clicking one card then hovering another never strands two. */
+.wallet-card:hover,
+.wallet-card:focus-visible,
+.wallet-card:has(:focus-visible) { z-index: 60 !important; }
+.wallet-card:hover .wallet-card-inner,
+.wallet-card:focus-visible .wallet-card-inner,
+.wallet-card:has(:focus-visible) .wallet-card-inner {
+  transform: translateY(calc(-1 * var(--lift))) rotate(0deg) scale(1.04);
+  box-shadow: 0 2px 3px rgba(0,0,0,0.14), 0 40px 60px -22px rgba(27,28,24,0.62);
+}
+.wallet-card:focus-visible { outline: none; }
+.wallet-card:focus-visible .wallet-card-inner { outline: 3px solid var(--green); outline-offset: 3px; }
+
+.wallet-card-top { display: flex; align-items: center; gap: 9px; }
+.wallet-card-logo {
+  width: 28px; height: 28px; border-radius: 7px; object-fit: contain;
+  background: rgba(255,255,255,0.92); padding: 3px; flex-shrink: 0;
+}
+.wallet-card-monogram {
+  width: 28px; height: 28px; border-radius: 7px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-display); font-weight: 700; font-size: 14px;
+  background: rgba(255,255,255,0.18); border: 1px solid var(--card-line); color: var(--card-fg);
+}
+.wallet-card-inst {
+  font-family: var(--font-display); font-weight: 600; font-size: 14px; letter-spacing: 0.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.wallet-card-type {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--card-fg-soft); border: 1px solid var(--card-line);
+  border-radius: var(--radius-pill); padding: 3px 6px; white-space: nowrap;
+}
+.wallet-card-degraded {
+  margin-left: 5px; font-family: var(--font-mono);
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: #fff; background: rgba(168,50,46,0.94); border-radius: var(--radius-pill); padding: 3px 5px;
+}
+.wallet-card-nick {
+  margin-top: 12px; font-size: 13.5px; font-weight: 600; line-height: 1.2; color: var(--card-fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.wallet-card-mask {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.16em;
+  color: var(--card-fg-soft); margin-top: 4px;
+}
+/* Never let flex squeeze a text row shorter than its line box (that clipped the
+   account name to its top half). Keep each row at its natural height. */
+.wallet-card-top, .wallet-card-nick, .wallet-card-mask, .wallet-card-foot { flex-shrink: 0; }
+/* Foot — balance + actions. Hidden while the card sits in the pocket; fades in
+   as the card lifts out, so it never peeks around the pocket lip on tilted cards. */
+.wallet-card-foot { margin-top: auto; opacity: 0; }
+.wallet-card:hover .wallet-card-foot,
+.wallet-card:focus-visible .wallet-card-foot,
+.wallet-card:has(:focus-visible) .wallet-card-foot { opacity: 1; }
+.wallet-card-bal { display: flex; align-items: baseline; gap: 7px; }
+.wallet-card-bal-fig {
+  font-family: var(--font-mono); font-size: 22px; font-weight: 600; letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums; color: var(--card-fg); line-height: 1;
+}
+.wallet-card-bal-label {
+  font-family: var(--font-mono); font-size: 9.5px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--card-fg-soft);
+}
+.wallet-card-fold {
+  display: flex; align-items: center; gap: 7px;
+  margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--card-line);
+}
+.wallet-card-synced {
+  font-family: var(--font-mono); font-size: 10px; color: var(--card-fg-soft);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.wallet-card-fold-actions { margin-left: auto; display: flex; gap: 6px; }
+.wallet-cbtn {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--font-body); font-size: 11px; font-weight: 600;
+  padding: 5px 9px; border-radius: var(--radius-sm);
+  border: 1px solid var(--card-line); background: rgba(255,255,255,0.15); color: var(--card-fg);
+  cursor: pointer; transition: background 120ms ease;
+}
+.wallet-cbtn:hover:not(:disabled) { background: rgba(255,255,255,0.28); }
+.wallet-cbtn:disabled { opacity: 0.55; cursor: default; }
+.wallet-cbtn.danger { color: #fff; background: rgba(168,50,46,0.92); border-color: rgba(168,50,46,0.92); }
+.wallet-cbtn.danger:hover:not(:disabled) { background: rgba(134,38,34,1); }
+.wallet-cbtn.ghost { background: transparent; }
+.wallet-cbtn:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+
+/* The billfold pocket — sits above resting cards (hiding their foot), below a
+   lifted card. Gives the "tucked into a wallet" read. */
+.wallet-pocket {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 118px; z-index: 40; pointer-events: auto;
+  border-radius: 14px 14px var(--radius) var(--radius);
+  background: linear-gradient(180deg, #3b3d34 0%, #2a2c24 100%);
+  box-shadow: inset 0 2px 0 rgba(255,255,255,0.06), 0 -1px 0 rgba(27,28,24,0.4), var(--shadow-card);
+}
+.wallet-pocket::before {
+  content: ""; position: absolute; left: 50%; top: 13px; transform: translateX(-50%);
+  width: 46px; height: 4px; border-radius: 2px; background: rgba(247,248,242,0.22);
+}
+.wallet-pocket::after {
+  content: "Wallet"; position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 9px; font-weight: 600;
+  letter-spacing: 0.28em; text-transform: uppercase; color: rgba(247,248,242,0.34);
+}
+
+/* Motion — animate the lift only when motion is welcome. The reveal itself
+   (transform + z-index) still applies instantly under reduced motion, so a
+   hovered/focused card's actions stay fully reachable either way. */
+@media (prefers-reduced-motion: no-preference) {
+  .wallet-card-inner { transition: transform 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms ease; will-change: transform; }
+  .wallet-card-foot { transition: opacity 200ms ease 60ms; }
+}
+
+/* ── Narrow / mobile: collapse the fan into a legible vertical column. The
+   6-card horizontal fan needs ~840px; below this it would clip, so mid-size
+   screens and phones get a clean vertical list instead. ───────────────────── */
+@media (max-width: 1180px) {
+  .wallet { display: block; padding: 4px 0 0; min-height: 0; }
+  .wallet-track { display: flex; flex-direction: column; align-items: stretch; gap: 14px; }
+  .wallet-card {
+    flex: none; width: 100%; height: auto; min-height: 0;
+    margin-left: 0 !important; z-index: auto !important;
+  }
+  .wallet-card-inner {
+    position: static; height: auto; min-height: var(--card-h);
+    transform: none !important;
+    box-shadow: 0 1px 1px rgba(0,0,0,0.10), 0 10px 22px -14px rgba(27,28,24,0.5);
+  }
+  .wallet-card-foot { opacity: 1 !important; }
+  .wallet-pocket { display: none; }
+  .wallet-hero-controls { align-items: flex-start; }
+  .wallet-lede, .wallet-actions-row { text-align: left; justify-content: flex-start; }
+  .wallet-nw-linked { align-self: flex-start; }
+}
+
+/* ── Empty & disabled ────────────────────────────────────────────────────── */
+.wallet-empty {
+  max-width: 460px; margin: 24px auto; border: 1.5px dashed var(--rule); border-radius: 16px;
+  min-height: 190px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; text-align: center; padding: 28px;
+  background: repeating-linear-gradient(135deg, transparent 0 10px, var(--green-wash) 10px 11px), var(--paper-raised);
+}
+.wallet-empty-ico {
+  width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center;
+  background: var(--green-soft); color: var(--green-deep);
+}
+.wallet-empty-title { font-family: var(--font-display); font-weight: 600; font-size: 15px; color: var(--ink); }
+.wallet-empty-sub { font-size: 12.5px; color: var(--ink-faint); max-width: 260px; line-height: 1.5; }
+
+.wallet-shell {
+  background: var(--paper-raised); border: 1px solid var(--rule);
+  border-radius: var(--radius); box-shadow: var(--shadow-card); padding: 22px 24px;
+}
+.wallet-shell-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+.wallet-shell-head .t { font-family: var(--font-display); font-weight: 600; font-size: 15px; }

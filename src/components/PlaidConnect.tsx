@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { usePlaidLink } from 'react-plaid-link'
 import type { PlaidLinkOnSuccessMetadata } from 'react-plaid-link'
@@ -7,20 +7,20 @@ import {
   Link2,
   RefreshCw,
   Trash2,
-  CreditCard,
+  Wallet,
+  Plus,
   CheckCircle,
   XCircle,
-  Info,
-  Building2,
 } from 'lucide-react'
 import {
   getPlaidStatus,
+  getNetWorth,
   createPlaidLinkToken,
   exchangePlaidPublicToken,
   plaidSync,
   deletePlaidItem,
 } from '../lib/api'
-import type { PlaidItem, PlaidSyncResult } from '../lib/types'
+import type { PlaidItem, PlaidAccount, PlaidSyncResult } from '../lib/types'
 import { invalidateLedger } from '../lib/queryKeys'
 
 // Human-friendly "last synced" — relative for recent, absolute for older.
@@ -39,17 +39,18 @@ function formatSynced(iso: string | null): string {
   return `Synced ${then.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
 }
 
-// Compact account balance for the connected-accounts chips.
-function fmtBal(amount: number | null | undefined, currency?: string | null): string | null {
-  if (amount === null || amount === undefined) return null
+// Money for card balances & the net-worth figure.
+function fmtMoney(amount: number | null | undefined, currency?: string | null, cents = false): string {
+  if (amount === null || amount === undefined) return '—'
   try {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: currency || 'USD',
-      maximumFractionDigits: 0,
+      maximumFractionDigits: cents ? 2 : 0,
+      minimumFractionDigits: cents ? 2 : 0,
     }).format(amount)
   } catch {
-    return `$${Math.round(amount)}`
+    return `$${cents ? amount.toFixed(2) : Math.round(amount)}`
   }
 }
 
@@ -63,9 +64,96 @@ function syncSummary(r: PlaidSyncResult): string {
   return `Sync complete${acrossItems}: ${parts.join(', ')}.`
 }
 
+// Nicely-cased account type/subtype for the little card chip.
+function typeLabel(a: PlaidAccount): string {
+  const raw = (a.subtype || a.type || 'account').replace(/_/g, ' ')
+  return raw.replace(/\b\w/g, (c) => c.toUpperCase())
+}
+// app_account often bakes the mask in ("CREDIT CARD ••2875"); strip it since the
+// card renders the masked number on its own line, card-style.
+function cleanNick(a: PlaidAccount): string {
+  const base = a.app_account || a.name || 'Account'
+  if (!a.mask) return base
+  const stripped = base.replace(new RegExp(`\\s*[•·]+\\s*${a.mask}\\s*$`), '').trim()
+  return stripped || base
+}
+function balanceLabel(a: PlaidAccount): string {
+  const t = (a.type || '').toLowerCase()
+  if (t === 'investment' || t === 'brokerage') return 'Value'
+  if (t === 'credit' || t === 'loan') return 'Balance'
+  return 'Available'
+}
+
+// ── Card colour: turn a brand hex into a legible gradient + text colour. ─────
+function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace('#', '')
+  const s = h.length === 3 ? h.split('').map((c) => c + c).join('') : h
+  const n = parseInt(s.slice(0, 6), 16)
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+}
+function relLuminance([r, g, b]: [number, number, number]): number {
+  const a = [r, g, b].map((v) => {
+    const s = v / 255
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4)
+  })
+  return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]
+}
+function scaleRgb([r, g, b]: [number, number, number], f: number): string {
+  const c = (v: number) => Math.max(0, Math.min(255, Math.round(v * f)))
+  return `rgb(${c(r)}, ${c(g)}, ${c(b)})`
+}
+interface CardTheme { bg1: string; bg2: string; fg: string; fgSoft: string; line: string }
+function cardTheme(hex?: string | null): CardTheme {
+  const valid = hex && /^#?[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(hex.trim())
+  const base = valid ? hex!.trim() : '#2c2e27' // slate ink fallback for brand-less banks
+  const rgb = hexToRgb(base)
+  const light = relLuminance(rgb) < 0.45 // dark card → light text
+  return {
+    bg1: scaleRgb(rgb, 1),
+    bg2: scaleRgb(rgb, light ? 0.62 : 1.14),
+    fg: light ? '#f7f8f2' : '#1b1c18',
+    fgSoft: light ? 'rgba(247,248,242,0.74)' : 'rgba(27,28,24,0.62)',
+    line: light ? 'rgba(247,248,242,0.24)' : 'rgba(27,28,24,0.16)',
+  }
+}
+
+const prefersReducedMotion =
+  typeof window !== 'undefined' &&
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+// Gentle count-up for the net-worth figure; static when motion is unwelcome.
+function useCountUp(target: number, ready: boolean): number {
+  const [val, setVal] = useState(prefersReducedMotion ? target : 0)
+  useEffect(() => {
+    if (!ready || prefersReducedMotion) { setVal(target); return }
+    let raf = 0
+    const start = performance.now()
+    const dur = 750
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / dur)
+      const eased = 1 - Math.pow(1 - t, 3)
+      setVal(target * eased)
+      if (t < 1) raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [target, ready])
+  return val
+}
+
+// Per-card tilt for the horizontal fan: symmetric about centre, with the total
+// spread capped so a large wallet doesn't over-rotate the edge cards.
+function fanRotation(idx: number, count: number): number {
+  if (count <= 1) return 0
+  const step = Math.min(4.5, 22 / (count - 1))
+  return (idx - (count - 1) / 2) * step
+}
+
 export default function PlaidConnect() {
   const queryClient = useQueryClient()
   const statusQuery = useQuery({ queryKey: ['plaid', 'status'], queryFn: getPlaidStatus })
+  const netWorthQuery = useQuery({ queryKey: ['stats', 'net-worth'], queryFn: getNetWorth })
   const status = statusQuery.data ?? null
   const loading = statusQuery.isPending
   const [actionError, setActionError] = useState<string | null>(null)
@@ -184,35 +272,42 @@ export default function PlaidConnect() {
     }
   }
 
+  const items = status?.items ?? []
+
+  // One card per account (a bank can hold several). Keep a stable flat order so
+  // the fan geometry doesn't reshuffle on re-render.
+  const cards = useMemo(
+    () => items.flatMap((item) => item.accounts.map((account) => ({ item, account }))),
+    [items],
+  )
+
   // ─── States ─────────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
-      <div className="card plaid-card">
-        <div className="plaid-head">
-          <Landmark size={18} style={{ color: 'var(--accent-hover)' }} />
-          <div style={{ fontWeight: 600, fontSize: 15 }}>Connect a bank</div>
+      <div className="wallet-shell">
+        <div className="wallet-shell-head">
+          <Wallet size={18} style={{ color: 'var(--green-deep)' }} />
+          <span className="t">Your wallet</span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 13 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--ink-faint)', fontSize: 13 }}>
           <span className="spinner" style={{ width: 15, height: 15 }} />
-          Checking bank sync…
+          Loading your accounts…
         </div>
       </div>
     )
   }
 
-  // Not configured — mirror the Assistant "feature disabled" treatment.
+  // Not configured — same guidance as before, in the wallet shell.
   if (!status?.configured) {
     return (
-      <div className="card plaid-card plaid-disabled">
-        <div className="plaid-head">
-          <Landmark size={18} style={{ color: 'var(--text-muted)' }} />
-          <div style={{ fontWeight: 600, fontSize: 15, color: 'var(--text-secondary)' }}>
-            Bank sync is off
-          </div>
-          <span className="badge badge-transfer" style={{ marginLeft: 'auto' }}>Not configured</span>
+      <div className="wallet-shell">
+        <div className="wallet-shell-head">
+          <Landmark size={18} style={{ color: 'var(--ink-faint)' }} />
+          <span className="t" style={{ color: 'var(--ink-soft)' }}>Bank sync is off</span>
+          <span className="wallet-env" style={{ marginLeft: 'auto' }}>Not configured</span>
         </div>
-        <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.7, margin: 0 }}>
+        <p style={{ fontSize: 13, color: 'var(--ink-faint)', lineHeight: 1.7, margin: 0 }}>
           Automatic bank sync (via Plaid) lets you link an account and pull transactions in without CSV
           exports. It's not enabled on this server. To turn it on, set{' '}
           <code className="plaid-code">PLAID_CLIENT_ID</code> and{' '}
@@ -222,98 +317,182 @@ export default function PlaidConnect() {
     )
   }
 
-  const items = status.items ?? []
   const busy = preparing || finishing
+  const nw = netWorthQuery.data ?? null
+  const nwReady = !netWorthQuery.isPending
+  const hasNetWorth = !!nw && (nw.net_worth !== 0 || nw.assets !== 0 || nw.liabilities !== 0)
 
   return (
-    <div className="card plaid-card">
-      <div className="plaid-head">
-        <Landmark size={18} style={{ color: 'var(--accent-hover)' }} />
-        <div style={{ fontWeight: 600, fontSize: 15 }}>Connect a bank</div>
-        {status.env && (
-          <span className="badge badge-statement badge-statement-bank" style={{ marginLeft: 8 }}>
-            {status.env}
-          </span>
-        )}
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-          {items.length > 0 && (
+    <div className="wallet-page">
+      {/* ── Net-worth hero band + controls ── */}
+      <section className="wallet-hero" aria-label="Net worth and bank controls">
+        <div className="wallet-hero-nw">
+          <NetWorthPanel
+            netWorth={nw}
+            ready={nwReady}
+            has={hasNetWorth}
+            bankCount={items.length}
+            accountCount={cards.length}
+          />
+        </div>
+
+        <div className="wallet-hero-controls">
+          <div className="wallet-actions-row">
             <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => void handleSync()}
-              disabled={syncingId !== null || busy}
-              title="Pull the latest transactions from every connected bank"
+              className="btn btn-primary btn-sm"
+              onClick={() => void handleConnect()}
+              disabled={busy || syncingId !== null}
             >
-              {syncingId === 'all'
-                ? <span className="spinner" style={{ width: 13, height: 13 }} />
-                : <RefreshCw size={14} />}
-              Sync all
+              {preparing
+                ? <><span className="spinner" style={{ width: 13, height: 13 }} /> Opening…</>
+                : finishing
+                  ? <><span className="spinner" style={{ width: 13, height: 13 }} /> Finishing…</>
+                  : <><Link2 size={14} /> Connect a bank</>}
             </button>
+            {items.length > 0 && (
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => void handleSync()}
+                disabled={syncingId !== null || busy}
+                title="Pull the latest transactions from every connected bank"
+              >
+                {syncingId === 'all'
+                  ? <span className="spinner" style={{ width: 13, height: 13 }} />
+                  : <RefreshCw size={14} />}
+                Sync all
+              </button>
+            )}
+            {status.env && <span className="wallet-env">{status.env}</span>}
+          </div>
+          <p className="wallet-lede">
+            Securely link a bank through Plaid — transactions sync in on their own, no CSV needed.
+          </p>
+          {msg && (
+            <div className="plaid-note success">
+              <CheckCircle size={15} />
+              <span>{msg}</span>
+            </div>
           )}
+          {error && (
+            <div className="plaid-note danger">
+              <XCircle size={15} />
+              <span>{error}</span>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* ── The wallet: cards fanned into a billfold pocket ── */}
+      {cards.length === 0 ? (
+        <div className="wallet-empty">
+          <div className="wallet-empty-ico"><Plus size={22} /></div>
+          <div className="wallet-empty-title">Your wallet is empty</div>
+          <div className="wallet-empty-sub">
+            Link your first bank to tuck a card in here — balances and transactions sync on their own.
+          </div>
           <button
             className="btn btn-primary btn-sm"
             onClick={() => void handleConnect()}
-            disabled={busy || syncingId !== null}
+            disabled={busy}
+            style={{ marginTop: 2 }}
           >
-            {preparing
-              ? <><span className="spinner" style={{ width: 13, height: 13 }} /> Opening…</>
-              : finishing
-                ? <><span className="spinner" style={{ width: 13, height: 13 }} /> Finishing…</>
-                : <><Link2 size={14} /> Connect a bank</>}
+            <Link2 size={14} /> Connect a bank
           </button>
         </div>
-      </div>
-
-      <p style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6, margin: '0 0 4px' }}>
-        Securely link a bank through Plaid and pull transactions in automatically — no CSV needed.
-      </p>
-
-      {msg && (
-        <div className="plaid-note success">
-          <CheckCircle size={15} />
-          <span>{msg}</span>
-        </div>
-      )}
-      {error && (
-        <div className="plaid-note danger">
-          <XCircle size={15} />
-          <span>{error}</span>
-        </div>
-      )}
-
-      {items.length === 0 ? (
-        <div className="plaid-empty">
-          <Info size={15} style={{ flexShrink: 0 }} />
-          <span>No banks connected yet. Click <strong>Connect a bank</strong> to link one.</span>
-        </div>
       ) : (
-        <div className="plaid-items">
-          {items.map((item) => (
-            <PlaidItemRow
-              key={item.id}
-              item={item}
-              syncing={syncingId === item.id}
-              removing={removingId === item.id}
-              confirming={confirmId === item.id}
-              disabled={syncingId !== null || busy}
-              onSync={() => void handleSync(item.id)}
-              onAskDisconnect={() => setConfirmId(item.id)}
-              onCancelDisconnect={() => setConfirmId(null)}
-              onConfirmDisconnect={() => void handleDisconnect(item.id)}
-            />
-          ))}
+        <div className="wallet">
+          <div className="wallet-track" role="list" aria-label="Linked accounts">
+            {cards.map(({ item, account }, idx) => (
+              <WalletCard
+                key={account.account_id}
+                item={item}
+                account={account}
+                rot={fanRotation(idx, cards.length)}
+                z={idx + 1}
+                syncing={syncingId === item.id}
+                removing={removingId === item.id}
+                confirming={confirmId === item.id}
+                disabled={syncingId !== null || busy}
+                onSync={() => void handleSync(item.id)}
+                onAskDisconnect={() => setConfirmId(item.id)}
+                onCancelDisconnect={() => setConfirmId(null)}
+                onConfirmDisconnect={() => void handleDisconnect(item.id)}
+              />
+            ))}
+          </div>
+          <div className="wallet-pocket" aria-hidden />
         </div>
       )}
     </div>
   )
 }
 
-// ─── Connected institution row ──────────────────────────────────────────────
+// ─── Net-worth hero ─────────────────────────────────────────────────────────
+// Reuses the app's /stats/net-worth figure (same source as the Dashboard tile)
+// so the numbers stay consistent: assets − liabilities across linked balances.
 
-function PlaidItemRow({
-  item, syncing, removing, confirming, disabled,
+function NetWorthPanel({
+  netWorth, ready, has, bankCount, accountCount,
+}: {
+  netWorth: import('../lib/types').NetWorth | null
+  ready: boolean
+  has: boolean
+  bankCount: number
+  accountCount: number
+}) {
+  const target = has && netWorth ? netWorth.net_worth : 0
+  const animated = useCountUp(target, ready && has)
+  const cur = netWorth?.currency || 'USD'
+
+  return (
+    <>
+      <div className="wallet-nw-eyebrow">
+        <Wallet size={13} />
+        <span>Net worth</span>
+      </div>
+
+      {!ready ? (
+        <>
+          <div className="wallet-nw-shimmer fig" />
+          <div className="wallet-nw-shimmer sub" />
+        </>
+      ) : has && netWorth ? (
+        <>
+          <div className="wallet-nw-figure">{fmtMoney(animated, cur, true)}</div>
+          <dl className="wallet-nw-ledger">
+            <div className="wallet-nw-cell">
+              <dt>Assets</dt>
+              <dd className="pos">{fmtMoney(netWorth.assets, cur)}</dd>
+            </div>
+            <div className="wallet-nw-cell">
+              <dt>Credit &amp; loans</dt>
+              <dd className="neg">{fmtMoney(netWorth.liabilities, cur)}</dd>
+            </div>
+          </dl>
+          <div className="wallet-nw-linked">
+            {bankCount} bank{bankCount === 1 ? '' : 's'} · {accountCount} account{accountCount === 1 ? '' : 's'} linked
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="wallet-nw-figure muted">—</div>
+          <div className="wallet-nw-linked">Connect a bank to see your net worth.</div>
+        </>
+      )}
+    </>
+  )
+}
+
+// ─── A single account card ────────────────────────────────────────────────
+
+function WalletCard({
+  item, account, rot, z, syncing, removing, confirming, disabled,
   onSync, onAskDisconnect, onCancelDisconnect, onConfirmDisconnect,
 }: {
   item: PlaidItem
+  account: PlaidAccount
+  rot: number
+  z: number
   syncing: boolean
   removing: boolean
   confirming: boolean
@@ -323,87 +502,88 @@ function PlaidItemRow({
   onCancelDisconnect: () => void
   onConfirmDisconnect: () => void
 }) {
+  const theme = cardTheme(item.institution_color)
+  const inst = item.institution_name ?? 'Bank'
+  const nick = cleanNick(account)
+  const bal = account.current ?? account.available
   const degraded = item.status && item.status.toLowerCase() !== 'active' && item.status.toLowerCase() !== 'good'
-  const accent = item.institution_color || undefined
+
+  const style = {
+    '--card-bg1': theme.bg1,
+    '--card-bg2': theme.bg2,
+    '--card-fg': theme.fg,
+    '--card-fg-soft': theme.fgSoft,
+    '--card-line': theme.line,
+    '--rot': `${rot}deg`,
+    zIndex: z,
+  } as React.CSSProperties
 
   return (
-    <div
-      className="plaid-item"
-      style={accent ? { borderLeft: `3px solid ${accent}` } : undefined}
+    <article
+      className="wallet-card"
+      style={style}
+      role="listitem"
+      tabIndex={0}
+      aria-label={`${inst} — ${nick}, ${balanceLabel(account).toLowerCase()} ${fmtMoney(bal, account.currency, true)}`}
     >
-      <div className="plaid-item-main">
-        <div className="plaid-item-title">
-          {item.institution_logo ? (
-            <img
-              className="plaid-item-logo"
-              src={`data:image/png;base64,${item.institution_logo}`}
-              alt=""
-            />
-          ) : (
-            <Building2 size={15} style={{ color: accent ?? 'var(--accent-hover)', flexShrink: 0 }} />
-          )}
-          <span className="plaid-item-name">{item.institution_name ?? 'Bank'}</span>
-          {degraded && (
-            <span className="badge badge-needs-review" title={`Item status: ${item.status}`}>
-              {item.status}
-            </span>
-          )}
-        </div>
-
-        {item.accounts.length > 0 && (
-          <div className="plaid-accounts">
-            {item.accounts.map((a) => {
-              const bal = fmtBal(a.current ?? a.available, a.currency)
-              return (
-                <span key={a.account_id} className="plaid-account">
-                  <CreditCard size={12} style={{ flexShrink: 0 }} />
-                  <span className="plaid-account-name">{a.name ?? a.app_account ?? 'Account'}</span>
-                  {a.mask && <span className="mono plaid-mask">••{a.mask}</span>}
-                  {a.subtype && <span className="plaid-account-sub">{a.subtype}</span>}
-                  {bal && <span className="mono plaid-account-bal">{bal}</span>}
-                </span>
-              )
-            })}
-          </div>
-        )}
-
-        <div className="plaid-item-meta mono">{formatSynced(item.last_synced_at)}</div>
-      </div>
-
-      <div className="plaid-item-actions">
-        <button
-          className="btn btn-secondary btn-sm"
-          onClick={onSync}
-          disabled={disabled || syncing || confirming}
-          title="Pull the latest transactions from this bank"
-        >
-          {syncing
-            ? <span className="spinner" style={{ width: 12, height: 12 }} />
-            : <RefreshCw size={13} />}
-          Sync now
-        </button>
-
-        {confirming ? (
-          <>
-            <button className="btn btn-danger btn-sm" onClick={onConfirmDisconnect} disabled={removing}>
-              {removing ? <span className="spinner" style={{ width: 12, height: 12 }} /> : 'Confirm'}
-            </button>
-            <button className="btn btn-ghost btn-sm" onClick={onCancelDisconnect} disabled={removing}>
-              Cancel
-            </button>
-          </>
+      <div className="wallet-card-inner">
+      <div className="wallet-card-top">
+        {item.institution_logo ? (
+          <img className="wallet-card-logo" src={`data:image/png;base64,${item.institution_logo}`} alt="" />
         ) : (
-          <button
-            className="btn btn-ghost btn-icon btn-sm"
-            onClick={onAskDisconnect}
-            disabled={disabled}
-            title="Disconnect this bank"
-            style={{ color: 'var(--danger)' }}
-          >
-            <Trash2 size={14} />
-          </button>
+          <span className="wallet-card-monogram" aria-hidden>{inst.charAt(0)}</span>
         )}
+        <span className="wallet-card-inst">{inst}</span>
+        {degraded && <span className="wallet-card-degraded" title={`Item status: ${item.status}`}>{item.status}</span>}
+        <span className="wallet-card-type">{typeLabel(account)}</span>
       </div>
-    </div>
+
+      <div className="wallet-card-nick">{nick}</div>
+      {account.mask && <div className="wallet-card-mask">•••• •••• {account.mask}</div>}
+
+      {/* Foot — balance + actions. Tucked into the pocket at rest; the lift reveals it. */}
+      <div className="wallet-card-foot">
+        <div className="wallet-card-bal">
+          <span className="wallet-card-bal-fig">{fmtMoney(bal, account.currency, true)}</span>
+          <span className="wallet-card-bal-label">{balanceLabel(account)}</span>
+        </div>
+        <div className="wallet-card-fold">
+          <span className="wallet-card-synced">{formatSynced(item.last_synced_at)}</span>
+          <div className="wallet-card-fold-actions">
+          {confirming ? (
+            <>
+              <button className="wallet-cbtn danger" onClick={onConfirmDisconnect} disabled={removing}>
+                {removing ? <span className="spinner" style={{ width: 12, height: 12 }} /> : 'Confirm'}
+              </button>
+              <button className="wallet-cbtn ghost" onClick={onCancelDisconnect} disabled={removing}>
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                className="wallet-cbtn"
+                onClick={onSync}
+                disabled={disabled || syncing}
+                title={`Pull the latest transactions from ${inst}`}
+              >
+                {syncing ? <span className="spinner" style={{ width: 12, height: 12 }} /> : <RefreshCw size={12} />}
+                Sync
+              </button>
+              <button
+                className="wallet-cbtn ghost"
+                onClick={onAskDisconnect}
+                disabled={disabled}
+                title={`Disconnect ${inst}`}
+              >
+                <Trash2 size={12} />
+              </button>
+            </>
+          )}
+          </div>
+        </div>
+      </div>
+      </div>
+    </article>
   )
 }
