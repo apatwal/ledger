@@ -4,7 +4,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Upload, FileText, CheckCircle, AlertTriangle, XCircle, X, ArrowLeftRight, CreditCard, Eye, Sparkles, History, Trash2, Check, Landmark } from 'lucide-react'
 import { importCsv, getAccounts, getAssistantStatus, categorizeBatch, getImports, reassignImport, deleteImport } from '../lib/api'
 import type { CsvImportResult, ImportBatch, StatementType } from '../lib/types'
-import PlaidConnect from './PlaidConnect'
 import { invalidateLedger } from '../lib/queryKeys'
 
 // Lightweight client-side peek: does the file look like a bank/checking export
@@ -156,25 +155,8 @@ export default function CsvImport() {
     <div>
       <div className="page-header">
         <div className="page-eyebrow">Bulk entry</div>
-        <h1 className="page-title">Import transactions</h1>
-        <p className="page-subtitle">Connect a bank for automatic sync, or import a CSV.</p>
-      </div>
-
-      {/* Bank sync (v8) */}
-      <div className="import-section-label">
-        <Landmark size={14} />
-        Connect a bank (auto-sync)
-      </div>
-      <div style={{ marginBottom: 24 }}>
-        <PlaidConnect />
-      </div>
-
-      {/* CSV import */}
-      <div className="import-section-label">
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-          <FileText size={14} />
-          Or import a CSV
-        </span>
+        <h1 className="page-title">Import a CSV</h1>
+        <p className="page-subtitle">Import transactions from a bank CSV export.</p>
       </div>
 
       {/* Instructions */}

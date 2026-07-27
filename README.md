@@ -35,8 +35,12 @@ or custom range — is just a query, and year-end stats come for free.
 - **Authentication (Clerk)** — optional Google sign-in via Clerk with server-side
   JWT verification and an email allowlist. Off by default locally; hard-required
   in production (see below).
-- **CSV import (legacy)** — a bank-agnostic drag-and-drop importer remains for
-  one-off backfills, but Plaid is now the primary path and CSV is being phased out.
+- **CSV import (decommissioned)** — a bank-agnostic drag-and-drop importer that
+  predates the Plaid integration. Now that the app is Plaid-first, its UI is
+  **hidden behind the `CSV_IMPORT_ENABLED` flag** (off by default — see
+  [`src/lib/features.ts`](src/lib/features.ts)). The code (frontend component,
+  API client, and `csv_import`/`imports` backend routes) is kept intact; flip the
+  flag and rebuild to restore the Import page for a one-off backfill.
 
 ## Tech stack
 

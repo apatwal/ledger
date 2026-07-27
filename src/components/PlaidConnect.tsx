@@ -217,7 +217,6 @@ export default function PlaidConnect() {
           exports. It's not enabled on this server. To turn it on, set{' '}
           <code className="plaid-code">PLAID_CLIENT_ID</code> and{' '}
           <code className="plaid-code">PLAID_SECRET</code> in the API environment and restart.
-          You can still import a CSV below.
         </p>
       </div>
     )

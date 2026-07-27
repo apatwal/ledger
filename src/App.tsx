@@ -3,12 +3,14 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './components/Layout'
 import { TopBar } from './components/TopProgressBar'
 import { AccountSelectionProvider } from './lib/accountSelection'
+import { CSV_IMPORT_ENABLED } from './lib/features'
 
 // Route-level code splitting: each page (and its heavy deps — Recharts on the
 // Dashboard especially) loads on demand, keeping the initial bundle small.
 // Layout stays eager because it frames every route.
 const Dashboard = lazy(() => import('./components/Dashboard'))
 const Transactions = lazy(() => import('./components/Transactions'))
+const Accounts = lazy(() => import('./components/Accounts'))
 const CsvImport = lazy(() => import('./components/CsvImport'))
 const Rules = lazy(() => import('./components/Rules'))
 const Holdings = lazy(() => import('./components/Holdings'))
@@ -29,10 +31,12 @@ export default function App() {
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/transactions" element={<Transactions />} />
+            <Route path="/accounts" element={<Accounts />} />
             <Route path="/investments" element={<Holdings />} />
             <Route path="/budget" element={<Budget />} />
             <Route path="/rules" element={<Rules />} />
-            <Route path="/import" element={<CsvImport />} />
+            {/* CSV import decommissioned (Plaid-first). Gated off; see lib/features.ts. */}
+            {CSV_IMPORT_ENABLED && <Route path="/import" element={<CsvImport />} />}
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
         </Suspense>
