@@ -1,10 +1,11 @@
 import { NavLink } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { LayoutDashboard, List, Upload, BookText, Wand2, LineChart, PiggyBank } from 'lucide-react'
+import { LayoutDashboard, List, Landmark, Upload, BookText, Wand2, LineChart, PiggyBank } from 'lucide-react'
 import { UserButton } from '@clerk/react'
 import { getHealth } from '../lib/api'
 import Assistant from './Assistant'
 import AccountSelect from './AccountSelect'
+import { CSV_IMPORT_ENABLED } from '../lib/features'
 
 // When Clerk isn't configured, the app renders outside <ClerkProvider>, so the
 // UserButton (which needs Clerk context) must be hidden.
@@ -54,6 +55,14 @@ export default function Layout({ children }: LayoutProps) {
           </NavLink>
 
           <NavLink
+            to="/accounts"
+            className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+          >
+            <Landmark className="nav-link-icon" />
+            Accounts
+          </NavLink>
+
+          <NavLink
             to="/investments"
             className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
           >
@@ -79,13 +88,15 @@ export default function Layout({ children }: LayoutProps) {
             Rules
           </NavLink>
 
-          <NavLink
-            to="/import"
-            className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
-          >
-            <Upload className="nav-link-icon" />
-            Import
-          </NavLink>
+          {CSV_IMPORT_ENABLED && (
+            <NavLink
+              to="/import"
+              className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+            >
+              <Upload className="nav-link-icon" />
+              Import
+            </NavLink>
+          )}
         </nav>
 
         {/* Footer / health */}
