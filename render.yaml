@@ -59,3 +59,20 @@ services:
       # header). Must match the PLAID_SYNC_TOKEN GitHub Actions secret.
       - key: PLAID_SYNC_TOKEN
         sync: false
+      # Public https URL of POST /api/plaid/webhook (v12). Set this, then call
+      # POST /api/plaid/webhook/register once so already-linked items push
+      # webhooks. Newly-linked items get it automatically via the Link token.
+      - key: PLAID_WEBHOOK_URL
+        sync: false
+
+      # ── Real-time duplicate alerts (ntfy.sh) (v12) ────────────────────────
+      # ntfy topic to publish duplicate-charge alerts to (subscribe in the ntfy
+      # app). Unset => notifications disabled (no-op). sync:false => prompted.
+      - key: NTFY_TOPIC
+        sync: false
+      # Optional self-hosted ntfy server base URL (defaults to https://ntfy.sh).
+      - key: NTFY_SERVER
+        sync: false
+      # App base URL used for the alert's Click action (deep-links to /dashboard).
+      - key: APP_URL
+        sync: false

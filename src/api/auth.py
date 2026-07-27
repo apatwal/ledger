@@ -215,6 +215,14 @@ def require_user(
     if not is_auth_enabled():
         return None
 
+    # Exemption: the Plaid webhook endpoint. Plaid cannot send a Clerk token, so
+    # this ONE path is reachable without auth. Gated instead by the payload's
+    # item_id lookup + (in production) Plaid-Verification signature. Scoped to
+    # EXACTLY /plaid/webhook so no other route is unlocked (endswith("/plaid/
+    # webhook") would NOT match /plaid/webhook/register, which stays authed).
+    if request.url.path.endswith("/plaid/webhook"):
+        return {"sub": None, "email": None, "via": "plaid_webhook"}
+
     # Exemption: the Plaid cron sync-all shared secret. Scoped to ONLY the
     # sync-all route so a leaked token can't unlock any other /api endpoint.
     if request.url.path.endswith("/plaid/sync-all"):
