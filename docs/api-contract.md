@@ -726,3 +726,157 @@ per account type — depository accounts use their cash `current`
 in full); credit/loan `current` is a liability; any other type is ignored. The
 holdings total is best-effort (a Plaid error yields `0` rather than failing the
 endpoint).
+
+---
+
+## Real-time duplicate alerts (v12)
+
+When a **new** duplicate expense is detected during any sync, the backend pushes a
+push notification via [ntfy.sh](https://ntfy.sh). This works for all three sync
+paths — Plaid webhooks, the manual "Sync now" button, and the cron/scheduler —
+because every path routes through `sync_items()`, which now calls
+`detect_and_notify_new_duplicates(db)` at the end (best-effort; a notify failure
+never breaks a sync).
+
+### Duplicate grouping is shared
+`src/api/routes/duplicates.py::compute_duplicate_groups(rows)` is the single source
+of truth for grouping expense rows into `DuplicateGroup`s by
+`(date, amount@2dp, normalized description, normalized account)`. Both
+`GET /api/duplicates` and the notifier call it, so alert grouping is identical to
+the on-screen Duplicates view.
+
+### No-spam mechanism (`dup_notified`)
+- `Transaction.dup_notified` (`BOOLEAN NOT NULL DEFAULT FALSE`, mirrors
+  `dup_dismissed`) records that a row's duplicate group has already been alerted.
+- `detect_and_notify_new_duplicates(db)` queries non-dismissed expense rows, groups
+  them, and for each group where **at least one** member has `dup_notified == False`
+  it sends **exactly one** ntfy notification, then flips `dup_notified = True` on
+  **every** member of that group and commits.
+- Result: a standing duplicate is alerted **once**. A genuinely new duplicate charge
+  (a fresh row that forms or joins a group) re-introduces an un-notified member, so
+  it triggers a fresh alert on the next sync. A **dismissed** group is excluded from
+  grouping entirely, so it never alerts.
+
+### Retro-backfill (no first-deploy blast)
+The migration `_migrate_add_dup_notified_column()` in `main.py` follows the existing
+introspect → `ALTER TABLE ... ADD COLUMN` pattern. Because every pre-existing row
+would otherwise have `dup_notified = FALSE` and fire retroactively on the first
+post-deploy sync, the migration performs a **one-time backfill**: immediately after
+adding the column it runs `UPDATE transactions SET dup_notified = TRUE`, marking all
+rows that existed **at migration time** as already-notified. The backfill is guarded
+on the column being absent beforehand, so it runs only on the deploy that first adds
+the column — never again. Only rows created **after** the migration can trigger alerts.
+
+### ntfy config
+- `NTFY_TOPIC` — the ntfy topic to publish to. **Unset ⇒ notifications disabled**
+  (`send_ntfy()` is a no-op returning `False`; no network call). Subscribe to this
+  topic in the ntfy mobile app / web.
+- `NTFY_SERVER` — optional self-hosted ntfy base URL (default `https://ntfy.sh`).
+- `APP_URL` — optional app base URL; used for the alert's `Click` header
+  (deep-links to `{APP_URL}/dashboard`).
+
+`send_ntfy(title, message, *, click, tags, priority)` POSTs `message` as the body to
+`{NTFY_SERVER}/{NTFY_TOPIC}` with ntfy's `Title`/`Click`/`Tags`/`Priority` request
+headers, using `urllib` only (no new dependency; mirrors the Clerk lookup in
+`auth.py`, including a real `User-Agent`). It **never raises** — the actual HTTP send
+is isolated in `notify._http_post` so tests can monkeypatch it.
+
+### `POST /api/plaid/webhook`
+Receives Plaid webhooks. **Always returns HTTP 200 quickly** (even on unknown
+types / items / errors) so Plaid never retry-storms.
+
+- **Auth:** exempt from Clerk in `auth.py` — Plaid can't send a session token. The
+  exemption is scoped to **exactly** the path ending in `/plaid/webhook` (so
+  `/plaid/webhook/register` stays authed). The gate is instead the payload's
+  `item_id` lookup + (in production) signature verification.
+- **Handled:** `webhook_type == "TRANSACTIONS"` with codes
+  `SYNC_UPDATES_AVAILABLE`, `DEFAULT_UPDATE`, `INITIAL_UPDATE`, `HISTORICAL_UPDATE`.
+  The payload's `item_id` (Plaid's item-id **string**) is matched against
+  `PlaidItem.item_id`; on a hit we call `sync_items(db, item_id=<local id>)` (which
+  syncs then detects+notifies). Unknown `item_id` ⇒ `{"status":"unknown_item"}`; any
+  other webhook type/code ⇒ `{"status":"ignored"}`. All 200.
+- **Verification (sandbox vs prod):** signature verification via the
+  `Plaid-Verification` JWT header (fetch the ES256 key with
+  `/webhook_verification_key/get`, verify the token, check the body SHA-256) is
+  **only enforced when `PLAID_ENV == "production"`**. In sandbox/development it is
+  **skipped** (logged). Tradeoff: the endpoint only triggers an idempotent sync + a
+  de-duplicated notification, so a spoofed call at worst causes a redundant sync —
+  acceptable for a personal single-user app.
+
+### Startup auto-registration
+On boot, `main.py::_maybe_register_plaid_webhook()` pushes `PLAID_WEBHOOK_URL` to
+every already-linked item automatically — **no manual step**. It is **gated** (only
+when Plaid is configured **and** `PLAID_WEBHOOK_URL` is set) and runs in a **daemon
+thread** (mirrors `_maybe_start_plaid_scheduler` / `_maybe_start_keepalive`), so a
+slow or failed Plaid round-trip never blocks or breaks boot; the outcome is logged
+(`[plaid] webhook registered on N items`, or the failure). It reuses
+`register_webhook_all(db)` — the same idempotent `/item/webhook/update` loop the
+endpoint below uses — so running once per boot is safe.
+
+### `POST /api/plaid/webhook/register` (authed)
+Pushes `PLAID_WEBHOOK_URL` to **all already-linked items** via Plaid
+`/item/webhook/update`, so items linked before the webhook was configured start
+sending webhooks. Returns `{"updated": N}`. **503** if Plaid is unconfigured or
+`PLAID_WEBHOOK_URL` is unset. Startup does this automatically (see above); this
+endpoint remains for **on-demand re-registration**. New links get the webhook
+automatically because `PLAID_WEBHOOK_URL` is set on the Link token in
+`POST /api/plaid/link-token`.
+
+### `POST /api/notify/test` (authed)
+Sends a test ntfy message so you can verify your setup. Returns `{"sent": bool}` —
+`false` when `NTFY_TOPIC` is unset or the send failed.
+
+### Config keys
+`NTFY_TOPIC`, `NTFY_SERVER` (optional), `PLAID_WEBHOOK_URL`, `APP_URL` — all declared
+`sync: false` in `render.yaml` and present (blank, commented) in `.env.example`.
+
+---
+
+## Monthly spend recap (v12)
+
+A cron on the **1st of each month** pushes an ntfy recap of the month that just
+ended, reusing `notify.send_ntfy`. Uses the CURRENT categories (no food split).
+
+### `POST /api/reports/monthly`
+- **`month`** (optional, query **or** JSON body, `"YYYY-MM"`). **Default = the
+  PREVIOUS calendar month** relative to today (UTC). Invalid format → **422**.
+- Computes over that month's `[first_day, last_day]` with **/stats/summary
+  semantics** (transfers excluded; net-expense = `Σ expense − Σ refund`):
+  - `income` = Σ income; `spent` = Σ net expense; `net` = income − spent.
+  - `saved` = Σ amount where `type='expense' AND category='Savings'`.
+  - `invested` = Σ amount where `type='expense' AND category='Investment'`.
+  - `savings` = Σ where `category ∈ {Savings, Investment}`;
+    `savings_rate` = `savings / income` (0 when income ≤ 0).
+  - `categories` = per-category **net expense**, EXCLUDING
+    `{Savings, Investment, Transfer, Payments & Credits, Income}`, positive totals
+    only, sorted desc, **top 6**.
+- Sends one ntfy notification (Title `📊 {Month Year} recap`, `Tags: bar_chart`,
+  `Click: {APP_URL}/dashboard` when `APP_URL` is set), then returns:
+  `{month, income, spent, saved, invested, savings_rate, net, categories:[{category, amount}], sent}`.
+
+**Recap message body** (currency rounded to whole dollars, thousands-separated;
+the `(NN%)` next to Saved is `savings_rate`):
+
+```
+Income $5,000 · Spent $3,240
+Saved $600 (12%) · Invested $500
+Top spending:
+• Food & Drink $520
+• Shopping $410
+• Bills & Utilities $900
+```
+
+### Auth (cron token)
+Mirrors `POST /plaid/sync-all` **exactly**. `PLAID_SYNC_TOKEN` is the **general
+cron token**: the `/reports/monthly` path is exempt from Clerk auth in `auth.py`
+when the `X-Plaid-Sync-Token` header matches it, and the endpoint **also** checks
+the token (**401** when `PLAID_SYNC_TOKEN` is set and the header mismatches). When
+`PLAID_SYNC_TOKEN` is **unset**, the request falls through to normal Clerk auth (so
+local dev + tests with auth disabled can call it).
+
+### Cron
+`.github/workflows/monthly-report.yml` — schedule `0 13 1 * *` (1st of month, 13:00
+UTC) + `workflow_dispatch`. Warms `${BASE_URL}/api/health`, then POSTs
+`${BASE_URL}/api/reports/monthly` with `X-Plaid-Sync-Token: ${{ secrets.PLAID_SYNC_TOKEN }}`.
+`BASE_URL` = `vars.SYNC_BASE_URL` (default `https://expense-tracker-2kfq.onrender.com`).
+Fails the run on any non-2xx.

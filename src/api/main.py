@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from .database import engine, SessionLocal, Base, get_db
 from .models import Transaction
-from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets, nicknames, investments
+from .routes import transactions, stats, csv_import, assistant, rules, imports, duplicates, plaid_routes, budgets, nicknames, investments, reports
 from . import plaid_client
 from .plaid_mapping import CANONICAL_CATEGORIES
 from . import auth
@@ -69,6 +69,7 @@ app.include_router(plaid_routes.router, prefix=API_PREFIX, dependencies=_auth)  
 app.include_router(budgets.router, prefix=API_PREFIX, dependencies=_auth)        # /api/budgets/* (v9b)
 app.include_router(nicknames.router, prefix=API_PREFIX, dependencies=_auth)      # /api/accounts/nicknames (v11)
 app.include_router(investments.router, prefix=API_PREFIX, dependencies=_auth)    # /api/investments/* (v11)
+app.include_router(reports.router, prefix=API_PREFIX, dependencies=_auth)         # /api/reports/* (v12)
 
 
 # ── Standalone endpoints ──────────────────────────────────────────────────────
@@ -93,6 +94,22 @@ def get_categories(db: Session = Depends(get_db)):
     seen = set(rows)
     merged = list(rows) + [c for c in DEFAULT_CATEGORIES if c not in seen]
     return merged
+
+
+@app.post(f"{API_PREFIX}/notify/test", dependencies=_auth)
+def notify_test():
+    """Send a test ntfy notification so the user can verify their setup (v12).
+    Returns {"sent": bool} — False when NTFY_TOPIC is unset or the send failed."""
+    from .notify import send_ntfy
+
+    app_url = (os.environ.get("APP_URL") or "").strip().rstrip("/")
+    sent = send_ntfy(
+        "✅ Expense Tracker",
+        "Test notification — your ntfy alerts are working.",
+        click=f"{app_url}/dashboard" if app_url else None,
+        tags="white_check_mark",
+    )
+    return {"sent": bool(sent)}
 
 
 @app.get(f"{API_PREFIX}/accounts", response_model=list[str], dependencies=_auth)
@@ -206,6 +223,33 @@ def _migrate_add_dup_dismissed_column() -> None:
     _add_column_if_missing("transactions", "dup_dismissed", "BOOLEAN NOT NULL DEFAULT FALSE")
 
 
+def _migrate_add_dup_notified_column() -> None:
+    """v12 migration: add `dup_notified` to transactions (portable).
+
+    RETRO-BACKFILL: the ALTER default is FALSE, but we then flip EVERY row that
+    already exists at migration time to dup_notified=TRUE, so pre-existing prod
+    duplicates never fire a retroactive alert-storm on first deploy. Only rows
+    created AFTER this migration (genuinely new syncs) can trigger a notification
+    (detect_and_notify_new_duplicates only alerts groups with an un-notified
+    member). The backfill runs ONLY on the deploy that first adds the column
+    (guarded on the column being absent beforehand), so it's a true one-time op."""
+    existing = _existing_columns("transactions")
+    if not existing:
+        return  # fresh table — create_all made the column; nothing pre-existing
+    if "dup_notified" in existing:
+        return  # already migrated — do NOT re-backfill
+    with engine.begin() as conn:
+        conn.execute(
+            sqlalchemy.text(
+                "ALTER TABLE transactions ADD COLUMN dup_notified BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+        # One-time backfill: treat all rows that pre-date this column as already
+        # notified so the first post-deploy sync doesn't blast standing dupes.
+        conn.execute(sqlalchemy.text("UPDATE transactions SET dup_notified = TRUE"))
+    print("[migrate] Added 'dup_notified' column to transactions and backfilled existing rows to notified.")
+
+
 def _migrate_add_plaid_columns() -> None:
     """v8 migration: add Plaid provenance columns to transactions (portable).
     `plaid_items` is created automatically by create_all()."""
@@ -304,6 +348,7 @@ def startup():
     _migrate_add_batch_id_column()      # v5.2: ensure batch_id exists
     _migrate_add_statement_type_column()  # v5.3: ensure import_batches.statement_type exists
     _migrate_add_dup_dismissed_column()   # v7: ensure transactions.dup_dismissed exists
+    _migrate_add_dup_notified_column()    # v12: ensure transactions.dup_notified exists (+ retro-backfill)
     _migrate_add_plaid_columns()          # v8: ensure transactions.plaid_* columns exist
     _migrate_add_v9_enrichment_columns()  # v9: ensure enrichment + branding columns exist
     # Auto-seeding is OPT-IN. By default the DB starts empty so real user data
@@ -313,6 +358,7 @@ def startup():
         with SessionLocal() as db:
             seed_data(db)
     _maybe_start_plaid_scheduler()        # v8: optional in-process auto-sync
+    _maybe_register_plaid_webhook()       # v12: auto-register webhook on linked items
     _maybe_start_keepalive()              # feature/performance: optional Neon keep-warm
 
 
@@ -357,6 +403,40 @@ def _maybe_start_plaid_scheduler() -> None:
         print(f"[plaid] auto-sync scheduler started ({interval} min interval).")
     except Exception as e:
         print(f"[plaid] scheduler not started: {e}")
+
+
+# ── Plaid webhook auto-registration (v12) ──────────────────────────────────────
+# On boot, push PLAID_WEBHOOK_URL to every already-linked PlaidItem via Plaid's
+# /item/webhook/update so items linked BEFORE the webhook was configured start
+# sending real-time webhooks — no manual POST /plaid/webhook/register needed.
+# GATED: only when Plaid is configured AND PLAID_WEBHOOK_URL is set. Runs in a
+# daemon thread so a slow/failed Plaid round-trip NEVER blocks or breaks boot.
+# Idempotent (item/webhook/update), so running once per boot is fine. Under the
+# test suite PLAID_WEBHOOK_URL is unset, so this is a no-op and never fires.
+
+def _maybe_register_plaid_webhook() -> None:
+    try:
+        if not plaid_client.is_configured():
+            return
+        webhook_url = (os.environ.get("PLAID_WEBHOOK_URL") or "").strip()
+        if not webhook_url:
+            return
+
+        import threading
+
+        def _job():
+            try:
+                from .routes.plaid_routes import register_webhook_all
+
+                with SessionLocal() as db:
+                    n = register_webhook_all(db)
+                print(f"[plaid] webhook registered on {n} items")
+            except Exception as e:  # never let registration crash anything
+                print(f"[plaid] webhook auto-registration failed: {e}")
+
+        threading.Thread(target=_job, name="plaid_webhook_register", daemon=True).start()
+    except Exception as e:
+        print(f"[plaid] webhook auto-registration not started: {e}")
 
 
 # ── Neon keep-warm ping (feature/performance) ──────────────────────────────────

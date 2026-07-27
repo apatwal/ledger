@@ -20,9 +20,10 @@ The access_token is stored server-side on PlaidItem ONLY and is NEVER returned.
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -54,6 +55,13 @@ _TXN_SYNC_COUNT = 500
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _webhook_url() -> str | None:
+    """PLAID_WEBHOOK_URL (the public https URL of POST /api/plaid/webhook), or None.
+    Registered on Link tokens + pushed to existing items via /plaid/webhook/register."""
+    url = (os.environ.get("PLAID_WEBHOOK_URL") or "").strip()
+    return url or None
+
 
 def _require_configured() -> None:
     if not plaid_client.is_configured():
@@ -229,6 +237,11 @@ def create_link_token():
     # transactions is requested (it always is, as the baseline product).
     if "transactions" in products:
         kwargs["transactions"] = LinkTokenTransactions(days_requested=730)
+    # v12: register the webhook URL so newly-linked items push TRANSACTIONS
+    # webhooks (real-time sync + duplicate alerts). Only when PLAID_WEBHOOK_URL set.
+    webhook_url = _webhook_url()
+    if webhook_url:
+        kwargs["webhook"] = webhook_url
     redirect_uri = plaid_client.get_redirect_uri()
     if redirect_uri:
         kwargs["redirect_uri"] = redirect_uri
@@ -522,6 +535,16 @@ def sync_items(db: Session, item_id: int | None = None) -> dict:
     except Exception as e:
         print(f"[plaid] portfolio snapshot skipped: {e}")
 
+    # v12: real-time duplicate alerts. Runs after everything is synced/committed
+    # so it sees the freshly-imported rows. BEST-EFFORT — a notify failure must
+    # NEVER break a sync. Covers webhook-triggered, manual, and cron/scheduler syncs.
+    try:
+        from ..notify import detect_and_notify_new_duplicates
+
+        detect_and_notify_new_duplicates(db)
+    except Exception as e:
+        print(f"[plaid] duplicate notify skipped: {e}")
+
     return {
         "items_synced": items_synced,
         "added": added,
@@ -676,3 +699,166 @@ def delete_item(item_id: int, db: Session = Depends(get_db)):
 
     db.delete(item)
     db.commit()
+
+
+# ── Real-time webhooks + notifications (v12) ────────────────────────────────────
+
+# Plaid TRANSACTIONS webhook codes that mean "new/updated data is available" and
+# should trigger an incremental sync (which then detects+notifies duplicates).
+_TXN_SYNC_CODES = frozenset({
+    "SYNC_UPDATES_AVAILABLE",
+    "DEFAULT_UPDATE",
+    "INITIAL_UPDATE",
+    "HISTORICAL_UPDATE",
+})
+
+
+def _verify_plaid_webhook(request: Request, raw_body: bytes) -> bool:
+    """Best-effort Plaid webhook verification via the `Plaid-Verification` JWT
+    header. We ONLY ENFORCE it in production (PLAID_ENV=production); in
+    sandbox/development we SKIP strict verification and log that we did.
+
+    Tradeoff (documented in docs/api-contract.md): the endpoint only triggers an
+    idempotent sync + a de-duplicated notification, so a spoofed call at worst
+    causes a redundant sync. For a personal single-user app the risk is minimal,
+    and the item_id lookup already scopes any effect to items we actually hold.
+
+    Returns True when the request may proceed, False when it must be rejected
+    (only possible in production). Never raises."""
+    if plaid_client.get_env() != "production":
+        print("[plaid] webhook signature verification SKIPPED (non-production env).")
+        return True
+    token = request.headers.get("Plaid-Verification")
+    if not token:
+        print("[plaid] webhook REJECTED: missing Plaid-Verification header (production).")
+        return False
+    try:
+        import jwt
+        from plaid.model.webhook_verification_key_get_request import (
+            WebhookVerificationKeyGetRequest,
+        )
+
+        header = jwt.get_unverified_header(token)
+        kid = header.get("kid")
+        if not kid:
+            return False
+        client = plaid_client.get_client()
+        key_resp = client.webhook_verification_key_get(
+            WebhookVerificationKeyGetRequest(key_id=kid)
+        ).to_dict()
+        jwk = key_resp.get("key")
+        if not jwk:
+            return False
+        from jwt.algorithms import ECAlgorithm
+
+        signing_key = ECAlgorithm.from_jwk(json.dumps(jwk))
+        claims = jwt.decode(token, signing_key, algorithms=["ES256"])
+        # Body integrity: the JWT carries a SHA-256 of the raw request body.
+        import hashlib
+
+        expected = claims.get("request_body_sha256")
+        actual = hashlib.sha256(raw_body).hexdigest()
+        if not expected or not hmac_compare(expected, actual):
+            print("[plaid] webhook REJECTED: body hash mismatch (production).")
+            return False
+        return True
+    except Exception as e:
+        print(f"[plaid] webhook verification failed ({e}) — REJECTED (production).")
+        return False
+
+
+def hmac_compare(a: str, b: str) -> bool:
+    import hmac as _hmac
+
+    return _hmac.compare_digest(a, b)
+
+
+@router.post("/webhook")
+async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
+    """Receive Plaid webhooks. ALWAYS returns HTTP 200 quickly (even on unknown
+    types / items / errors) so Plaid never retry-storms. AUTH: exempted from Clerk
+    in auth.py (Plaid can't send a token); gated instead by item_id lookup +
+    (in production) Plaid-Verification. Handles TRANSACTIONS codes
+    SYNC_UPDATES_AVAILABLE / DEFAULT_UPDATE / INITIAL_UPDATE / HISTORICAL_UPDATE
+    by syncing the matching local item (which then detects + notifies duplicates)."""
+    try:
+        raw = await request.body()
+    except Exception:
+        return {"status": "ignored"}
+
+    if not _verify_plaid_webhook(request, raw):
+        # Only reachable in production on a verification failure. 200 anyway so we
+        # don't invite retries of an unverifiable payload.
+        return {"status": "unverified"}
+
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+    except (ValueError, UnicodeDecodeError):
+        return {"status": "ignored"}
+    if not isinstance(payload, dict):
+        return {"status": "ignored"}
+
+    webhook_type = payload.get("webhook_type")
+    webhook_code = payload.get("webhook_code")
+    plaid_item_id = payload.get("item_id")
+
+    # Only TRANSACTIONS update codes trigger a sync; everything else is a no-op 200.
+    if webhook_type != "TRANSACTIONS" or webhook_code not in _TXN_SYNC_CODES:
+        return {"status": "ignored", "webhook_type": webhook_type, "webhook_code": webhook_code}
+
+    if not plaid_item_id:
+        return {"status": "ignored"}
+
+    # Match Plaid's item_id STRING against PlaidItem.item_id → resolve our local id.
+    item = db.execute(
+        select(PlaidItem).where(PlaidItem.item_id == plaid_item_id)
+    ).scalar_one_or_none()
+    if item is None:
+        return {"status": "unknown_item"}
+
+    if not plaid_client.is_configured():
+        # Can't sync without keys; acknowledge so Plaid doesn't retry.
+        return {"status": "not_configured"}
+
+    try:
+        result = sync_items(db, item_id=item.id)
+        return {"status": "synced", "item_id": item.id, **result}
+    except Exception as e:  # never surface a 5xx to Plaid
+        print(f"[plaid] webhook sync failed for item {item.id}: {e}")
+        return {"status": "sync_failed"}
+
+
+def register_webhook_all(db: Session) -> int:
+    """Push PLAID_WEBHOOK_URL to ALL already-linked items via /item/webhook/update
+    so items linked BEFORE the webhook was configured start sending webhooks.
+    Idempotent — safe to call once per boot. Returns the number of items updated.
+    Assumes Plaid is configured AND PLAID_WEBHOOK_URL is set (callers gate first).
+    Shared by the manual endpoint AND the startup auto-registration in main.py."""
+    from plaid.model.item_webhook_update_request import ItemWebhookUpdateRequest
+
+    webhook_url = _webhook_url()
+    client = plaid_client.get_client()
+    items = db.execute(select(PlaidItem).order_by(PlaidItem.id.asc())).scalars().all()
+    updated = 0
+    for item in items:
+        try:
+            client.item_webhook_update(
+                ItemWebhookUpdateRequest(access_token=item.access_token, webhook=webhook_url)
+            )
+            updated += 1
+        except Exception as e:
+            print(f"[plaid] webhook update failed for item {item.id}: {e}")
+    return updated
+
+
+@router.post("/webhook/register")
+def register_webhook(db: Session = Depends(get_db)):
+    """Push PLAID_WEBHOOK_URL to ALL already-linked items via /item/webhook/update
+    so items linked BEFORE the webhook was configured start sending webhooks.
+    Returns {updated: N}. 503 if Plaid unconfigured or PLAID_WEBHOOK_URL unset.
+    Startup does this automatically too (main.py); this endpoint is for on-demand
+    re-registration."""
+    _require_configured()
+    if not _webhook_url():
+        raise HTTPException(503, "PLAID_WEBHOOK_URL is not set on the server.")
+    return {"updated": register_webhook_all(db)}
