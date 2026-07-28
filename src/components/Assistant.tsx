@@ -2,39 +2,30 @@ import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Sparkles, X, ArrowUp, Check, ArrowRight } from 'lucide-react'
-import { getAssistantStatus, assistantBudget } from '../lib/api'
-import type { ChatMessage, BudgetChatResponse } from '../lib/types'
+import { getAssistantStatus, assistantChat } from '../lib/api'
+import { invalidateLedger } from '../lib/queryKeys'
+import type { ChatMessage } from '../lib/types'
+
+// Create-tool names the backend reports in `AssistantReply.tool_calls` when the
+// assistant persists something this turn. Kept in sync with the backend tools.
+const CREATE_RULE = 'create_categorization_rule'
+const CREATE_GOAL = 'create_savings_goal'
+const CREATE_BUDGET = 'create_category_budget'
+const CREATE_TOOLS = [CREATE_RULE, CREATE_GOAL, CREATE_BUDGET]
 
 const SUGGESTIONS = [
   'How much did I spend on dining this year?',
-  'Save $2,000 for a Japan trip by December',
+  'Save $2,000 for a NYC trip',
   'Cap my Food & Drink spending at $400 a month',
+  'Always categorize Whole Foods as Groceries',
 ]
 
-// A rendered chat entry — the assistant may also have `created` budgets attached.
+// A rendered chat entry. `tools` holds the CREATE tools that ran on an assistant
+// turn (empty/absent when nothing was created) so we can show a confirmation.
 interface ChatEntry {
   role: 'user' | 'assistant'
   content: string
-  created?: BudgetChatResponse['created']
-}
-
-function fmt(n: number): string {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  }).format(n)
-}
-
-function monthYear(iso: string | null): string {
-  if (!iso) return ''
-  const d = new Date(`${iso}T00:00:00`)
-  if (isNaN(d.getTime())) return iso
-  return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })
-}
-
-function hasCreations(c?: BudgetChatResponse['created']): boolean {
-  return !!c && (c.goals.length > 0 || c.category_limits.length > 0)
+  tools?: string[]
 }
 
 export default function Assistant() {
@@ -68,13 +59,24 @@ export default function Assistant() {
     setInput('')
     setLoading(true)
     try {
-      // The budget endpoint answers like normal chat AND creates goals/limits when
-      // the message expresses that intent — so it cleanly covers both cases.
+      // The chat endpoint answers questions AND can create rules / goals / budgets
+      // via tool calls — it reports which tools ran in `tool_calls`.
       const history: ChatMessage[] = next.map((e) => ({ role: e.role, content: e.content }))
-      const res = await assistantBudget(history)
-      setEntries([...next, { role: 'assistant', content: res.reply, created: res.created }])
-      // The assistant may have created goals/limits — refresh the Budget views.
-      if (hasCreations(res.created)) void queryClient.invalidateQueries({ queryKey: ['budgets'] })
+      const res = await assistantChat(history)
+      // Code defensively: tool_calls may be undefined on read-only replies.
+      const ran = res.tool_calls ?? []
+      const created = ran.filter((t) => CREATE_TOOLS.includes(t))
+      setEntries([...next, { role: 'assistant', content: res.reply, tools: created }])
+
+      // A create tool ran → the ledger (and derived stats/duplicates) may have
+      // changed, since a new rule can recategorize transactions. Refresh broadly,
+      // then the specific lists the created entity shows up in.
+      if (created.length > 0) {
+        invalidateLedger(queryClient)
+        if (ran.includes(CREATE_RULE)) void queryClient.invalidateQueries({ queryKey: ['rules'] })
+        if (ran.includes(CREATE_GOAL)) void queryClient.invalidateQueries({ queryKey: ['budgets', 'goals'] })
+        if (ran.includes(CREATE_BUDGET)) void queryClient.invalidateQueries({ queryKey: ['budgets', 'categories'] })
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Something went wrong')
     } finally {
@@ -108,7 +110,10 @@ export default function Assistant() {
           <div className="assistant-body" ref={scrollRef}>
             {entries.length === 0 && (
               <div className="assistant-intro">
-                <p>Ask anything about your spending, or tell me a savings goal or category limit and I'll set it up.</p>
+                <p>
+                  Ask anything about your spending, or tell me what to set up — a savings goal, a
+                  monthly category budget, or a categorization rule — and I'll create it for you.
+                </p>
                 <div className="assistant-suggestions">
                   {SUGGESTIONS.map((s) => (
                     <button key={s} className="assistant-chip" onClick={() => void send(s)}>
@@ -124,28 +129,36 @@ export default function Assistant() {
                 <div className={`chat-row ${m.role}`}>
                   <div className={`chat-bubble ${m.role}`}>{m.content}</div>
                 </div>
-                {m.role === 'assistant' && hasCreations(m.created) && (
+                {m.role === 'assistant' && m.tools && m.tools.length > 0 && (
                   <div className="budget-confirm">
-                    {m.created!.goals.map((g) => (
-                      <div key={`g-${g.id}`} className="budget-confirm-item">
+                    {m.tools.includes(CREATE_RULE) && (
+                      <div className="budget-confirm-item">
                         <Check size={13} className="budget-confirm-check" />
-                        <span>
-                          Created goal <strong>'{g.name}'</strong> — {fmt(g.target_amount)}
-                          {g.target_date ? ` by ${monthYear(g.target_date)}` : ''}
-                        </span>
+                        <span>Created a categorization rule.</span>
                       </div>
-                    ))}
-                    {m.created!.category_limits.map((c) => (
-                      <div key={`c-${c.id}`} className="budget-confirm-item">
+                    )}
+                    {m.tools.includes(CREATE_GOAL) && (
+                      <div className="budget-confirm-item">
                         <Check size={13} className="budget-confirm-check" />
-                        <span>
-                          <strong>{c.category}</strong> capped at {fmt(c.limit_amount)}/mo
-                        </span>
+                        <span>Created a savings goal.</span>
                       </div>
-                    ))}
-                    <Link to="/budget" className="budget-confirm-link" onClick={() => setOpen(false)}>
-                      View in Budget <ArrowRight size={13} />
-                    </Link>
+                    )}
+                    {m.tools.includes(CREATE_BUDGET) && (
+                      <div className="budget-confirm-item">
+                        <Check size={13} className="budget-confirm-check" />
+                        <span>Set a monthly category budget.</span>
+                      </div>
+                    )}
+                    {m.tools.includes(CREATE_RULE) && (
+                      <Link to="/rules" className="budget-confirm-link" onClick={() => setOpen(false)}>
+                        View in Rules <ArrowRight size={13} />
+                      </Link>
+                    )}
+                    {(m.tools.includes(CREATE_GOAL) || m.tools.includes(CREATE_BUDGET)) && (
+                      <Link to="/budget" className="budget-confirm-link" onClick={() => setOpen(false)}>
+                        View in Budget <ArrowRight size={13} />
+                      </Link>
+                    )}
                   </div>
                 )}
               </div>
@@ -166,7 +179,7 @@ export default function Assistant() {
             <textarea
               ref={inputRef}
               rows={1}
-              placeholder="Ask, or set a goal or limit…"
+              placeholder="Ask, or set a goal, budget, or rule…"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
