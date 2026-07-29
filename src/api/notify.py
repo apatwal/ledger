@@ -9,8 +9,19 @@ with the message as the body and ntfy's Title/Click/Tags/Priority request header
 (ntfy reads these headers). We use urllib only (no new dependency), mirroring the
 Clerk user-lookup pattern in auth.py — including a real User-Agent.
 
+Header encoding (bug fix): HTTP headers go out latin-1 (http.client), so a raw
+emoji in Title — e.g. "⚠️ Possible duplicate charge" — raises UnicodeEncodeError
+BEFORE the request is even sent, silently killing every notification. Every
+header value therefore passes through `_encode_header`, which leaves pure-ASCII
+values untouched and rewrites non-ASCII ones as an RFC 2047 encoded-word
+(=?UTF-8?B?...?=); ntfy decodes that and the emoji survives. The BODY is
+unaffected — it is already sent as UTF-8 bytes with charset=utf-8.
+
 Nothing here EVER raises: a notification failure must never break a sync. The
 actual HTTP send is isolated in `_http_post` so tests can monkeypatch it.
+`send_ntfy_verbose` returns (sent, error) for the self-diagnosing
+/api/notify/test endpoint; `send_ntfy` is the bool-only wrapper used everywhere
+else.
 
 Duplicate alerts (no-spam):
   detect_and_notify_new_duplicates(db) re-uses compute_duplicate_groups() and
@@ -21,6 +32,7 @@ Duplicate alerts (no-spam):
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import urllib.request
@@ -47,6 +59,41 @@ def _app_url() -> str:
     return (os.environ.get("APP_URL") or "").strip().rstrip("/")
 
 
+# ── Header encoding (latin-1 safety) ───────────────────────────────────────────
+
+def _encode_header(value: str) -> str:
+    """Make a header value safe for http.client's latin-1 header encoding.
+
+    Pure-ASCII values are returned unchanged (headers/logs stay readable). Anything
+    with non-ASCII (emoji titles, an accented merchant or account nickname) becomes
+    an RFC 2047 base64 encoded-word — ntfy decodes it, so "⚠️ Possible duplicate
+    charge" arrives intact instead of blowing up with UnicodeEncodeError.
+    """
+    text = str(value)
+    if text.isascii():
+        return text
+    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"=?UTF-8?B?{b64}?="
+
+
+def _redact(reason: str, topic: str) -> str:
+    """Strip the ntfy topic (a secret — it is the whole auth story for a topic) out
+    of an error string before it is handed to an API caller.
+
+    The topic only ever reaches an exception message via the URL we built, so the
+    `/{topic}` path form is the one that matters. A bare topic is also scrubbed,
+    but only when it is long enough to be a real topic — blind substring
+    replacement on a short test stub like "t" would corrupt genuine error text
+    ("network down" → "ne<topic>work down").
+    """
+    if not topic:
+        return reason
+    out = reason.replace(f"/{topic}", "/<topic>")
+    if len(topic) >= 6:
+        out = out.replace(topic, "<topic>")
+    return out
+
+
 # ── HTTP send (seam: _http_post) ────────────────────────────────────────────────
 
 def _http_post(url: str, body: bytes, headers: dict) -> None:
@@ -55,6 +102,43 @@ def _http_post(url: str, body: bytes, headers: dict) -> None:
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=5):  # noqa: S310 (trusted host, gated by env)
         pass
+
+
+def send_ntfy_verbose(
+    title: str,
+    message: str,
+    *,
+    click: str | None = None,
+    tags: str | None = None,
+    priority: str | None = None,
+) -> tuple[bool, str | None]:
+    """Send a push notification via ntfy and report WHY it failed.
+
+    Returns (sent, error): (True, None) on a successful POST, else (False, reason)
+    — "NTFY_TOPIC is not set" for the gated no-op, or the exception text for a
+    network/HTTP failure (with the topic redacted, never leaked). NEVER raises.
+    """
+    topic = _topic()
+    if not topic:
+        return False, "NTFY_TOPIC is not set"
+    url = f"{_server()}/{topic}"
+    headers = {
+        "User-Agent": "expense-tracker/1.0",
+        "Content-Type": "text/plain; charset=utf-8",
+        "Title": _encode_header(title),
+    }
+    if click:
+        headers["Click"] = _encode_header(click)
+    if tags:
+        headers["Tags"] = _encode_header(tags)
+    if priority:
+        headers["Priority"] = _encode_header(priority)
+    try:
+        _http_post(url, message.encode("utf-8"), headers)
+        return True, None
+    except Exception as e:  # network/timeout/HTTP error — never break the caller
+        logger.warning("[notify] ntfy send failed: %s", e)
+        return False, _redact(str(e) or e.__class__.__name__, topic)
 
 
 def send_ntfy(
@@ -67,27 +151,10 @@ def send_ntfy(
 ) -> bool:
     """Send a push notification via ntfy. Returns True on a successful POST, False
     when NTFY_TOPIC is unset (no-op) or the send failed. NEVER raises."""
-    topic = _topic()
-    if not topic:
-        return False
-    url = f"{_server()}/{topic}"
-    headers = {
-        "User-Agent": "expense-tracker/1.0",
-        "Content-Type": "text/plain; charset=utf-8",
-        "Title": title,
-    }
-    if click:
-        headers["Click"] = click
-    if tags:
-        headers["Tags"] = tags
-    if priority:
-        headers["Priority"] = priority
-    try:
-        _http_post(url, message.encode("utf-8"), headers)
-        return True
-    except Exception as e:  # network/timeout/HTTP error — never break the caller
-        logger.warning("[notify] ntfy send failed: %s", e)
-        return False
+    sent, _ = send_ntfy_verbose(
+        title, message, click=click, tags=tags, priority=priority
+    )
+    return sent
 
 
 # ── Duplicate detection + notification ──────────────────────────────────────────
