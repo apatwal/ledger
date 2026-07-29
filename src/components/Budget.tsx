@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Plus, X, Pencil, Trash2, PiggyBank, Target, Check, AlertTriangle } from 'lucide-react'
+import { Plus, X, Pencil, Trash2, PiggyBank, Target, Check, AlertTriangle, ChevronDown } from 'lucide-react'
 import {
   getSavingsGoals,
   createSavingsGoal,
@@ -86,6 +86,89 @@ function ConfirmDialog({
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+// ─── Single-select account field (goal form) ──────────────────────────────────
+// Replaces the native <input list=datalist> combobox with a themed dropdown so
+// it matches the ledger look. Restricted to known accounts (+ "No account"),
+// since a savings goal tracks a designated account's balance; an existing goal's
+// account is kept selectable even if it's not in the current label set.
+function AccountSelectField({
+  value,
+  onChange,
+  options,
+}: {
+  value: string
+  onChange: (v: string) => void
+  options: string[]
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    function onDown(e: MouseEvent) {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  const opts = value && !options.includes(value) ? [value, ...options] : options
+  const pick = (v: string) => { onChange(v); setOpen(false) }
+
+  return (
+    <div className={`acct-field${open ? ' open' : ''}`} ref={rootRef}>
+      <button
+        type="button"
+        className="acct-field-trigger"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <PiggyBank size={14} className="acct-field-lead" />
+        <span className={`acct-field-value${value ? '' : ' placeholder'}`}>
+          {value || 'No account'}
+        </span>
+        <ChevronDown size={15} className="acct-field-caret" />
+      </button>
+      {open && (
+        <div className="acct-field-popover" role="listbox">
+          <button
+            type="button"
+            role="option"
+            aria-selected={!value}
+            className={`acct-field-option${!value ? ' on' : ''}`}
+            onClick={() => pick('')}
+          >
+            <span className="acct-field-check">{!value && <Check size={13} strokeWidth={3} />}</span>
+            <span className="acct-field-muted">No account</span>
+          </button>
+          {opts.map((a) => (
+            <button
+              key={a}
+              type="button"
+              role="option"
+              aria-selected={value === a}
+              className={`acct-field-option${value === a ? ' on' : ''}`}
+              onClick={() => pick(a)}
+            >
+              <span className="acct-field-check">{value === a && <Check size={13} strokeWidth={3} />}</span>
+              <span className="acct-field-name">{a}</span>
+            </button>
+          ))}
+          {opts.length === 0 && (
+            <div className="acct-field-empty">No connected accounts yet</div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -206,21 +289,9 @@ function GoalModal({
             </div>
 
             <div className="form-group" style={{ marginBottom: 0 }}>
-              <label htmlFor="goal-account">Savings account (optional)</label>
-              <input
-                id="goal-account"
-                type="text"
-                list="goal-account-options"
-                placeholder="Which account holds these savings?"
-                value={account}
-                onChange={(e) => setAccount(e.target.value)}
-                autoComplete="off"
-              />
-              <datalist id="goal-account-options">
-                {accountLabels.map((a) => (
-                  <option key={a} value={a} />
-                ))}
-              </datalist>
+              <label id="goal-account-label">Savings account (optional)</label>
+              <AccountSelectField value={account} onChange={setAccount} options={accountLabels} />
+              <div className="form-hint">Money you move into this account counts toward the goal.</div>
             </div>
           </div>
           <div className="modal-footer">
