@@ -312,7 +312,9 @@ export interface ChatMessage {
 
 export interface AssistantReply {
   reply: string
-  tool_calls: string[]
+  // Names of the tools the assistant invoked this turn (e.g. create_categorization_rule).
+  // May be absent on older/read-only responses — always read defensively.
+  tool_calls?: string[]
 }
 
 export interface CategorySuggestion {

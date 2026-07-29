@@ -139,6 +139,45 @@ def apply_rules_to_existing(body: ApplyRequest, db: Session = Depends(get_db)):
     return ApplyResponse(updated=updated)
 
 
+def apply_single_rule_to_existing(db: Session, rule: Rule) -> int:
+    """Apply ONE rule to every existing transaction it matches, updating
+    type/category/account where the rule's non-null action differs and clearing
+    the review flag on a match. Commits. Returns the number of rows changed.
+
+    Used right after the Assistant creates a rule so the new classification takes
+    effect on existing rows immediately — scoped to the single new rule (via
+    rules_engine.rule_matches) rather than blanket-re-applying every rule."""
+    txns = db.execute(select(Transaction)).scalars().all()
+    updated = 0
+    for t in txns:
+        if not rules_engine.rule_matches(
+            rule,
+            description=t.description,
+            category=t.category,
+            account=t.account,
+            amount=t.amount,
+        ):
+            continue
+        changed = False
+        if rule.set_type and rule.set_type != t.type:
+            t.type = rule.set_type
+            changed = True
+        if rule.set_category and rule.set_category != t.category:
+            t.category = rule.set_category
+            changed = True
+        if rule.set_account and rule.set_account != t.account:
+            t.account = rule.set_account
+            changed = True
+        if t.needs_review:
+            t.needs_review = False
+            t.review_reason = None
+            changed = True
+        if changed:
+            updated += 1
+    db.commit()
+    return updated
+
+
 class PreviewResponse(BaseModel):
     matches: int
 
