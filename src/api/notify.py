@@ -17,11 +17,24 @@ values untouched and rewrites non-ASCII ones as an RFC 2047 encoded-word
 (=?UTF-8?B?...?=); ntfy decodes that and the emoji survives. The BODY is
 unaffected — it is already sent as UTF-8 bytes with charset=utf-8.
 
+Authentication (NTFY_TOKEN): ntfy.sh rate-limits ANONYMOUS publishing per source
+IP. On a shared-IP host like Render the outbound IP is shared across tenants, so
+we get HTTP 429 from traffic that isn't even ours. ntfy applies its limits
+per-ACCOUNT for authenticated requests, so setting NTFY_TOKEN (an ntfy access
+token) and publishing with `Authorization: Bearer <token>` fixes it. Unset =>
+anonymous publishing exactly as before. The token is a SECRET: it is redacted out
+of every error string and log line by `_redact`, alongside the topic.
+
+Retry: a single bounded retry (after ~2s) on the transient statuses — HTTP 429 and
+5xx. Anything else (403 bad token, DNS failure, timeout) fails immediately. This
+code runs inside the Plaid sync path, so added latency is capped at one short
+sleep and must never stall a sync.
+
 Nothing here EVER raises: a notification failure must never break a sync. The
-actual HTTP send is isolated in `_http_post` so tests can monkeypatch it.
-`send_ntfy_verbose` returns (sent, error) for the self-diagnosing
-/api/notify/test endpoint; `send_ntfy` is the bool-only wrapper used everywhere
-else.
+actual HTTP send is isolated in `_http_post` so tests can monkeypatch it (and the
+retry pause in `_sleep`, so the suite never waits). `send_ntfy_verbose` returns
+(sent, error) for the self-diagnosing /api/notify/test endpoint; `send_ntfy` is
+the bool-only wrapper used everywhere else.
 
 Duplicate alerts (no-spam):
   detect_and_notify_new_duplicates(db) re-uses compute_duplicate_groups() and
@@ -35,6 +48,8 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
+import time
 import urllib.request
 
 from sqlalchemy import select
@@ -53,6 +68,12 @@ def _topic() -> str:
 
 def _server() -> str:
     return (os.environ.get("NTFY_SERVER") or "https://ntfy.sh").strip().rstrip("/")
+
+
+def _token() -> str:
+    """ntfy access token (`tk_...`). Empty => publish anonymously (the old
+    behavior). Set it to escape ntfy.sh's per-IP anonymous rate limit."""
+    return (os.environ.get("NTFY_TOKEN") or "").strip()
 
 
 def _app_url() -> str:
@@ -76,22 +97,62 @@ def _encode_header(value: str) -> str:
     return f"=?UTF-8?B?{b64}?="
 
 
-def _redact(reason: str, topic: str) -> str:
-    """Strip the ntfy topic (a secret — it is the whole auth story for a topic) out
-    of an error string before it is handed to an API caller.
+def _redact(reason: str, topic: str, token: str = "") -> str:
+    """Strip the ntfy topic AND access token (both secrets) out of an error string
+    before it is logged or handed to an API caller.
 
     The topic only ever reaches an exception message via the URL we built, so the
     `/{topic}` path form is the one that matters. A bare topic is also scrubbed,
     but only when it is long enough to be a real topic — blind substring
     replacement on a short test stub like "t" would corrupt genuine error text
     ("network down" → "ne<topic>work down").
+
+    The token reaches an exception message via the header dict some libraries echo
+    back, so the `Bearer {token}` form is scrubbed unconditionally; the bare token
+    is scrubbed under the same length guard (real ntfy tokens are `tk_` + 29 chars,
+    so the guard never actually spares one).
     """
-    if not topic:
-        return reason
-    out = reason.replace(f"/{topic}", "/<topic>")
-    if len(topic) >= 6:
-        out = out.replace(topic, "<topic>")
+    out = reason
+    if topic:
+        out = out.replace(f"/{topic}", "/<topic>")
+        if len(topic) >= 6:
+            out = out.replace(topic, "<topic>")
+    if token:
+        out = out.replace(f"Bearer {token}", "Bearer <token>")
+        if len(token) >= 6:
+            out = out.replace(token, "<token>")
     return out
+
+
+# ── Transient-failure retry ─────────────────────────────────────────────────────
+
+RETRY_DELAY_SECONDS = 2.0
+
+
+def _sleep(seconds: float) -> None:
+    """The pause before the single retry. A seam so tests never actually wait."""
+    time.sleep(seconds)
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """HTTP status behind a failed send, or None if it wasn't an HTTP error.
+
+    `urllib.error.HTTPError` carries `.code`; we also parse urllib's message form
+    ("HTTP Error 429: Too Many Requests") so a stubbed/wrapped error still routes
+    to the right retry decision.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    m = re.search(r"HTTP Error (\d{3})", str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _is_retryable(status: int | None) -> bool:
+    """Retry only genuinely transient statuses: 429 (rate limited) and 5xx (server
+    side). NOT 4xx auth/permission failures — those never fix themselves and a
+    retry just doubles the latency of a sync."""
+    return status == 429 or (status is not None and 500 <= status <= 599)
 
 
 # ── HTTP send (seam: _http_post) ────────────────────────────────────────────────
@@ -116,29 +177,62 @@ def send_ntfy_verbose(
 
     Returns (sent, error): (True, None) on a successful POST, else (False, reason)
     — "NTFY_TOPIC is not set" for the gated no-op, or the exception text for a
-    network/HTTP failure (with the topic redacted, never leaked). NEVER raises.
+    network/HTTP failure (with the topic AND token redacted, never leaked). A 429
+    gets an actionable hint appended. Retries ONCE on 429/5xx. NEVER raises.
     """
     topic = _topic()
     if not topic:
         return False, "NTFY_TOPIC is not set"
+    token = _token()
     url = f"{_server()}/{topic}"
     headers = {
         "User-Agent": "expense-tracker/1.0",
         "Content-Type": "text/plain; charset=utf-8",
         "Title": _encode_header(title),
     }
+    # Authenticated publishing => ntfy meters us per-account instead of per-IP
+    # (the shared Render egress IP is what earns anonymous 429s). Deliberately NOT
+    # run through _encode_header: an RFC 2047 encoded-word is not valid in an
+    # Authorization header, and a real ntfy token (`tk_` + base62) is pure ASCII.
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     if click:
         headers["Click"] = _encode_header(click)
     if tags:
         headers["Tags"] = _encode_header(tags)
     if priority:
         headers["Priority"] = _encode_header(priority)
-    try:
-        _http_post(url, message.encode("utf-8"), headers)
-        return True, None
-    except Exception as e:  # network/timeout/HTTP error — never break the caller
-        logger.warning("[notify] ntfy send failed: %s", e)
-        return False, _redact(str(e) or e.__class__.__name__, topic)
+
+    body = message.encode("utf-8")
+    error = ""
+    status: int | None = None
+    for attempt in (1, 2):  # original + at most ONE retry
+        try:
+            _http_post(url, body, headers)
+            return True, None
+        except Exception as e:  # network/timeout/HTTP error — never break the caller
+            status = _status_code(e)
+            # Log the REDACTED text: the raw exception can echo the URL (topic) or
+            # the Authorization header (token) straight into the log.
+            error = _redact(str(e) or e.__class__.__name__, topic, token)
+            logger.warning("[notify] ntfy send failed (attempt %d/2): %s",
+                           attempt, error)
+            if attempt == 1 and _is_retryable(status):
+                _sleep(RETRY_DELAY_SECONDS)
+                continue
+            break
+
+    if status == 429:
+        error += (
+            " — ntfy account message quota exhausted; wait for it to reset or "
+            "upgrade the ntfy plan."
+            if token else
+            " — ntfy.sh rate-limits ANONYMOUS publishing per source IP, and this "
+            "host's outbound IP is shared with other tenants. Fix: create an ntfy "
+            "account, generate an access token, and set NTFY_TOKEN so publishing "
+            "is metered per-account."
+        )
+    return False, error
 
 
 def send_ntfy(

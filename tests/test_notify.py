@@ -5,6 +5,14 @@ Coverage
 --------
 * send_ntfy: returns False (no-op) when NTFY_TOPIC is unset; sends via the
   monkeypatched HTTP seam when the topic is set, passing the right URL/headers.
+* NTFY_TOKEN (authenticated publishing): set => an `Authorization: Bearer <token>`
+  header; unset => NO Authorization header (anonymous, the old behavior). The token
+  is a SECRET: it must never appear in the returned error string OR in the log
+  output, even when the underlying exception text contains it.
+* Bounded retry: ONE retry (after notify.RETRY_DELAY_SECONDS) on the transient
+  statuses 429 / 5xx, and NO retry on anything else (403, generic errors) — this
+  code runs inside the Plaid sync path, so the added latency is capped. The 429
+  message must be actionable (name NTFY_TOKEN when publishing anonymously).
 * Header encoding regression (the production bug): every header value must be
   latin-1 encodable, because http.client encodes headers as latin-1 and a raw
   emoji Title raised UnicodeEncodeError before the request was ever sent — which
@@ -24,16 +32,58 @@ Coverage
 
 from __future__ import annotations
 
+import logging
+import urllib.error
 from datetime import date
 from email.header import make_header, decode_header
 
+import pytest
+
 from src.api import notify
 from src.api.models import Transaction
+
+# A realistic ntfy access token (tk_ + 29 chars) — used wherever a test needs the
+# real thing, so the redaction assertions exercise a production-shaped secret.
+TOKEN = "tk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _no_ntfy_token(monkeypatch):
+    """Default every test to ANONYMOUS publishing.
+
+    main.py calls load_dotenv() at import time, so a real NTFY_TOKEN in the
+    developer's .env would otherwise leak an Authorization header into assertions
+    here. Tests that want a token set it explicitly.
+    """
+    monkeypatch.delenv("NTFY_TOKEN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch) -> list[float]:
+    """Record (and never actually perform) the retry pause.
+
+    send_ntfy_verbose sleeps RETRY_DELAY_SECONDS before its one retry; without this
+    the suite would really wait 2s per retrying test. Retry tests assert on the
+    recorded delays.
+    """
+    recorded: list[float] = []
+    monkeypatch.setattr(notify, "_sleep", recorded.append)
+    return recorded
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _http_error(code: int, reason: str = "Too Many Requests") -> urllib.error.HTTPError:
+    """A real urllib HTTPError, exactly what _http_post raises in production
+    (str() => "HTTP Error 429: Too Many Requests")."""
+    return urllib.error.HTTPError("https://ntfy.sh/my-topic", code, reason, {}, None)
+
 
 def _add_expense(session, **kwargs) -> Transaction:
     defaults = dict(
@@ -61,6 +111,25 @@ class _Recorder:
 
     def __call__(self, url, body, headers):
         self.calls.append({"url": url, "body": body, "headers": headers})
+
+
+class _Flaky(_Recorder):
+    """_http_post stub with a scripted outcome per attempt.
+
+    Pass one entry per call — an exception to raise, or None to succeed. The last
+    entry repeats if it is called again (so `_Flaky(err)` always fails), which is
+    what lets a test assert the exact CALL COUNT rather than assuming it.
+    """
+
+    def __init__(self, *outcomes):
+        super().__init__()
+        self.outcomes = list(outcomes) or [None]
+
+    def __call__(self, url, body, headers):
+        super().__call__(url, body, headers)
+        outcome = self.outcomes[min(len(self.calls) - 1, len(self.outcomes) - 1)]
+        if outcome is not None:
+            raise outcome
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +262,239 @@ class TestHeaderEncoding:
         for value in headers.values():
             str(value).encode("latin-1")
         assert str(make_header(decode_header(headers["Title"]))) == self.EMOJI_TITLE
+
+
+# ---------------------------------------------------------------------------
+# NTFY_TOKEN — authenticated publishing (fixes ntfy.sh's per-IP anonymous 429)
+# ---------------------------------------------------------------------------
+
+class TestNtfyToken:
+    """ntfy.sh rate-limits ANONYMOUS publishing per source IP; Render's egress IP
+    is shared across tenants, so production got 429s from other people's traffic.
+    Authenticated requests are metered per-ACCOUNT instead."""
+
+    def _headers_for(self, monkeypatch) -> dict:
+        rec = _Recorder()
+        monkeypatch.setattr(notify, "_http_post", rec)
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        assert notify.send_ntfy("Title", "Body") is True
+        return rec.calls[0]["headers"]
+
+    def test_authorization_header_when_token_set(self, monkeypatch):
+        monkeypatch.setenv("NTFY_TOKEN", TOKEN)
+        headers = self._headers_for(monkeypatch)
+        assert headers["Authorization"] == f"Bearer {TOKEN}"
+
+    def test_no_authorization_header_when_token_unset(self, monkeypatch):
+        """Unset => behave exactly as before: anonymous, no auth header at all."""
+        monkeypatch.delenv("NTFY_TOKEN", raising=False)
+        assert "Authorization" not in self._headers_for(monkeypatch)
+
+    def test_blank_token_is_treated_as_unset(self, monkeypatch):
+        """render.yaml/.env.example ship the key blank — whitespace must not become
+        a bogus `Authorization: Bearer ` header."""
+        monkeypatch.setenv("NTFY_TOKEN", "   ")
+        assert "Authorization" not in self._headers_for(monkeypatch)
+
+    def test_token_helper_strips(self, monkeypatch):
+        monkeypatch.setenv("NTFY_TOKEN", f"  {TOKEN}\n")
+        assert notify._token() == TOKEN
+        monkeypatch.delenv("NTFY_TOKEN", raising=False)
+        assert notify._token() == ""
+
+    def test_auth_header_is_latin1_encodable(self, monkeypatch):
+        """The Authorization header joins the latin-1 regression guard."""
+        monkeypatch.setenv("NTFY_TOKEN", TOKEN)
+        rec = _Recorder()
+        monkeypatch.setattr(notify, "_http_post", rec)
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        notify.send_ntfy("⚠️ Possible duplicate charge", "Body",
+                         tags="warning,café", priority="high")
+        for value in rec.calls[0]["headers"].values():
+            str(value).encode("latin-1")  # raises UnicodeEncodeError if unsafe
+
+
+class TestTokenNeverLeaks:
+    """The token is a secret. It must not reach an API response or a log file even
+    when the underlying exception text embeds it (urllib errors can echo headers)."""
+
+    def _fail_with_token_in_message(self, monkeypatch):
+        def boom(url, body, headers):
+            raise RuntimeError(
+                f"rejected request headers Authorization: Bearer {TOKEN}"
+            )
+
+        monkeypatch.setattr(notify, "_http_post", boom)
+        monkeypatch.setenv("NTFY_TOPIC", "super-secret-topic")
+        monkeypatch.setenv("NTFY_TOKEN", TOKEN)
+
+    def test_token_redacted_from_error(self, monkeypatch):
+        self._fail_with_token_in_message(monkeypatch)
+        sent, error = notify.send_ntfy_verbose("t", "m")
+        assert sent is False
+        assert TOKEN not in error
+        assert "<token>" in error
+        # The rest of the message survives — still diagnosable.
+        assert "rejected request headers" in error
+
+    def test_token_redacted_from_logs(self, monkeypatch, caplog):
+        self._fail_with_token_in_message(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="expense_tracker.notify"):
+            notify.send_ntfy_verbose("t", "m")
+        assert caplog.text  # it DID log the failure
+        assert TOKEN not in caplog.text
+        assert "<token>" in caplog.text
+
+    def test_topic_and_token_both_redacted(self, monkeypatch):
+        def boom(url, body, headers):
+            raise RuntimeError(f"POST {url} failed with token {TOKEN}")
+
+        monkeypatch.setattr(notify, "_http_post", boom)
+        monkeypatch.setenv("NTFY_TOPIC", "super-secret-topic")
+        monkeypatch.setenv("NTFY_TOKEN", TOKEN)
+        _, error = notify.send_ntfy_verbose("t", "m")
+        assert "super-secret-topic" not in error
+        assert TOKEN not in error
+
+    def test_redact_helper(self):
+        assert notify._redact("boom", "", "") == "boom"
+        assert notify._redact(f"Bearer {TOKEN}", "", TOKEN) == "Bearer <token>"
+        assert notify._redact(f"x {TOKEN} y", "", TOKEN) == "x <token> y"
+        # Topic redaction is unchanged by the new parameter.
+        assert notify._redact("https://ntfy.sh/abc", "abc", "") == \
+            "https://ntfy.sh/<topic>"
+        # A short stub topic must not corrupt genuine error text.
+        assert notify._redact("network down", "n", "") == "network down"
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry on transient failures (429 / 5xx)
+# ---------------------------------------------------------------------------
+
+class TestRetry:
+    """Exactly ONE retry, and only for transient statuses. This runs inside the
+    Plaid sync path, so the worst case is a single RETRY_DELAY_SECONDS pause."""
+
+    def _run(self, monkeypatch, *outcomes, token: str | None = None):
+        flaky = _Flaky(*outcomes)
+        monkeypatch.setattr(notify, "_http_post", flaky)
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        if token:
+            monkeypatch.setenv("NTFY_TOKEN", token)
+        return flaky, notify.send_ntfy_verbose("t", "m")
+
+    def test_429_retried_once_then_gives_up(self, monkeypatch, sleeps):
+        flaky, (sent, error) = self._run(monkeypatch, _http_error(429))
+        assert len(flaky.calls) == 2          # original + ONE retry, no more
+        assert sent is False
+        assert "429" in error
+        assert "rate-limit" in error.lower()
+        assert sleeps == [notify.RETRY_DELAY_SECONDS]
+
+    def test_429_then_success(self, monkeypatch, sleeps):
+        flaky, result = self._run(monkeypatch, _http_error(429), None)
+        assert result == (True, None)
+        assert len(flaky.calls) == 2
+        assert sleeps == [notify.RETRY_DELAY_SECONDS]
+
+    def test_5xx_retried_once(self, monkeypatch, sleeps):
+        flaky, (sent, error) = self._run(
+            monkeypatch, _http_error(503, "Service Unavailable"))
+        assert len(flaky.calls) == 2
+        assert sent is False
+        assert "503" in error
+        assert sleeps == [notify.RETRY_DELAY_SECONDS]
+
+    def test_5xx_then_success(self, monkeypatch):
+        flaky, result = self._run(
+            monkeypatch, _http_error(500, "Internal Server Error"), None)
+        assert result == (True, None)
+        assert len(flaky.calls) == 2
+
+    def test_403_not_retried(self, monkeypatch, sleeps):
+        """A bad/expired token never fixes itself — retrying only adds latency."""
+        flaky, (sent, error) = self._run(
+            monkeypatch, _http_error(403, "Forbidden"), token=TOKEN)
+        assert len(flaky.calls) == 1
+        assert sent is False
+        assert "403" in error
+        assert sleeps == []
+
+    def test_401_not_retried(self, monkeypatch):
+        flaky, _ = self._run(monkeypatch, _http_error(401, "Unauthorized"))
+        assert len(flaky.calls) == 1
+
+    def test_generic_exception_not_retried(self, monkeypatch, sleeps):
+        flaky, (sent, error) = self._run(monkeypatch, RuntimeError("network down"))
+        assert len(flaky.calls) == 1
+        assert (sent, error) == (False, "network down")
+        assert sleeps == []
+
+    def test_success_never_sleeps(self, monkeypatch, sleeps):
+        flaky, result = self._run(monkeypatch, None)
+        assert result == (True, None)
+        assert len(flaky.calls) == 1
+        assert sleeps == []
+
+    def test_retry_reuses_same_url_body_and_headers(self, monkeypatch):
+        flaky, _ = self._run(monkeypatch, _http_error(429), token=TOKEN)
+        first, second = flaky.calls
+        assert first == second
+        assert second["headers"]["Authorization"] == f"Bearer {TOKEN}"
+
+    def test_send_ntfy_still_never_raises_on_retryable_error(self, monkeypatch):
+        monkeypatch.setattr(notify, "_http_post", _Flaky(_http_error(429)))
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        assert notify.send_ntfy("t", "m") is False
+
+    def test_status_code_helper(self):
+        assert notify._status_code(_http_error(429)) == 429
+        # Stubbed/wrapped errors: parsed out of urllib's message form.
+        assert notify._status_code(
+            RuntimeError("HTTP Error 502: Bad Gateway")) == 502
+        assert notify._status_code(RuntimeError("network down")) is None
+
+    def test_is_retryable_helper(self):
+        assert notify._is_retryable(429) is True
+        assert notify._is_retryable(500) is True
+        assert notify._is_retryable(599) is True
+        assert notify._is_retryable(403) is False
+        assert notify._is_retryable(404) is False
+        assert notify._is_retryable(200) is False
+        assert notify._is_retryable(None) is False
+
+
+class Test429Message:
+    """The 429 error must say what to DO about it — the whole point of the
+    self-diagnosing /api/notify/test endpoint."""
+
+    def _error(self, monkeypatch, token: str | None = None) -> str:
+        monkeypatch.setattr(notify, "_http_post", _Flaky(_http_error(429)))
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        if token:
+            monkeypatch.setenv("NTFY_TOKEN", token)
+        sent, error = notify.send_ntfy_verbose("t", "m")
+        assert sent is False
+        return error
+
+    def test_anonymous_429_names_ntfy_token_as_the_fix(self, monkeypatch):
+        error = self._error(monkeypatch)
+        assert "NTFY_TOKEN" in error
+        assert "ANONYMOUS" in error
+        assert "IP" in error
+
+    def test_authenticated_429_blames_account_quota(self, monkeypatch):
+        error = self._error(monkeypatch, token=TOKEN)
+        assert "quota" in error.lower()
+        assert "NTFY_TOKEN" not in error   # already set — don't misdirect
+        assert TOKEN not in error
+
+    def test_non_429_gets_no_rate_limit_hint(self, monkeypatch):
+        monkeypatch.setattr(notify, "_http_post",
+                            _Flaky(_http_error(404, "Not Found")))
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        _, error = notify.send_ntfy_verbose("t", "m")
+        assert error == "HTTP Error 404: Not Found"
 
 
 # ---------------------------------------------------------------------------
@@ -404,3 +706,34 @@ class TestNotifyTestEndpoint:
         assert body["sent"] is False
         assert body["topic_configured"] is True
         assert body["error"] == "network down"
+
+    def test_token_configured_false_when_unset(self, client, monkeypatch):
+        monkeypatch.delenv("NTFY_TOKEN", raising=False)
+        monkeypatch.setenv("NTFY_TOPIC", "t")
+        monkeypatch.setattr(notify, "_http_post", _Recorder())
+        assert client.post("/api/notify/test").json()["token_configured"] is False
+
+    def test_token_configured_true_and_value_never_echoed(self, client, monkeypatch):
+        """Confirms NTFY_TOKEN reached the process — as a BOOL only."""
+        monkeypatch.setenv("NTFY_TOPIC", "secret-topic")
+        monkeypatch.setenv("NTFY_TOKEN", TOKEN)
+        monkeypatch.setattr(notify, "_http_post", _Recorder())
+
+        resp = client.post("/api/notify/test")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["token_configured"] is True
+        assert TOKEN not in resp.text
+
+    def test_429_response_is_actionable(self, client, monkeypatch):
+        """The exact production symptom: reports 429 and how to fix it, with no
+        secret in the payload."""
+        monkeypatch.setenv("NTFY_TOPIC", "ledger-dupes-9f3a2b71")
+        monkeypatch.delenv("NTFY_TOKEN", raising=False)
+        monkeypatch.setattr(notify, "_http_post", _Flaky(_http_error(429)))
+
+        body = client.post("/api/notify/test").json()
+        assert body["sent"] is False
+        assert body["topic_configured"] is True
+        assert body["token_configured"] is False
+        assert "429" in body["error"]
+        assert "NTFY_TOKEN" in body["error"]

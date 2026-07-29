@@ -73,6 +73,14 @@ services:
       # Optional self-hosted ntfy server base URL (defaults to https://ntfy.sh).
       - key: NTFY_SERVER
         sync: false
+      # ntfy access token (tk_...). REQUIRED IN PRACTICE ON RENDER: ntfy.sh
+      # rate-limits ANONYMOUS publishing per source IP, and Render's outbound IPs
+      # are shared across tenants — so anonymous sends get HTTP 429 because of
+      # other people's traffic. With a token, ntfy meters per-ACCOUNT instead.
+      # Create a free ntfy.sh account → Account → Access tokens. sync:false =>
+      # prompted at deploy, never committed. Unset => anonymous publishing.
+      - key: NTFY_TOKEN
+        sync: false
       # App base URL used for the alert's Click action (deep-links to /dashboard).
       - key: APP_URL
         sync: false

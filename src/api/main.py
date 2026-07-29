@@ -102,10 +102,12 @@ def notify_test():
 
     Self-diagnosing: returns the failure reason too, so a False `sent` is
     actionable ("NTFY_TOPIC is not set" vs. an HTTP/network error) instead of a
-    bare boolean. `topic_configured` reports whether NTFY_TOPIC is set — the topic
-    value itself is a secret and is never returned.
+    bare boolean. `topic_configured` / `token_configured` report only WHETHER
+    NTFY_TOPIC / NTFY_TOKEN are set — both values are secrets and are never
+    returned. (An anonymous 429 from ntfy.sh is the symptom of a missing token, so
+    confirming the token was actually read is the first thing you want to know.)
     """
-    from .notify import _server, _topic, send_ntfy_verbose
+    from .notify import _server, _token, _topic, send_ntfy_verbose
 
     app_url = (os.environ.get("APP_URL") or "").strip().rstrip("/")
     sent, error = send_ntfy_verbose(
@@ -117,6 +119,7 @@ def notify_test():
     return {
         "sent": bool(sent),
         "topic_configured": bool(_topic()),
+        "token_configured": bool(_token()),
         "server": _server(),
         "error": error,
     }
