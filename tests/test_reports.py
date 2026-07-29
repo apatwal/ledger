@@ -9,10 +9,18 @@ figures + the recap message body. Also covers the default-previous-month path.
 from __future__ import annotations
 
 from datetime import date, datetime
+from email.header import make_header, decode_header
 
 import pytest
 
 from src.api import notify
+
+
+def _title(headers: dict) -> str:
+    """The recap Title contains an emoji, so it goes out as an RFC 2047
+    encoded-word (raw non-ASCII headers are unsendable — see notify._encode_header).
+    Decode it back to compare against the human-readable title."""
+    return str(make_header(decode_header(headers["Title"])))
 
 
 class _Recorder:
@@ -88,7 +96,8 @@ class TestMonthlyReport:
         # ntfy message body: month name + headline figures + top spending lines.
         assert len(rec.calls) == 1
         headers = rec.calls[0]["headers"]
-        assert headers["Title"] == "📊 June 2026 recap"
+        assert _title(headers) == "📊 June 2026 recap"
+        headers["Title"].encode("latin-1")  # must be sendable as an HTTP header
         body = rec.calls[0]["body"].decode("utf-8")
         assert "Income $5,000 · Spent $2,980" in body
         assert "Saved $600 (22%) · Invested $500" in body
@@ -127,7 +136,7 @@ class TestMonthlyReport:
         assert data["income"] == pytest.approx(5000.00)
         assert data["spent"] == pytest.approx(2980.00)
         month_name = date(py, pm, 1).strftime("%B %Y")
-        assert rec.calls[0]["headers"]["Title"] == f"📊 {month_name} recap"
+        assert _title(rec.calls[0]["headers"]) == f"📊 {month_name} recap"
 
     def test_empty_month_zeros(self, client, monkeypatch):
         """A month with no data → zeros, empty categories, sent still True."""

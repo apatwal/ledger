@@ -99,17 +99,27 @@ def get_categories(db: Session = Depends(get_db)):
 @app.post(f"{API_PREFIX}/notify/test", dependencies=_auth)
 def notify_test():
     """Send a test ntfy notification so the user can verify their setup (v12).
-    Returns {"sent": bool} — False when NTFY_TOPIC is unset or the send failed."""
-    from .notify import send_ntfy
+
+    Self-diagnosing: returns the failure reason too, so a False `sent` is
+    actionable ("NTFY_TOPIC is not set" vs. an HTTP/network error) instead of a
+    bare boolean. `topic_configured` reports whether NTFY_TOPIC is set — the topic
+    value itself is a secret and is never returned.
+    """
+    from .notify import _server, _topic, send_ntfy_verbose
 
     app_url = (os.environ.get("APP_URL") or "").strip().rstrip("/")
-    sent = send_ntfy(
+    sent, error = send_ntfy_verbose(
         "✅ Expense Tracker",
         "Test notification — your ntfy alerts are working.",
         click=f"{app_url}/dashboard" if app_url else None,
         tags="white_check_mark",
     )
-    return {"sent": bool(sent)}
+    return {
+        "sent": bool(sent),
+        "topic_configured": bool(_topic()),
+        "server": _server(),
+        "error": error,
+    }
 
 
 @app.get(f"{API_PREFIX}/accounts", response_model=list[str], dependencies=_auth)

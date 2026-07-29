@@ -5,6 +5,12 @@ Coverage
 --------
 * send_ntfy: returns False (no-op) when NTFY_TOPIC is unset; sends via the
   monkeypatched HTTP seam when the topic is set, passing the right URL/headers.
+* Header encoding regression (the production bug): every header value must be
+  latin-1 encodable, because http.client encodes headers as latin-1 and a raw
+  emoji Title raised UnicodeEncodeError before the request was ever sent — which
+  send_ntfy swallowed, silently breaking ALL notifications. Emoji titles are sent
+  as RFC 2047 encoded-words (and must round-trip); ASCII titles pass through
+  unchanged.
 * detect_and_notify_new_duplicates:
   - Two identical expense rows → ONE notification; both rows get dup_notified=True.
   - Running again sends NO second notification (no-spam).
@@ -13,12 +19,13 @@ Coverage
   suite; here we confirm the notifier reuses it correctly.
 * POST /api/plaid/webhook with a TRANSACTIONS payload for an unknown item_id →
   200 no-op, no crash (Plaid unconfigured in tests).
-* POST /api/notify/test returns {"sent": bool}.
+* POST /api/notify/test returns {"sent", "topic_configured", "server", "error"}.
 """
 
 from __future__ import annotations
 
 from datetime import date
+from email.header import make_header, decode_header
 
 from src.api import notify
 from src.api.models import Transaction
@@ -101,6 +108,120 @@ class TestSendNtfy:
         monkeypatch.setattr(notify, "_http_post", boom)
         monkeypatch.setenv("NTFY_TOPIC", "t")
         assert notify.send_ntfy("a", "b") is False
+
+
+# ---------------------------------------------------------------------------
+# Header encoding — regression tests for the emoji-Title production bug
+# ---------------------------------------------------------------------------
+
+class TestHeaderEncoding:
+    """http.client encodes HTTP headers as latin-1, so a raw non-ASCII header
+    value raises UnicodeEncodeError before the request leaves the process. That
+    killed every notification in production (send_ntfy swallowed it and returned
+    False). These tests assert on the headers send_ntfy actually builds."""
+
+    EMOJI_TITLE = "⚠️ Possible duplicate charge"
+
+    def _headers_for(self, monkeypatch, title, **kwargs) -> dict:
+        rec = _Recorder()
+        monkeypatch.setattr(notify, "_http_post", rec)
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        assert notify.send_ntfy(title, "Body", **kwargs) is True
+        return rec.calls[0]["headers"]
+
+    def test_all_header_values_are_latin1_encodable(self, monkeypatch):
+        """THE regression assertion — this is what fails on the old code."""
+        headers = self._headers_for(
+            monkeypatch,
+            self.EMOJI_TITLE,
+            tags="warning,café",           # non-ASCII tag
+            click="https://x/dashboard?q=café",
+            priority="high",
+        )
+        for name, value in headers.items():
+            str(value).encode("latin-1")  # raises UnicodeEncodeError if unsafe
+
+    def test_emoji_title_round_trips(self, monkeypatch):
+        """The emoji must survive the wire, not be stripped: decoding the RFC 2047
+        encoded-word gives back the original title."""
+        headers = self._headers_for(monkeypatch, self.EMOJI_TITLE)
+        assert headers["Title"] != self.EMOJI_TITLE  # it IS encoded
+        assert headers["Title"].startswith("=?UTF-8?B?")
+        assert str(make_header(decode_header(headers["Title"]))) == self.EMOJI_TITLE
+
+    def test_non_ascii_tag_round_trips(self, monkeypatch):
+        headers = self._headers_for(monkeypatch, "Plain", tags="warning,café")
+        assert str(make_header(decode_header(headers["Tags"]))) == "warning,café"
+
+    def test_ascii_title_passed_through_unchanged(self, monkeypatch):
+        """Don't needlessly encode — ASCII headers stay human-readable."""
+        headers = self._headers_for(
+            monkeypatch, "Expense Tracker", tags="bar_chart",
+            click="https://x/dashboard", priority="high",
+        )
+        assert headers["Title"] == "Expense Tracker"
+        assert headers["Tags"] == "bar_chart"
+        assert headers["Click"] == "https://x/dashboard"
+        assert headers["Priority"] == "high"
+
+    def test_body_still_utf8_not_encoded_word(self, monkeypatch):
+        """Only headers are latin-1 constrained; the body keeps raw UTF-8."""
+        rec = _Recorder()
+        monkeypatch.setattr(notify, "_http_post", rec)
+        monkeypatch.setenv("NTFY_TOPIC", "my-topic")
+        notify.send_ntfy(self.EMOJI_TITLE, "$100.00 — charged 2×.")
+        assert rec.calls[0]["body"] == "$100.00 — charged 2×.".encode("utf-8")
+
+    def test_encode_header_helper(self):
+        assert notify._encode_header("plain ascii") == "plain ascii"
+        assert notify._encode_header("") == ""
+        assert notify._encode_header("📊 July 2026 recap") == "=?UTF-8?B?" \
+            "8J+TiiBKdWx5IDIwMjYgcmVjYXA=?="
+
+    def test_duplicate_alert_headers_are_latin1_encodable(self, test_session,
+                                                          monkeypatch):
+        """End-to-end through the real duplicate-alert path (its title is the emoji
+        one that broke in production)."""
+        rec = _Recorder()
+        monkeypatch.setattr(notify, "_http_post", rec)
+        monkeypatch.setenv("NTFY_TOPIC", "dupes")
+        _add_expense(test_session)
+        _add_expense(test_session)
+
+        assert notify.detect_and_notify_new_duplicates(test_session) == 1
+        headers = rec.calls[0]["headers"]
+        for value in headers.values():
+            str(value).encode("latin-1")
+        assert str(make_header(decode_header(headers["Title"]))) == self.EMOJI_TITLE
+
+
+# ---------------------------------------------------------------------------
+# send_ntfy_verbose
+# ---------------------------------------------------------------------------
+
+class TestSendNtfyVerbose:
+
+    def test_reports_unset_topic(self, monkeypatch):
+        monkeypatch.delenv("NTFY_TOPIC", raising=False)
+        sent, error = notify.send_ntfy_verbose("t", "m")
+        assert sent is False
+        assert "NTFY_TOPIC" in error
+
+    def test_reports_send_error_without_leaking_topic(self, monkeypatch):
+        def boom(url, body, headers):
+            raise RuntimeError(f"HTTP Error 403: Forbidden ({url})")
+
+        monkeypatch.setattr(notify, "_http_post", boom)
+        monkeypatch.setenv("NTFY_TOPIC", "super-secret-topic")
+        sent, error = notify.send_ntfy_verbose("t", "m")
+        assert sent is False
+        assert "403" in error
+        assert "super-secret-topic" not in error
+
+    def test_success_has_no_error(self, monkeypatch):
+        monkeypatch.setattr(notify, "_http_post", _Recorder())
+        monkeypatch.setenv("NTFY_TOPIC", "t")
+        assert notify.send_ntfy_verbose("t", "m") == (True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -253,3 +374,33 @@ class TestNotifyTestEndpoint:
         body = resp.json()
         assert "sent" in body
         assert body["sent"] is False
+        # Self-diagnosing: says WHY it didn't send.
+        assert body["topic_configured"] is False
+        assert "NTFY_TOPIC" in body["error"]
+        assert body["server"] == "https://ntfy.sh"
+
+    def test_shape_when_configured(self, client, monkeypatch):
+        monkeypatch.setenv("NTFY_TOPIC", "secret-topic")
+        monkeypatch.setenv("NTFY_SERVER", "https://ntfy.example.com")
+        monkeypatch.setattr(notify, "_http_post", _Recorder())
+
+        resp = client.post("/api/notify/test")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["sent"] is True
+        assert body["topic_configured"] is True
+        assert body["error"] is None
+        assert body["server"] == "https://ntfy.example.com"
+        # The topic is a secret — never echoed back.
+        assert "secret-topic" not in resp.text
+
+    def test_reports_error_when_send_fails(self, client, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("network down")
+
+        monkeypatch.setenv("NTFY_TOPIC", "ledger-dupes-9f3a2b71")
+        monkeypatch.setattr(notify, "_http_post", boom)
+        body = client.post("/api/notify/test").json()
+        assert body["sent"] is False
+        assert body["topic_configured"] is True
+        assert body["error"] == "network down"
