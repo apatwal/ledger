@@ -772,6 +772,8 @@ the column — never again. Only rows created **after** the migration can trigge
   (`send_ntfy()` is a no-op returning `False`; no network call). Subscribe to this
   topic in the ntfy mobile app / web.
 - `NTFY_SERVER` — optional self-hosted ntfy base URL (default `https://ntfy.sh`).
+- `NTFY_TOKEN` — ntfy access token (`tk_...`). Unset ⇒ **anonymous** publishing
+  (unchanged behavior). See below — on a shared-IP host this is effectively required.
 - `APP_URL` — optional app base URL; used for the alert's `Click` header
   (deep-links to `{APP_URL}/dashboard`).
 
@@ -780,6 +782,38 @@ the column — never again. Only rows created **after** the migration can trigge
 headers, using `urllib` only (no new dependency; mirrors the Clerk lookup in
 `auth.py`, including a real `User-Agent`). It **never raises** — the actual HTTP send
 is isolated in `notify._http_post` so tests can monkeypatch it.
+
+### Authentication — why `NTFY_TOKEN` is needed on shared-IP hosts (HTTP 429)
+ntfy.sh rate-limits **anonymous** publishing **per source IP**. Render's outbound IPs
+are shared across many tenants, so anonymous sends from production returned
+`HTTP Error 429: Too Many Requests` because of *other people's* traffic — nothing the
+app itself could throttle its way out of. For **authenticated** requests ntfy applies
+its limits **per-account**, so publishing with a token removes the shared-IP problem.
+
+- Setup: free ntfy.sh account → **Account → Access tokens** → generate → set
+  `NTFY_TOKEN` (`sync: false` in `render.yaml`).
+- When set, `send_ntfy_verbose` adds `Authorization: Bearer <token>` to the request
+  headers. When unset it behaves exactly as before (anonymous).
+- **The token is a secret.** `notify._redact(reason, topic, token)` scrubs both the
+  topic and the token out of the returned `error` string **and** out of
+  `logger.warning` output (the log line is the redacted text, never the raw
+  exception — a raw urllib error can echo the request URL or headers). The
+  `Bearer {token}` form is always scrubbed; the bare token is scrubbed under the same
+  `len >= 6` guard the topic uses, which no real `tk_`-prefixed token trips.
+- A 429 gets an **actionable** hint appended to the error: with no token, that
+  ntfy.sh meters anonymous publishing per IP and `NTFY_TOKEN` is the fix; with a
+  token set, that the account's own quota is exhausted.
+
+### Retry policy
+`send_ntfy_verbose` retries **exactly once**, after `notify.RETRY_DELAY_SECONDS`
+(2s), and only for **transient** statuses: **HTTP 429 or any 5xx**. Everything else
+(403 bad token, DNS failure, timeout, `UnicodeEncodeError`) fails on the first
+attempt — a retry would never fix it and would only double the delay. The status is
+read from `HTTPError.code`, falling back to parsing urllib's `HTTP Error NNN` message
+form. Worst-case added latency is therefore one 2s sleep: this runs inside the Plaid
+sync path and must never stall it. The pause is isolated in `notify._sleep` so the
+test suite patches it out and never actually waits. `send_ntfy` still **never
+raises**.
 
 ### `POST /api/plaid/webhook`
 Receives Plaid webhooks. **Always returns HTTP 200 quickly** (even on unknown
@@ -823,12 +857,27 @@ automatically because `PLAID_WEBHOOK_URL` is set on the Link token in
 `POST /api/plaid/link-token`.
 
 ### `POST /api/notify/test` (authed)
-Sends a test ntfy message so you can verify your setup. Returns `{"sent": bool}` —
-`false` when `NTFY_TOPIC` is unset or the send failed.
+Sends a test ntfy message so you can verify your setup. Returns:
+
+```json
+{
+  "sent": false,
+  "topic_configured": true,
+  "token_configured": false,
+  "server": "https://ntfy.sh",
+  "error": "HTTP Error 429: Too Many Requests — ntfy.sh rate-limits ANONYMOUS publishing per source IP, …"
+}
+```
+
+`sent` is `false` when `NTFY_TOPIC` is unset or the send failed, and `error` says
+which. `topic_configured` / `token_configured` are **booleans only** — the topic and
+token values are secrets and are never echoed back; `token_configured` exists so you
+can confirm `NTFY_TOKEN` reached the running process.
 
 ### Config keys
-`NTFY_TOPIC`, `NTFY_SERVER` (optional), `PLAID_WEBHOOK_URL`, `APP_URL` — all declared
-`sync: false` in `render.yaml` and present (blank, commented) in `.env.example`.
+`NTFY_TOPIC`, `NTFY_SERVER` (optional), `NTFY_TOKEN`, `PLAID_WEBHOOK_URL`, `APP_URL`
+— all declared `sync: false` in `render.yaml` and present (blank, commented) in
+`.env.example`.
 
 ---
 
