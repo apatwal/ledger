@@ -64,6 +64,40 @@ function syncSummary(r: PlaidSyncResult): string {
   return `Sync complete${acrossItems}: ${parts.join(', ')}.`
 }
 
+// A sync that hits a broken bank still resolves 200 with the failures listed, so
+// the summary has to call them out — otherwise a partial sync reads as a clean one.
+function syncFailureNote(r: PlaidSyncResult): string | null {
+  const errs = r.errors ?? []
+  if (errs.length === 0) return null
+  const names = errs.map((e) => e.institution ?? 'a bank')
+  const who = names.length === 1 ? names[0] : `${names.length} banks`
+  return `${who} couldn't sync — reconnect ${names.length === 1 ? 'it' : 'them'} below.`
+}
+
+// Plaid's error codes, in words a person can act on.
+function errorHeadline(item: PlaidItem): string {
+  switch (item.error_code) {
+    case 'NO_ACCOUNTS':
+      return 'No eligible accounts were selected for this bank. Reconnect and tick the accounts you want synced.'
+    case 'ITEM_LOGIN_REQUIRED':
+    case 'ITEM_LOCKED':
+      return 'This bank needs you to sign in again before it can sync.'
+    case 'INSUFFICIENT_CREDENTIALS':
+    case 'INVALID_CREDENTIALS':
+    case 'INVALID_MFA':
+      return 'Your saved credentials for this bank are no longer valid. Reconnect to fix it.'
+    default:
+      return item.error_message || 'This bank stopped syncing. Reconnect to fix it.'
+  }
+}
+
+// Short chip text for the card corner — the code reads as jargon, so map the
+// common ones and fall back to a neutral nudge.
+function errorChip(item: PlaidItem): string {
+  if (item.status?.toLowerCase() !== 'error') return item.status
+  return item.error_code === 'NO_ACCOUNTS' ? 'No accounts' : 'Reconnect'
+}
+
 // Nicely-cased account type/subtype for the little card chip.
 function typeLabel(a: PlaidAccount): string {
   const raw = (a.subtype || a.type || 'account').replace(/_/g, ' ')
@@ -169,6 +203,9 @@ export default function PlaidConnect() {
   // keeps the old handler (and `ready`) around until the new token's handler is
   // built, so we only auto-open once `open` has actually changed away from this.
   const openAtRequest = useRef<Function | null>(null)
+  // Which item the in-flight Link session is REPAIRING (update mode), or null for
+  // a brand-new link. Decides whether onSuccess exchanges the public_token.
+  const reconnectId = useRef<number | null>(null)
 
   // Per-action state
   const [syncingId, setSyncingId] = useState<number | 'all' | null>(null)
@@ -183,18 +220,35 @@ export default function PlaidConnect() {
   // ─── Link success → exchange → first sync ──────────────────────────────────
   const onLinkSuccess = useCallback(
     async (publicToken: string, _metadata: PlaidLinkOnSuccessMetadata) => {
+      const repairing = reconnectId.current
+      reconnectId.current = null
       setLinkToken(null)
       setPendingOpen(false)
       setFinishing(true)
       setMsg(null)
       setActionError(null)
       try {
-        const item = await exchangePlaidPublicToken(publicToken)
-        const res = await plaidSync(item.id)
-        setMsg(`Connected ${item.institution_name ?? 'your bank'}. ${syncSummary(res)}`)
+        if (repairing !== null) {
+          // Update mode keeps the SAME item and access_token, so there is nothing
+          // to exchange — re-syncing is what clears the item's error status and
+          // pulls in any account the user just ticked.
+          const res = await plaidSync(repairing)
+          const failed = syncFailureNote(res)
+          setMsg(failed ? `Reconnected, but ${failed}` : `Reconnected. ${syncSummary(res)}`)
+        } else {
+          const item = await exchangePlaidPublicToken(publicToken)
+          const res = await plaidSync(item.id)
+          setMsg(`Connected ${item.institution_name ?? 'your bank'}. ${syncSummary(res)}`)
+        }
         refresh()
       } catch (e) {
-        setActionError(e instanceof Error ? e.message : 'Could not finish connecting your bank')
+        setActionError(
+          e instanceof Error
+            ? e.message
+            : repairing !== null
+              ? 'Could not finish reconnecting your bank'
+              : 'Could not finish connecting your bank',
+        )
       } finally {
         setFinishing(false)
       }
@@ -209,6 +263,7 @@ export default function PlaidConnect() {
       // User bailed out of Link; drop the one-shot token and cancel the pending open.
       setLinkToken(null)
       setPendingOpen(false)
+      reconnectId.current = null
     },
   })
 
@@ -225,17 +280,26 @@ export default function PlaidConnect() {
     }
   }, [pendingOpen, ready, linkToken, open])
 
-  async function handleConnect() {
+  // itemId set => UPDATE mode: repair an existing bank rather than link a new one.
+  async function handleConnect(itemId?: number) {
     setPreparing(true)
     setActionError(null)
     setMsg(null)
     try {
-      const { link_token } = await createPlaidLinkToken()
+      const { link_token } = await createPlaidLinkToken(itemId)
+      reconnectId.current = itemId ?? null
       openAtRequest.current = open // remember the current (soon-to-be-stale) handler
       setPendingOpen(true)
       setLinkToken(link_token)
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Could not start bank connection')
+      reconnectId.current = null
+      setActionError(
+        e instanceof Error
+          ? e.message
+          : itemId !== undefined
+            ? 'Could not start reconnecting this bank'
+            : 'Could not start bank connection',
+      )
     } finally {
       setPreparing(false)
     }
@@ -247,7 +311,11 @@ export default function PlaidConnect() {
     setMsg(null)
     try {
       const res = await plaidSync(itemId)
+      // A broken bank no longer fails the request, so a 200 can still carry
+      // failures — report them instead of claiming a clean sync.
+      const failed = syncFailureNote(res)
       setMsg(syncSummary(res))
+      setActionError(failed)
       refresh()
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Sync failed')
@@ -414,6 +482,7 @@ export default function PlaidConnect() {
                 confirming={confirmId === item.id}
                 disabled={syncingId !== null || busy}
                 onSync={() => void handleSync(item.id)}
+                onReconnect={() => void handleConnect(item.id)}
                 onAskDisconnect={() => setConfirmId(item.id)}
                 onCancelDisconnect={() => setConfirmId(null)}
                 onConfirmDisconnect={() => void handleDisconnect(item.id)}
@@ -487,7 +556,7 @@ function NetWorthPanel({
 
 function WalletCard({
   item, account, rot, z, syncing, removing, confirming, disabled,
-  onSync, onAskDisconnect, onCancelDisconnect, onConfirmDisconnect,
+  onSync, onReconnect, onAskDisconnect, onCancelDisconnect, onConfirmDisconnect,
 }: {
   item: PlaidItem
   account: PlaidAccount
@@ -498,6 +567,7 @@ function WalletCard({
   confirming: boolean
   disabled: boolean
   onSync: () => void
+  onReconnect: () => void
   onAskDisconnect: () => void
   onCancelDisconnect: () => void
   onConfirmDisconnect: () => void
@@ -507,6 +577,9 @@ function WalletCard({
   const nick = cleanNick(account)
   const bal = account.current ?? account.available
   const degraded = item.status && item.status.toLowerCase() !== 'active' && item.status.toLowerCase() !== 'good'
+  // A recorded sync failure is fixable by the user: swap Sync for Reconnect,
+  // which reopens Link in update mode against this very item.
+  const broken = item.status?.toLowerCase() === 'error'
 
   const style = {
     '--card-bg1': theme.bg1,
@@ -534,12 +607,17 @@ function WalletCard({
           <span className="wallet-card-monogram" aria-hidden>{inst.charAt(0)}</span>
         )}
         <span className="wallet-card-inst">{inst}</span>
-        {degraded && <span className="wallet-card-degraded" title={`Item status: ${item.status}`}>{item.status}</span>}
+        {degraded && (
+          <span className="wallet-card-degraded" title={broken ? errorHeadline(item) : `Item status: ${item.status}`}>
+            {errorChip(item)}
+          </span>
+        )}
         <span className="wallet-card-type">{typeLabel(account)}</span>
       </div>
 
       <div className="wallet-card-nick">{nick}</div>
       {account.mask && <div className="wallet-card-mask">•••• •••• {account.mask}</div>}
+      {broken && <div className="wallet-card-error">{errorHeadline(item)}</div>}
 
       {/* Foot — balance + actions. Tucked into the pocket at rest; the lift reveals it. */}
       <div className="wallet-card-foot">
@@ -561,15 +639,27 @@ function WalletCard({
             </>
           ) : (
             <>
-              <button
-                className="wallet-cbtn"
-                onClick={onSync}
-                disabled={disabled || syncing}
-                title={`Pull the latest transactions from ${inst}`}
-              >
-                {syncing ? <span className="spinner" style={{ width: 12, height: 12 }} /> : <RefreshCw size={12} />}
-                Sync
-              </button>
+              {broken ? (
+                <button
+                  className="wallet-cbtn warn"
+                  onClick={onReconnect}
+                  disabled={disabled}
+                  title={errorHeadline(item)}
+                >
+                  <Link2 size={12} />
+                  Reconnect
+                </button>
+              ) : (
+                <button
+                  className="wallet-cbtn"
+                  onClick={onSync}
+                  disabled={disabled || syncing}
+                  title={`Pull the latest transactions from ${inst}`}
+                >
+                  {syncing ? <span className="spinner" style={{ width: 12, height: 12 }} /> : <RefreshCw size={12} />}
+                  Sync
+                </button>
+              )}
               <button
                 className="wallet-cbtn ghost"
                 onClick={onAskDisconnect}

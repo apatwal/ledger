@@ -72,6 +72,12 @@ class PlaidItem(Base):
     accounts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     cursor: Mapped[str | None] = mapped_column(String(512), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    # v13: why this item last failed to sync. Written when a per-item sync raises
+    # (`status` flips to "error") and cleared on the next successful sync, so the
+    # wallet can tell a healthy bank from one that needs re-linking. `error_code`
+    # is Plaid's own code — NO_ACCOUNTS, ITEM_LOGIN_REQUIRED, etc.
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 

@@ -34,6 +34,7 @@ from ..schemas import (
     PlaidItemOut,
     PlaidStatus,
     ExchangeRequest,
+    LinkTokenRequest,
     PlaidSyncRequest,
     PlaidSyncResult,
     HoldingOut,
@@ -169,6 +170,8 @@ def _item_to_out(item: PlaidItem) -> PlaidItemOut:
         institution_color=item.institution_color,
         accounts=account_list,
         status=item.status,
+        error_code=item.error_code,
+        error_message=item.error_message,
         last_synced_at=item.last_synced_at,
         created_at=item.created_at,
     )
@@ -177,6 +180,66 @@ def _item_to_out(item: PlaidItem) -> PlaidItemOut:
 def _plaid_error(e: Exception) -> HTTPException:
     """Map a Plaid SDK / network error to a 502 (never leak the access_token)."""
     return HTTPException(502, f"Plaid request failed: {e}")
+
+
+# Longest error text we persist/return. A raw plaid.ApiException stringifies to
+# the whole response INCLUDING the header dump, which is useless in a UI.
+_ERR_MAX = 400
+
+
+def _plaid_error_details(e: Exception) -> tuple[str | None, str]:
+    """Pull (error_code, human-readable message) out of a Plaid SDK exception.
+    The SDK hangs the JSON error envelope off `e.body`, so prefer `display_message`
+    (written for end users) then `error_message`. Anything we can't parse — network
+    errors, SDK bugs — falls back to a trimmed str(e). Never touches the
+    access_token, which Plaid does not echo back in error bodies."""
+    body = getattr(e, "body", None)
+    if body:
+        try:
+            raw = body if isinstance(body, str) else body.decode("utf-8")
+            data = json.loads(raw)
+        except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
+            data = None
+        if isinstance(data, dict):
+            code = data.get("error_code")
+            msg = data.get("display_message") or data.get("error_message") or code
+            if code or msg:
+                return (
+                    str(code) if code else None,
+                    str(msg)[:_ERR_MAX] if msg else "Plaid request failed",
+                )
+    return (None, str(e)[:_ERR_MAX])
+
+
+def _record_item_failure(
+    db: Session, item_id: int, institution: str | None, e: Exception
+) -> dict:
+    """Roll back one item's partial sync and persist WHY it failed (v13).
+
+    `last_synced_at` is deliberately NOT touched — it must keep reading as the
+    last time this bank actually synced, not the last time we tried. The rollback
+    also discards the un-advanced `cursor`, so the next successful sync re-reads
+    the same page rather than skipping transactions. Bookkeeping is itself
+    best-effort: a failure here must never abort the items still to be synced."""
+    code, message = _plaid_error_details(e)
+    print(f"[plaid] item {item_id} ({institution or 'unknown'}) sync failed: {code or message}")
+    try:
+        db.rollback()
+        item = db.get(PlaidItem, item_id)
+        if item is not None:
+            item.status = "error"
+            item.error_code = code
+            item.error_message = message
+            db.commit()
+    except Exception as inner:
+        db.rollback()
+        print(f"[plaid] could not record failure for item {item_id}: {inner}")
+    return {
+        "item_id": item_id,
+        "institution": institution,
+        "error_code": code,
+        "message": message,
+    }
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -194,16 +257,59 @@ def status(db: Session = Depends(get_db)):
 
 
 @router.post("/link-token")
-def create_link_token():
-    """Create a Link token to open Plaid Link on the client. 503 if unconfigured."""
+def create_link_token(
+    body: LinkTokenRequest | None = None, db: Session = Depends(get_db)
+):
+    """Create a Link token to open Plaid Link on the client. 503 if unconfigured.
+
+    Two modes:
+      * NEW LINK (no body / item_id null) — the normal "connect a bank" flow.
+      * UPDATE MODE (item_id given, v13) — re-authenticate an EXISTING item with
+        account selection re-opened. This is the fix for an item stuck on
+        NO_ACCOUNTS (no transactions-eligible account was selected at Link time)
+        and for ITEM_LOGIN_REQUIRED. The access_token survives, so the client has
+        nothing to exchange afterwards — it just re-syncs.
+    """
     _require_configured()
     from plaid.model.link_token_create_request import LinkTokenCreateRequest
     from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
+    from plaid.model.link_token_create_request_update import LinkTokenCreateRequestUpdate
     from plaid.model.link_token_transactions import LinkTokenTransactions
     from plaid.model.products import Products
     from plaid.model.country_code import CountryCode
 
     client = plaid_client.get_client()
+
+    update_item = None
+    if body is not None and body.item_id is not None:
+        update_item = db.get(PlaidItem, body.item_id)
+        if update_item is None:
+            raise HTTPException(404, f"Plaid item {body.item_id} not found")
+
+    if update_item is not None:
+        # Update mode: `products` MUST be omitted (Plaid rejects it alongside an
+        # access_token) — the item's products are already fixed. The webhook and
+        # redirect_uri still apply.
+        kwargs = dict(
+            client_name=CLIENT_NAME,
+            country_codes=[CountryCode(c) for c in plaid_client.get_country_codes()],
+            language="en",
+            user=LinkTokenCreateRequestUser(client_user_id=CLIENT_USER_ID),
+            access_token=update_item.access_token,
+            update=LinkTokenCreateRequestUpdate(account_selection_enabled=True),
+        )
+        webhook_url = _webhook_url()
+        if webhook_url:
+            kwargs["webhook"] = webhook_url
+        redirect_uri = plaid_client.get_redirect_uri()
+        if redirect_uri:
+            kwargs["redirect_uri"] = redirect_uri
+        try:
+            resp = client.link_token_create(LinkTokenCreateRequest(**kwargs))
+        except Exception as e:
+            raise _plaid_error(e)
+        data = resp.to_dict()
+        return {"link_token": data.get("link_token"), "expiration": data.get("expiration")}
 
     # Plaid requires the chosen institution to support EVERY product in `products`,
     # so requesting "investments" up front rejects credit-card/bank-only banks with
@@ -316,6 +422,9 @@ def exchange_public_token(body: ExchangeRequest, db: Session = Depends(get_db)):
         existing.institution_color = institution_color
         existing.accounts_json = json.dumps(accounts)
         existing.status = "active"
+        # A successful re-link clears any recorded failure (v13).
+        existing.error_code = None
+        existing.error_message = None
         item = existing
     else:
         item = PlaidItem(
@@ -489,7 +598,13 @@ def _delete_transaction(db: Session, plaid_transaction_id: str) -> bool:
 def sync_items(db: Session, item_id: int | None = None) -> dict:
     """Sync one item (item_id given) or ALL items. Reused by the route AND the
     scheduler. Assumes Plaid is configured (callers gate first). Returns a dict
-    matching PlaidSyncResult: items_synced, added, modified, removed."""
+    matching PlaidSyncResult: items_synced, added, modified, removed, errors.
+
+    ERROR ISOLATION (v13): every item syncs inside its OWN try/except, so a single
+    broken institution — NO_ACCOUNTS, ITEM_LOGIN_REQUIRED, a transient Plaid 5xx —
+    can no longer abort the run and starve every item ordered after it. The failing
+    item is rolled back and marked status="error" with Plaid's code; healthy items
+    still sync and commit, and the caller gets the failures in `errors`."""
     client = plaid_client.get_client()
 
     stmt = select(PlaidItem)
@@ -502,28 +617,38 @@ def sync_items(db: Session, item_id: int | None = None) -> dict:
 
     items_synced = 0
     added = modified = removed = 0
+    errors: list[dict] = []
     for item in items:
-        # v9: refresh per-account balances (best-effort — never fails the sync).
-        _refresh_account_balances(client, item)
-
-        txn_res = _sync_transactions_for_item(client, db, item, savings_labels)
-        added += txn_res["added"]
-        modified += txn_res["modified"]
-        removed += txn_res["removed"]
-
-        # Investments are best-effort: an item without the investments product
-        # raises PRODUCT_NOT_READY/NOT_SUPPORTED — skip it, don't fail the sync.
+        # Capture identity UP FRONT: the failure path rolls back, which expires the
+        # ORM object, and we still need to name the bank that broke.
+        iid, inst = item.id, item.institution_name
         try:
-            inv_res = _sync_investments_for_item(client, db, item)
-            added += inv_res["added"]
-            modified += inv_res["modified"]
-        except Exception:
-            pass
+            # v9: refresh per-account balances (best-effort — never fails the sync).
+            _refresh_account_balances(client, item)
 
-        item.last_synced_at = datetime.utcnow()
-        item.status = "active"
-        items_synced += 1
-        db.commit()
+            txn_res = _sync_transactions_for_item(client, db, item, savings_labels)
+            added += txn_res["added"]
+            modified += txn_res["modified"]
+            removed += txn_res["removed"]
+
+            # Investments are best-effort: an item without the investments product
+            # raises PRODUCT_NOT_READY/NOT_SUPPORTED — skip it, don't fail the sync.
+            try:
+                inv_res = _sync_investments_for_item(client, db, item)
+                added += inv_res["added"]
+                modified += inv_res["modified"]
+            except Exception:
+                pass
+
+            item.last_synced_at = datetime.utcnow()
+            item.status = "active"
+            # Recovered: drop any stale failure so the wallet stops nagging.
+            item.error_code = None
+            item.error_message = None
+            items_synced += 1
+            db.commit()
+        except Exception as e:
+            errors.append(_record_item_failure(db, iid, inst, e))
 
     # v11: record a portfolio snapshot on every sync (best-effort — a snapshot
     # failure must NEVER break the sync). Both /plaid/sync and /plaid/sync-all
@@ -550,6 +675,7 @@ def sync_items(db: Session, item_id: int | None = None) -> dict:
         "added": added,
         "modified": modified,
         "removed": removed,
+        "errors": errors,
     }
 
 

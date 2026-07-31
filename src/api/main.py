@@ -283,6 +283,14 @@ def _migrate_add_v9_enrichment_columns() -> None:
     _add_column_if_missing("plaid_items", "institution_color", "VARCHAR")
 
 
+def _migrate_add_item_error_columns() -> None:
+    """v13 migration: add per-item sync-failure columns to plaid_items (portable).
+    Existing rows get NULLs, which read as "no known failure" — correct, since a
+    healthy item carries no error and the next sync writes one if it breaks."""
+    _add_column_if_missing("plaid_items", "error_code", "VARCHAR")
+    _add_column_if_missing("plaid_items", "error_message", "VARCHAR")
+
+
 def seed_data(db: Session) -> None:
     """Insert ~19 realistic transactions if the table is empty."""
     count = db.execute(sqlalchemy.text("SELECT COUNT(*) FROM transactions")).scalar()
@@ -364,6 +372,7 @@ def startup():
     _migrate_add_dup_notified_column()    # v12: ensure transactions.dup_notified exists (+ retro-backfill)
     _migrate_add_plaid_columns()          # v8: ensure transactions.plaid_* columns exist
     _migrate_add_v9_enrichment_columns()  # v9: ensure enrichment + branding columns exist
+    _migrate_add_item_error_columns()      # v13: ensure plaid_items.error_* columns exist
     # Auto-seeding is OPT-IN. By default the DB starts empty so real user data
     # is never re-created on restart. Set SEED_DB=1 (for dev/demo) to seed the
     # sample transactions into an empty DB.

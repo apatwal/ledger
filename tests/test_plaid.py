@@ -68,6 +68,50 @@ class FakeSyncClient:
         raise RuntimeError("investments product not available for this item")
 
 
+class _FakeApiException(Exception):
+    """Shaped like plaid.ApiException: the JSON error envelope hangs off `.body`,
+    and str() is the noisy status+headers+body dump the real SDK produces."""
+
+    def __init__(self, body: str):
+        super().__init__(f"(400)\nReason: Bad Request\nHTTP response body: {body}")
+        self.body = body
+
+
+NO_ACCOUNTS_BODY = json.dumps({
+    "display_message": "No valid accounts were found at the financial institution.",
+    "error_code": "NO_ACCOUNTS",
+    "error_message": "no valid accounts were found for this item",
+    "error_type": "ITEM_ERROR",
+    "request_id": "req-1",
+})
+
+
+class FakeMixedClient:
+    """Fake PlaidApi where SOME access_tokens raise an item-level Plaid error and
+    the rest sync normally — the real-world "one bank is broken" case."""
+
+    def __init__(self, page: dict, failing_tokens: set[str], body: str = NO_ACCOUNTS_BODY):
+        self._page = page
+        self._failing = failing_tokens
+        self._body = body
+        self.synced_tokens: list[str] = []
+
+    def transactions_sync(self, req):
+        if req.access_token in self._failing:
+            raise _FakeApiException(self._body)
+        self.synced_tokens.append(req.access_token)
+        return _Resp(self._page)
+
+    def accounts_get(self, req):
+        # A NO_ACCOUNTS item fails here too; the balance refresh swallows it.
+        if req.access_token in self._failing:
+            raise _FakeApiException(self._body)
+        return _Resp({"accounts": []})
+
+    def investments_transactions_get(self, req):
+        raise RuntimeError("investments product not available for this item")
+
+
 class _ExchangeResp:
     def __init__(self, access_token: str, item_id: str):
         self.access_token = access_token
@@ -404,7 +448,9 @@ class TestSyncItems:
 
         result = sync_items(test_session, item.id)
 
-        assert result == {"items_synced": 1, "added": 2, "modified": 0, "removed": 0}
+        assert result == {
+            "items_synced": 1, "added": 2, "modified": 0, "removed": 0, "errors": [],
+        }
 
         txns = test_session.query(Transaction).order_by(Transaction.plaid_transaction_id).all()
         assert len(txns) == 2
@@ -483,12 +529,189 @@ class TestSyncItems:
 
         resp = client.post("/api/plaid/sync", json={"item_id": item.id})
         assert resp.status_code == 200
-        assert resp.json() == {"items_synced": 1, "added": 1, "modified": 0, "removed": 0}
+        assert resp.json() == {
+            "items_synced": 1, "added": 1, "modified": 0, "removed": 0, "errors": [],
+        }
 
     def test_sync_route_bad_item_404(self, client, monkeypatch):
         _configure(monkeypatch)
         monkeypatch.setattr(plaid_client, "get_client", lambda: FakeSyncClient([_sync_page()]))
         assert client.post("/api/plaid/sync", json={"item_id": 99999}).status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4b. Per-item error isolation (v13) — one broken bank must not abort the run.
+#     Regression guard for the NO_ACCOUNTS 502: sync_items used to raise out of
+#     the loop, so every item ordered AFTER the bad one was silently skipped and
+#     POST /plaid/sync-all returned 502 with no clue which bank was at fault.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSyncErrorIsolation:
+
+    def test_failing_item_does_not_starve_later_items(self, test_session, monkeypatch):
+        bad = _seed_item(test_session, item_id="item-bad", access_token="tok-bad")
+        _seed_item(test_session, item_id="item-good-1", access_token="tok-good-1")
+        _seed_item(test_session, item_id="item-good-2", access_token="tok-good-2")
+
+        fake = FakeMixedClient(
+            _sync_page(added=[_plaid_txn("FOOD_AND_DRINK", 6.25, txn_id="p-food")]),
+            failing_tokens={"tok-bad"},
+        )
+        monkeypatch.setattr(plaid_client, "get_client", lambda: fake)
+
+        result = sync_items(test_session)
+
+        # The failure is FIRST in id order, yet both healthy banks still synced.
+        assert result["items_synced"] == 2
+        assert sorted(fake.synced_tokens) == ["tok-good-1", "tok-good-2"]
+
+        assert len(result["errors"]) == 1
+        err = result["errors"][0]
+        assert err["item_id"] == bad.id
+        assert err["error_code"] == "NO_ACCOUNTS"
+        assert err["institution"] == "Test Bank"
+        # The end-user display_message, not the raw header dump.
+        assert err["message"] == "No valid accounts were found at the financial institution."
+
+        test_session.refresh(bad)
+        assert bad.status == "error"
+        assert bad.error_code == "NO_ACCOUNTS"
+
+    def test_failure_preserves_last_synced_at_and_cursor(self, test_session, monkeypatch):
+        item = _seed_item(test_session)
+        page = _sync_page(
+            added=[_plaid_txn("FOOD_AND_DRINK", 6.25, txn_id="p-food")], cursor="cursor-1",
+        )
+        monkeypatch.setattr(plaid_client, "get_client", lambda: FakeSyncClient([page]))
+        sync_items(test_session, item.id)
+        test_session.refresh(item)
+        synced_at, cursor = item.last_synced_at, item.cursor
+        assert cursor == "cursor-1" and synced_at is not None
+
+        # The same item now fails.
+        monkeypatch.setattr(
+            plaid_client, "get_client",
+            lambda: FakeMixedClient(page, failing_tokens={item.access_token}),
+        )
+        result = sync_items(test_session, item.id)
+
+        assert result["items_synced"] == 0 and len(result["errors"]) == 1
+        test_session.refresh(item)
+        assert item.status == "error"
+        # The stamp still reads as the last SUCCESSFUL sync, not the last attempt,
+        # and the cursor never advanced — so no transactions get skipped on retry.
+        assert item.last_synced_at == synced_at
+        assert item.cursor == cursor
+        assert test_session.query(Transaction).count() == 1  # earlier data intact
+
+    def test_successful_resync_clears_the_error(self, test_session, monkeypatch):
+        item = _seed_item(test_session)
+        page = _sync_page(added=[_plaid_txn("FOOD_AND_DRINK", 6.25, txn_id="p-food")])
+        monkeypatch.setattr(
+            plaid_client, "get_client",
+            lambda: FakeMixedClient(page, failing_tokens={item.access_token}),
+        )
+        sync_items(test_session, item.id)
+        test_session.refresh(item)
+        assert item.status == "error" and item.error_code == "NO_ACCOUNTS"
+
+        monkeypatch.setattr(plaid_client, "get_client", lambda: FakeSyncClient([page]))
+        result = sync_items(test_session, item.id)
+
+        assert result["errors"] == [] and result["items_synced"] == 1
+        test_session.refresh(item)
+        assert item.status == "active"
+        assert item.error_code is None and item.error_message is None
+
+    def test_non_plaid_exception_is_isolated_too(self, test_session, monkeypatch):
+        """A network/unexpected error carries no Plaid envelope — it still gets
+        isolated, with a null error_code instead of crashing the run."""
+        item = _seed_item(test_session)
+
+        class Boom:
+            def accounts_get(self, req):
+                raise RuntimeError("connection reset by peer")
+
+            def transactions_sync(self, req):
+                raise RuntimeError("connection reset by peer")
+
+            def investments_transactions_get(self, req):
+                raise RuntimeError("nope")
+
+        monkeypatch.setattr(plaid_client, "get_client", lambda: Boom())
+        result = sync_items(test_session, item.id)
+
+        assert result["items_synced"] == 0
+        assert result["errors"][0]["error_code"] is None
+        assert "connection reset by peer" in result["errors"][0]["message"]
+        test_session.refresh(item)
+        assert item.status == "error"
+
+    def test_sync_all_route_returns_200_not_502(self, client, test_session, monkeypatch):
+        """THE regression: a NO_ACCOUNTS item used to 502 the whole endpoint."""
+        _configure(monkeypatch)
+        bad = _seed_item(test_session, item_id="item-bad", access_token="tok-bad")
+        _seed_item(test_session, item_id="item-good", access_token="tok-good")
+        page = _sync_page(added=[_plaid_txn("FOOD_AND_DRINK", 6.25, txn_id="p-food")])
+        monkeypatch.setattr(
+            plaid_client, "get_client",
+            lambda: FakeMixedClient(page, failing_tokens={"tok-bad"}),
+        )
+
+        resp = client.post("/api/plaid/sync-all")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["items_synced"] == 1
+        assert data["added"] == 1
+        assert [e["error_code"] for e in data["errors"]] == ["NO_ACCOUNTS"]
+        assert data["errors"][0]["item_id"] == bad.id
+
+    def test_link_token_update_mode_targets_the_item(self, client, test_session, monkeypatch):
+        """POST /plaid/link-token {item_id} builds an UPDATE-mode token: bound to
+        that item's access_token, account selection re-opened, and NO `products`
+        (Plaid rejects products alongside an access_token)."""
+        _configure(monkeypatch)
+        item = _seed_item(test_session, access_token="tok-repair-me")
+        seen = {}
+
+        class FakeLinkClient:
+            def link_token_create(self, req):
+                seen["req"] = req
+                return _Resp({"link_token": "link-sandbox-update", "expiration": "2026-08-01T00:00:00Z"})
+
+        monkeypatch.setattr(plaid_client, "get_client", lambda: FakeLinkClient())
+
+        resp = client.post("/api/plaid/link-token", json={"item_id": item.id})
+
+        assert resp.status_code == 200
+        assert resp.json()["link_token"] == "link-sandbox-update"
+        req = seen["req"]
+        assert req.access_token == "tok-repair-me"
+        assert req.update.account_selection_enabled is True
+        assert "products" not in req.to_dict()
+
+    def test_link_token_unknown_item_404(self, client, monkeypatch):
+        _configure(monkeypatch)
+        monkeypatch.setattr(plaid_client, "get_client", lambda: object())
+        assert client.post("/api/plaid/link-token", json={"item_id": 99999}).status_code == 404
+
+    def test_item_error_surfaces_on_status_route(self, client, test_session, monkeypatch):
+        """The wallet reads the failure off GET /plaid/status to offer a reconnect."""
+        _configure(monkeypatch)
+        item = _seed_item(test_session)
+        page = _sync_page()
+        monkeypatch.setattr(
+            plaid_client, "get_client",
+            lambda: FakeMixedClient(page, failing_tokens={item.access_token}),
+        )
+        client.post("/api/plaid/sync-all")
+
+        body = client.get("/api/plaid/status").json()
+        entry = next(i for i in body["items"] if i["id"] == item.id)
+        assert entry["status"] == "error"
+        assert entry["error_code"] == "NO_ACCOUNTS"
+        assert "No valid accounts" in entry["error_message"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
