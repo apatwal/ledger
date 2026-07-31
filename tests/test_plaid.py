@@ -28,10 +28,34 @@ from datetime import date
 
 import pytest
 
+import sqlalchemy
+
 from src.api import plaid_client
 from src.api.plaid_mapping import map_transaction, map_investment_transaction
 from src.api.models import PlaidItem, Transaction
+from src.api.routes import plaid_routes
 from src.api.routes.plaid_routes import sync_items
+
+
+# The unique partial index makes duplicate Plaid rows un-insertable, which is the
+# point — so tests that need to reproduce the PRE-migration corruption have to
+# drop it first, seed the duplicates, and (where relevant) let the migration or
+# the self-healing upsert put things right.
+UX_INDEX = "ux_transactions_plaid_transaction_id"
+
+
+def _drop_unique_index(engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(sqlalchemy.text(f"DROP INDEX IF EXISTS {UX_INDEX}"))
+
+
+def _index_names(engine) -> set[str]:
+    with engine.begin() as conn:
+        return {
+            r[0] for r in conn.execute(sqlalchemy.text(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='transactions'"
+            ))
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -667,6 +691,41 @@ class TestSyncErrorIsolation:
         assert [e["error_code"] for e in data["errors"]] == ["NO_ACCOUNTS"]
         assert data["errors"][0]["item_id"] == bad.id
 
+    def test_concurrent_sync_is_rejected_not_raced(self, client, test_session, monkeypatch):
+        """Second caller gets 409 instead of racing the first into duplicate rows."""
+        _configure(monkeypatch)
+        _seed_item(test_session)
+        monkeypatch.setattr(plaid_routes, "_SYNC_LOCK_TIMEOUT", 0.05)
+        acquired = plaid_routes._sync_lock.acquire(timeout=1)
+        assert acquired
+        try:
+            resp = client.post("/api/plaid/sync-all")
+        finally:
+            plaid_routes._sync_lock.release()
+
+        assert resp.status_code == 409
+        assert "already running" in resp.json()["detail"]
+
+    def test_lock_is_released_after_a_failing_sync(self, test_session, monkeypatch):
+        """A sync that blows up must not wedge the lock for every later sync."""
+        item = _seed_item(test_session)
+
+        class Boom:
+            def accounts_get(self, req):
+                raise RuntimeError("boom")
+
+            def transactions_sync(self, req):
+                raise RuntimeError("boom")
+
+            def investments_transactions_get(self, req):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(plaid_client, "get_client", lambda: Boom())
+        sync_items(test_session, item.id)
+
+        assert plaid_routes._sync_lock.acquire(blocking=False), "lock was left held"
+        plaid_routes._sync_lock.release()
+
     def test_link_token_update_mode_targets_the_item(self, client, test_session, monkeypatch):
         """POST /plaid/link-token {item_id} builds an UPDATE-mode token: bound to
         that item's access_token, account selection re-opened, and NO `products`
@@ -712,6 +771,123 @@ class TestSyncErrorIsolation:
         assert entry["status"] == "error"
         assert entry["error_code"] == "NO_ACCOUNTS"
         assert "No valid accounts" in entry["error_message"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4c. Duplicate Plaid rows (v13). Concurrent syncs used to insert the same
+#     plaid_transaction_id twice — double-counting the charge in every stat, then
+#     breaking that item's sync for good once the upsert's one-or-none lookup
+#     started raising MultipleResultsFound (surfaced as a bogus 502 from Plaid).
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPlaidDuplicateRows:
+
+    def _seed_duplicate_pair(self, session, pid="p-dupe"):
+        """Two rows for ONE Plaid transaction — only possible pre-index."""
+        for _ in range(2):
+            session.add(Transaction(
+                date=date(2026, 6, 1), amount=6.25, type="expense", category="Food & Drink",
+                description="Starbucks", account="My Checking", source="plaid",
+                plaid_transaction_id=pid,
+            ))
+        session.commit()
+
+    def test_unique_index_blocks_a_second_insert(self, test_session):
+        """The DB itself now refuses the duplicate that races used to create."""
+        test_session.add(Transaction(
+            date=date(2026, 6, 1), amount=6.25, type="expense", category="Food & Drink",
+            account="My Checking", source="plaid", plaid_transaction_id="p-solo",
+        ))
+        test_session.commit()
+
+        test_session.add(Transaction(
+            date=date(2026, 6, 1), amount=6.25, type="expense", category="Food & Drink",
+            account="My Checking", source="plaid", plaid_transaction_id="p-solo",
+        ))
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            test_session.commit()
+        test_session.rollback()
+
+    def test_manual_rows_are_unaffected_by_the_index(self, test_session):
+        """Manual/CSV rows all carry a NULL plaid id — NULLs must never collide."""
+        for _ in range(3):
+            test_session.add(Transaction(
+                date=date(2026, 6, 1), amount=10.0, type="expense",
+                category="Groceries", source="manual",
+            ))
+        test_session.commit()
+        assert test_session.query(Transaction).count() == 3
+
+    def test_upsert_heals_existing_duplicates_instead_of_raising(
+        self, test_engine, test_session, monkeypatch,
+    ):
+        """An un-migrated DB must recover on its own rather than 502 forever."""
+        _drop_unique_index(test_engine)
+        item = _seed_item(test_session)
+        self._seed_duplicate_pair(test_session)
+        assert test_session.query(Transaction).count() == 2
+
+        page = _sync_page(added=[_plaid_txn("FOOD_AND_DRINK", 6.25, txn_id="p-dupe")])
+        monkeypatch.setattr(plaid_client, "get_client", lambda: FakeSyncClient([page]))
+
+        result = sync_items(test_session, item.id)
+
+        assert result["errors"] == []          # no MultipleResultsFound
+        assert test_session.query(Transaction).count() == 1  # collapsed to one
+
+    def test_delete_removes_every_copy(self, test_engine, test_session, monkeypatch):
+        _drop_unique_index(test_engine)
+        item = _seed_item(test_session)
+        self._seed_duplicate_pair(test_session)
+
+        page = _sync_page(removed=[{"transaction_id": "p-dupe"}])
+        monkeypatch.setattr(plaid_client, "get_client", lambda: FakeSyncClient([page]))
+        sync_items(test_session, item.id)
+
+        assert test_session.query(Transaction).count() == 0
+
+    def test_migration_dedupes_and_enforces_uniqueness(
+        self, test_engine, test_session, monkeypatch,
+    ):
+        """The startup migration collapses pre-existing dupes (keeping the oldest)
+        and leaves the unique index in place."""
+        from src.api import main as app_main
+
+        _drop_unique_index(test_engine)
+        self._seed_duplicate_pair(test_session, pid="p-dupe-a")
+        self._seed_duplicate_pair(test_session, pid="p-dupe-b")
+        test_session.add(Transaction(
+            date=date(2026, 6, 2), amount=1.0, type="expense", category="Groceries",
+            source="manual",
+        ))
+        test_session.commit()
+        kept_ids = [
+            r[0] for r in test_session.execute(sqlalchemy.text(
+                "SELECT MIN(id) FROM transactions WHERE plaid_transaction_id IS NOT NULL "
+                "GROUP BY plaid_transaction_id ORDER BY 1"
+            ))
+        ]
+        assert test_session.query(Transaction).count() == 5
+
+        # Point the migration's engine at this test's in-memory DB.
+        monkeypatch.setattr(app_main, "engine", test_engine)
+        app_main._migrate_dedupe_plaid_transactions()
+
+        rows = test_session.query(Transaction).order_by(Transaction.id).all()
+        assert len(rows) == 3  # 2 deduped Plaid rows + the untouched manual one
+        # The OLDEST row of each duplicate group survived.
+        surviving_plaid = [r.id for r in rows if r.plaid_transaction_id is not None]
+        assert surviving_plaid == kept_ids
+        # ...and the index is now in place, so it can't happen again.
+        assert UX_INDEX in _index_names(test_engine)
+
+    def test_migration_is_idempotent(self, test_engine, monkeypatch):
+        from src.api import main as app_main
+
+        monkeypatch.setattr(app_main, "engine", test_engine)
+        app_main._migrate_dedupe_plaid_transactions()
+        app_main._migrate_dedupe_plaid_transactions()  # must not raise
+        assert UX_INDEX in _index_names(test_engine)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

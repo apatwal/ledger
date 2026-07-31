@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
@@ -541,13 +542,25 @@ def _sync_investments_for_item(client, db: Session, item: PlaidItem) -> dict:
 
 def _upsert_transaction(db: Session, item: PlaidItem, mapped: dict) -> bool:
     """Insert (True) or update (False) a Transaction by plaid_transaction_id.
-    Skips rows with no usable id or date."""
+    Skips rows with no usable id or date.
+
+    SELF-HEALING (v13): this used to use scalar_one_or_none(), which RAISED
+    MultipleResultsFound on a DB that already had duplicate rows for one Plaid id
+    — permanently breaking that item's sync. A unique partial index now prevents
+    new duplicates, but we still collapse any survivors here (keeping the oldest)
+    so an un-migrated DB heals itself instead of failing forever."""
     pid = mapped.get("plaid_transaction_id")
     if not pid or mapped.get("date") is None:
         return False
-    existing = db.execute(
-        select(Transaction).where(Transaction.plaid_transaction_id == pid)
-    ).scalar_one_or_none()
+    rows = db.execute(
+        select(Transaction)
+        .where(Transaction.plaid_transaction_id == pid)
+        .order_by(Transaction.id.asc())
+    ).scalars().all()
+    existing = rows[0] if rows else None
+    for extra in rows[1:]:
+        # A stale duplicate double-counts in every stat — drop it.
+        db.delete(extra)
     if existing is None:
         obj = Transaction(
             date=mapped["date"],
@@ -586,19 +599,50 @@ def _upsert_transaction(db: Session, item: PlaidItem, mapped: dict) -> bool:
 
 
 def _delete_transaction(db: Session, plaid_transaction_id: str) -> bool:
-    obj = db.execute(
+    """Delete the row(s) for a Plaid transaction Plaid told us it removed. Deletes
+    EVERY copy — a pre-index duplicate must not survive its own removal (v13)."""
+    rows = db.execute(
         select(Transaction).where(Transaction.plaid_transaction_id == plaid_transaction_id)
-    ).scalar_one_or_none()
-    if obj is None:
-        return False
-    db.delete(obj)
-    return True
+    ).scalars().all()
+    for obj in rows:
+        db.delete(obj)
+    return bool(rows)
+
+
+class SyncInProgress(RuntimeError):
+    """Raised when another sync holds the lock for longer than we'll wait."""
+
+
+# FOUR things can start a sync: the Render cron (POST /plaid/sync-all), the
+# in-process APScheduler, Plaid webhooks (which arrive in bursts), and manual
+# syncs from the wallet. Serialize them: two overlapping runs would both miss on
+# the same plaid_transaction_id and both INSERT it. Render runs a single web
+# instance, so a process-wide lock covers every trigger; the unique partial index
+# on transactions.plaid_transaction_id is the backstop if that ever changes.
+_sync_lock = threading.Lock()
+# Long enough for a queued manual sync to wait out a normal run, short enough to
+# fail an HTTP request rather than hang it.
+_SYNC_LOCK_TIMEOUT = 60.0
 
 
 def sync_items(db: Session, item_id: int | None = None) -> dict:
+    """Serialized entry point for a sync — see `_sync_items_locked` for the work.
+    Raises SyncInProgress if another sync doesn't finish within the timeout."""
+    if not _sync_lock.acquire(timeout=_SYNC_LOCK_TIMEOUT):
+        raise SyncInProgress(
+            "Another Plaid sync is already running. Try again in a moment."
+        )
+    try:
+        return _sync_items_locked(db, item_id)
+    finally:
+        _sync_lock.release()
+
+
+def _sync_items_locked(db: Session, item_id: int | None = None) -> dict:
     """Sync one item (item_id given) or ALL items. Reused by the route AND the
-    scheduler. Assumes Plaid is configured (callers gate first). Returns a dict
-    matching PlaidSyncResult: items_synced, added, modified, removed, errors.
+    scheduler. Assumes Plaid is configured (callers gate first) and that the
+    caller holds `_sync_lock`. Returns a dict matching PlaidSyncResult:
+    items_synced, added, modified, removed, errors.
 
     ERROR ISOLATION (v13): every item syncs inside its OWN try/except, so a single
     broken institution — NO_ACCOUNTS, ITEM_LOGIN_REQUIRED, a transient Plaid 5xx —
@@ -692,6 +736,8 @@ def sync(body: PlaidSyncRequest, db: Session = Depends(get_db)):
         result = sync_items(db, body.item_id)
     except plaid_client.PlaidNotConfigured as e:
         raise HTTPException(503, str(e))
+    except SyncInProgress as e:
+        raise HTTPException(409, str(e))
     except Exception as e:
         raise _plaid_error(e)
     return PlaidSyncResult(**result)
@@ -715,6 +761,8 @@ def sync_all(
         result = sync_items(db, None)
     except plaid_client.PlaidNotConfigured as e:
         raise HTTPException(503, str(e))
+    except SyncInProgress as e:
+        raise HTTPException(409, str(e))
     except Exception as e:
         raise _plaid_error(e)
     return PlaidSyncResult(**result)
@@ -949,6 +997,11 @@ async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
     try:
         result = sync_items(db, item_id=item.id)
         return {"status": "synced", "item_id": item.id, **result}
+    except SyncInProgress:
+        # A sync is already running and will pick this item up; acknowledging is
+        # correct — a retry would just queue behind the same lock.
+        print(f"[plaid] webhook for item {item.id} skipped: sync already running")
+        return {"status": "busy", "item_id": item.id}
     except Exception as e:  # never surface a 5xx to Plaid
         print(f"[plaid] webhook sync failed for item {item.id}: {e}")
         return {"status": "sync_failed"}

@@ -291,6 +291,77 @@ def _migrate_add_item_error_columns() -> None:
     _add_column_if_missing("plaid_items", "error_message", "VARCHAR")
 
 
+def _migrate_dedupe_plaid_transactions() -> None:
+    """v13 migration: collapse duplicate Plaid rows, then enforce uniqueness.
+
+    Four triggers can call sync_items() at once (Render cron, in-process
+    scheduler, Plaid webhooks, manual UI syncs). With no lock and no unique
+    constraint, two overlapping runs could both miss on the same
+    `plaid_transaction_id` and both INSERT it — silently double-counting the
+    charge in every stat/budget, and thereafter breaking that item's sync
+    outright (the upsert's one-or-none lookup raised MultipleResultsFound, which
+    surfaced as a 502 from /plaid/sync-all).
+
+    Keeps the LOWEST id per `plaid_transaction_id` and deletes the rest. That's
+    safe: rows sharing a Plaid id are the same transaction imported twice, and
+    every sync overwrites a Plaid row's fields from Plaid anyway, so no durable
+    user edit lives only on the copy being dropped. Manual/CSV rows are untouched
+    (their `plaid_transaction_id` is NULL and NULLs never collide).
+
+    Idempotent — after the first run there is nothing left to delete, and the
+    index creation is IF NOT EXISTS."""
+    if not _existing_columns("transactions"):
+        return  # fresh DB — create_all() already built the table with the index
+    dupes_sql = sqlalchemy.text(
+        """
+        SELECT COUNT(*) FROM transactions
+         WHERE plaid_transaction_id IS NOT NULL
+           AND id NOT IN (
+             SELECT MIN(id) FROM transactions
+              WHERE plaid_transaction_id IS NOT NULL
+              GROUP BY plaid_transaction_id
+           )
+        """
+    )
+    with engine.begin() as conn:
+        extra = conn.execute(dupes_sql).scalar() or 0
+        if extra:
+            # Log the affected ids BEFORE deleting so the removal is auditable.
+            affected = conn.execute(sqlalchemy.text(
+                """
+                SELECT plaid_transaction_id, COUNT(*) AS n FROM transactions
+                 WHERE plaid_transaction_id IS NOT NULL
+                 GROUP BY plaid_transaction_id HAVING COUNT(*) > 1
+                """
+            )).fetchall()
+            logger.warning(
+                "[migrate] Found %d duplicate Plaid transaction row(s) across %d "
+                "transaction id(s); keeping the oldest of each: %s",
+                extra, len(affected), ", ".join(f"{r[0]}×{r[1]}" for r in affected[:20]),
+            )
+            conn.execute(sqlalchemy.text(
+                """
+                DELETE FROM transactions
+                 WHERE plaid_transaction_id IS NOT NULL
+                   AND id NOT IN (
+                     SELECT MIN(id) FROM transactions
+                      WHERE plaid_transaction_id IS NOT NULL
+                      GROUP BY plaid_transaction_id
+                   )
+                """
+            ))
+            print(f"[migrate] Removed {extra} duplicate Plaid transaction row(s).")
+
+        # Now that the column is unique-able, enforce it. The old non-unique index
+        # is redundant once this exists.
+        conn.execute(sqlalchemy.text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_plaid_transaction_id "
+            "ON transactions (plaid_transaction_id) "
+            "WHERE plaid_transaction_id IS NOT NULL"
+        ))
+        conn.execute(sqlalchemy.text("DROP INDEX IF EXISTS ix_transactions_plaid_transaction_id"))
+
+
 def seed_data(db: Session) -> None:
     """Insert ~19 realistic transactions if the table is empty."""
     count = db.execute(sqlalchemy.text("SELECT COUNT(*) FROM transactions")).scalar()
@@ -373,6 +444,7 @@ def startup():
     _migrate_add_plaid_columns()          # v8: ensure transactions.plaid_* columns exist
     _migrate_add_v9_enrichment_columns()  # v9: ensure enrichment + branding columns exist
     _migrate_add_item_error_columns()      # v13: ensure plaid_items.error_* columns exist
+    _migrate_dedupe_plaid_transactions()   # v13: drop duplicate Plaid rows + enforce uniqueness
     # Auto-seeding is OPT-IN. By default the DB starts empty so real user data
     # is never re-created on restart. Set SEED_DB=1 (for dev/demo) to seed the
     # sample transactions into an empty DB.

@@ -1,11 +1,28 @@
 from datetime import date, datetime
-from sqlalchemy import Integer, Float, String, Text, Date, DateTime, Boolean, func
+from sqlalchemy import Integer, Float, String, Text, Date, DateTime, Boolean, Index, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
 
 class Transaction(Base):
     __tablename__ = "transactions"
+    # v13: one row per Plaid transaction, enforced by the DB. Four things can
+    # trigger a sync concurrently (Render cron, in-process scheduler, Plaid
+    # webhooks, manual UI syncs); before this, two overlapping runs could both
+    # miss on the same plaid_transaction_id and both INSERT it, which silently
+    # double-counted the charge and then broke every later sync of that item.
+    # PARTIAL index — manual/CSV rows all carry NULL here and must not collide.
+    # (Postgres and SQLite ≥3.8 both support the WHERE clause; it also doubles as
+    # the lookup index for the sync upsert, so the column needs no separate one.)
+    __table_args__ = (
+        Index(
+            "ux_transactions_plaid_transaction_id",
+            "plaid_transaction_id",
+            unique=True,
+            sqlite_where=text("plaid_transaction_id IS NOT NULL"),
+            postgresql_where=text("plaid_transaction_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     date: Mapped[date] = mapped_column(Date, nullable=False)
@@ -21,7 +38,8 @@ class Transaction(Base):
     dup_notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # v12: already-alerted duplicate (no-spam)
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")  # manual | csv | plaid
     # v8 Plaid: null for manual/csv rows; set for bank-synced rows.
-    plaid_transaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    # Indexed by the unique partial index in __table_args__, not here.
+    plaid_transaction_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     plaid_account_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     plaid_item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # v9 Plaid enrichment: null for manual/csv rows; populated for bank-synced rows.
