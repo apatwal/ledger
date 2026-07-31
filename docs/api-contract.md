@@ -330,14 +330,70 @@ existing tests pass, and every `/api/plaid/*` network endpoint returns `503`
 
 ### Endpoints (all under `/api/plaid`)
 - `GET /status` → `PlaidStatus { configured: bool, env: str, products: string[], items: PlaidItemOut[] }`. **Works without keys** (`configured=false`). Never 503.
-- `POST /link-token` → `{ link_token, expiration }`. Creates a Link token (products/country codes from env, `client_user_id="local-user"`, optional redirect_uri). **503** if unconfigured.
-- `POST /exchange` body `{ public_token }` → `PlaidItemOut`. Exchanges for an access_token, fetches accounts + best-effort institution name, stores/updates a `PlaidItem` (account label = `"{name} ••{mask}"`). **503** if unconfigured.
-- `POST /sync` body `{ item_id?: int|null }` → `PlaidSyncResult { items_synced, added, modified, removed }`. Syncs one item, or ALL items when `item_id` is null. **503** if unconfigured; **404** if a given `item_id` doesn't exist.
-- `POST /sync-all` (header `X-Plaid-Sync-Token` required only when `PLAID_SYNC_TOKEN` set) → `PlaidSyncResult`. Cron/scheduler friendly; **401** on token mismatch, **503** if unconfigured.
+- `POST /link-token` body `{ item_id?: int|null }` (body optional) → `{ link_token, expiration }`. With no `item_id`, creates a normal new-link token (products/country codes from env, `client_user_id="local-user"`, optional redirect_uri). With an `item_id`, creates an **update-mode** token instead: bound to that item's `access_token`, `update.account_selection_enabled=true`, and **no `products`** (Plaid rejects products alongside an access_token). **503** if unconfigured; **404** if the `item_id` doesn't exist.
+- `POST /exchange` body `{ public_token }` → `PlaidItemOut`. Exchanges for an access_token, fetches accounts + best-effort institution name, stores/updates a `PlaidItem` (account label = `"{name} ••{mask}"`). Clears any recorded `error_code`/`error_message`. **503** if unconfigured.
+- `POST /sync` body `{ item_id?: int|null }` → `PlaidSyncResult { items_synced, added, modified, removed, errors }`. Syncs one item, or ALL items when `item_id` is null. **503** if unconfigured; **404** if a given `item_id` doesn't exist; **409** if another sync is already running (see *Sync serialization*).
+- `POST /sync-all` (header `X-Plaid-Sync-Token` required only when `PLAID_SYNC_TOKEN` set) → `PlaidSyncResult`. Cron/scheduler friendly; **401** on token mismatch, **409** if a sync is already running, **503** if unconfigured.
 - `GET /items` → `PlaidItemOut[]`. **Works without keys.**
 - `DELETE /items/{id}` → `204`. Best-effort Plaid `item/remove`, then deletes the `PlaidItem` row. **Keeps the imported transactions** — just nulls their `plaid_item_id`. **404** if not found.
 
-`PlaidItemOut { id, item_id, institution_id?, institution_name?, accounts: PlaidAccount[], status, last_synced_at?, created_at }`; `PlaidAccount { account_id, name?, mask?, type?, subtype?, app_account? }`. **No `access_token` field anywhere.**
+`PlaidItemOut { id, item_id, institution_id?, institution_name?, accounts: PlaidAccount[], status, error_code?, error_message?, last_synced_at?, created_at }`; `PlaidAccount { account_id, name?, mask?, type?, subtype?, app_account? }`. **No `access_token` field anywhere.**
+
+### Per-item error isolation (v13)
+A sync **never fails as a whole because one bank is broken.** Each item syncs in
+its own `try`/`except` inside `sync_items()`: a failing item is rolled back,
+marked `status="error"` with Plaid's `error_code`/display message persisted on
+the row, and reported in `PlaidSyncResult.errors`; every other item still syncs
+and commits. So:
+
+- `POST /sync` and `POST /sync-all` return **200 even when some items failed** —
+  clients must inspect `errors`, not rely on the request throwing. A `502` now
+  means the sync couldn't start at all (e.g. `get_client()` failed), not that one
+  institution is unhealthy. This keeps a nightly cron from alerting on a
+  condition only a human re-link can clear.
+- `PlaidSyncError { item_id, institution?, error_code?, message }`. `error_code`
+  is Plaid's own (`NO_ACCOUNTS`, `ITEM_LOGIN_REQUIRED`, …) and is `null` for
+  network/unexpected errors, where `message` falls back to the trimmed exception.
+- A failed item keeps its previous `last_synced_at` (it reads as the last
+  *successful* sync) **and its previous `cursor`** — the rollback discards the
+  un-advanced cursor, so a retry re-reads the same page instead of skipping
+  transactions.
+- The next successful sync clears `status`/`error_code`/`error_message`.
+
+Before v13 the loop had no per-item guard: the first failing item raised straight
+out of `sync_items()`, every item ordered after it was silently skipped, and the
+route mapped the exception to a `502` that named no institution.
+
+### Sync serialization + duplicate prevention (v13)
+`transactions.plaid_transaction_id` carries a **UNIQUE partial index**
+(`ux_transactions_plaid_transaction_id ... WHERE plaid_transaction_id IS NOT
+NULL`) — one row per Plaid transaction, enforced by the DB. Manual/CSV rows are
+unaffected: their `plaid_transaction_id` is `NULL`, and NULLs never collide.
+
+Four things can start a sync — the Render cron, the in-process APScheduler,
+Plaid webhooks (which arrive in bursts), and manual syncs from the wallet.
+`sync_items()` now takes a **process-wide lock** so they can't overlap; a caller
+that waits more than 60s raises `SyncInProgress` →
+- `POST /sync` / `POST /sync-all` → **409**,
+- `POST /webhook` → `200 {"status": "busy"}` (a retry would only re-queue behind
+  the same lock),
+- the APScheduler job logs and skips.
+
+Both layers matter: the lock stops the race on a single Render instance, and the
+index is the backstop if the service ever runs more than one. `_upsert_transaction`
+also self-heals — it takes the oldest row and deletes any others sharing the id,
+so a database that predates the index recovers instead of failing forever.
+
+**Migration.** `_migrate_dedupe_plaid_transactions()` (startup, idempotent)
+deletes duplicate rows keeping `MIN(id)` per `plaid_transaction_id`, logs exactly
+what it removed, then creates the unique index and drops the old non-unique one.
+
+Without this, two concurrent syncs both missed on the same
+`plaid_transaction_id` and both inserted it — double-counting the charge in every
+stat and budget, and thereafter breaking that item's sync outright: the upsert's
+`scalar_one_or_none()` raised `MultipleResultsFound`, which the route wrapped
+into a misleading `502 "Plaid request failed: Multiple rows were found when one
+or none was required"`.
 
 ### Idempotent sync
 `POST /sync` loops `/transactions/sync` with the item's stored `cursor` until

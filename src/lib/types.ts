@@ -225,6 +225,11 @@ export interface PlaidItem {
   accounts: PlaidAccount[]
   last_synced_at: string | null
   status: string
+  // ── Last sync failure (v13) ────────────────────────────────────────────────
+  // Set when status === 'error'. error_code is Plaid's own (NO_ACCOUNTS,
+  // ITEM_LOGIN_REQUIRED, …); both clear on the next successful sync.
+  error_code?: string | null
+  error_message?: string | null
   // ── Branding (v9) ──────────────────────────────────────────────────────────
   institution_logo?: string | null // base64 PNG (no data: prefix), may be null
   institution_color?: string | null // hex accent, may be null
@@ -290,11 +295,22 @@ export interface PlaidStatus {
   items: PlaidItem[]
 }
 
+export interface PlaidSyncError {
+  item_id: number
+  institution: string | null
+  error_code: string | null
+  message: string
+}
+
 export interface PlaidSyncResult {
   items_synced: number
   added: number
   modified: number
   removed: number
+  // v13: banks that failed THIS sync. A sync with failures still resolves 200 —
+  // one broken item no longer fails the whole request — so callers MUST check
+  // this rather than relying on the promise rejecting.
+  errors?: PlaidSyncError[]
 }
 
 // ─── Health ──────────────────────────────────────────────────────────────────

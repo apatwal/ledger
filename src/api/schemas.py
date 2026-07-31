@@ -235,6 +235,10 @@ class PlaidItemOut(BaseModel):
     institution_color: Optional[str] = None  # hex color
     accounts: list[PlaidAccount] = []
     status: str
+    # v13: set when status == "error" — Plaid's code (NO_ACCOUNTS, …) plus a
+    # display message, so the wallet can explain WHY a bank needs reconnecting.
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
     last_synced_at: Optional[datetime] = None
     created_at: datetime
 
@@ -254,11 +258,32 @@ class PlaidSyncRequest(BaseModel):
     item_id: Optional[int] = None   # null = sync all linked items
 
 
+class LinkTokenRequest(BaseModel):
+    """Body for POST /plaid/link-token. Omit it (or send item_id=null) for a
+    normal new-bank link; pass an existing item_id to get an UPDATE-mode token
+    that re-authenticates that bank and re-opens account selection (v13)."""
+    item_id: Optional[int] = None
+
+
+class PlaidSyncError(BaseModel):
+    """One item that failed during a sync (v13). `error_code` is Plaid's own code
+    (NO_ACCOUNTS, ITEM_LOGIN_REQUIRED, …) when the failure came from Plaid, and
+    None for network/unexpected errors. Never carries the access_token."""
+    item_id: int
+    institution: Optional[str] = None
+    error_code: Optional[str] = None
+    message: str
+
+
 class PlaidSyncResult(BaseModel):
     items_synced: int
     added: int
     modified: int
     removed: int
+    # v13: items that failed THIS run; empty on a clean sync. A non-empty list
+    # still returns 200 — one broken bank must not fail the whole sync, or a
+    # nightly cron would page on an item that only a human re-link can fix.
+    errors: list[PlaidSyncError] = []
 
 
 # ── Budgets (v9b) ─────────────────────────────────────────────────────────────

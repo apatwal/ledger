@@ -15,6 +15,12 @@ or custom range — is just a query, and year-end stats come for free.
   pending-vs-posted status. New links request up to **24 months** of history.
   Investments are supported when the institution offers them, but never block a
   card/bank-only link. Optional in-process auto-sync + a `/sync-all` cron endpoint.
+  Syncs are **isolated per bank**: one unhealthy institution can't fail the run or
+  stop the others, it's flagged in the wallet with the reason, and **Reconnect**
+  reopens Plaid Link in update mode to repair it (re-auth + account re-selection).
+  Syncs are also **serialized and exactly-once**: the cron, scheduler, webhooks,
+  and manual syncs can't overlap, and a unique index guarantees one row per Plaid
+  transaction, so a bank charge can never be imported (or counted) twice.
 - **Dashboard** — KPI cards (income, expense, net, savings rate), spend-over-time
   area chart, category donut, and income-vs-expense bar chart, driven by a
   date-range and granularity selector, plus a per-account spending breakdown. A

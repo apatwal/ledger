@@ -195,10 +195,15 @@ export async function getPlaidStatus(): Promise<PlaidStatus> {
   return request<PlaidStatus>('/plaid/status')
 }
 
-export async function createPlaidLinkToken(): Promise<{ link_token: string; expiration: string }> {
+// Pass an itemId to get an UPDATE-mode token: it re-authenticates that existing
+// bank and re-opens account selection (the fix for an item stuck on NO_ACCOUNTS)
+// instead of linking a brand-new one. Omit it for the normal connect flow.
+export async function createPlaidLinkToken(
+  itemId?: number,
+): Promise<{ link_token: string; expiration: string }> {
   return request<{ link_token: string; expiration: string }>('/plaid/link-token', {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify(itemId === undefined ? {} : { item_id: itemId }),
   })
 }
 
