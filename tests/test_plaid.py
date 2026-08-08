@@ -136,6 +136,36 @@ class FakeMixedClient:
         raise RuntimeError("investments product not available for this item")
 
 
+class FakeReExchangeClient:
+    """Fake PlaidApi for re-running Link on an ALREADY-linked institution: Plaid
+    mints a brand-new Item (new item_id, new access_token) for the same
+    institution_id, which is exactly how duplicate accounts used to appear."""
+
+    def __init__(self, institution_id="ins_test", item_id="item-second", accounts=None):
+        self._institution_id = institution_id
+        self._item_id = item_id
+        self._accounts = accounts if accounts is not None else [
+            {"account_id": "acc_roth", "name": "Roth IRA", "mask": "1111",
+             "type": "investment", "subtype": "ira"},
+            {"account_id": "acc_brok", "name": "Brokerage", "mask": "2222",
+             "type": "investment", "subtype": "brokerage"},
+        ]
+        self.removed_tokens: list[str] = []
+
+    def item_public_token_exchange(self, req):
+        return _ExchangeResp("access-sandbox-SECOND", self._item_id)
+
+    def accounts_get(self, req):
+        return _Resp({"item": {"institution_id": self._institution_id}, "accounts": self._accounts})
+
+    def institutions_get_by_id(self, req):
+        return _Resp({"institution": {"name": "Charles Schwab"}})
+
+    def item_remove(self, req):
+        self.removed_tokens.append(req.access_token)
+        return _Resp({"request_id": "req-remove"})
+
+
 class _ExchangeResp:
     def __init__(self, access_token: str, item_id: str):
         self.access_token = access_token
@@ -888,6 +918,139 @@ class TestPlaidDuplicateRows:
         app_main._migrate_dedupe_plaid_transactions()
         app_main._migrate_dedupe_plaid_transactions()  # must not raise
         assert UX_INDEX in _index_names(test_engine)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4d. Duplicate ACCOUNTS (v13). Re-running Link on a connected bank to pick up a
+#     newly-opened account mints a NEW Plaid Item covering the accounts you
+#     already had — so the old ones came back as duplicates, double-counting
+#     their balances AND holdings in net worth, and re-importing their
+#     transactions under fresh per-Item ids that no uniqueness rule can catch.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDuplicateInstitution:
+
+    def _seed_schwab(self, session):
+        item = PlaidItem(
+            item_id="item-schwab-1",
+            access_token="access-schwab-1",
+            institution_id="ins_test",
+            institution_name="Charles Schwab",
+            accounts_json=json.dumps({"acc_roth_orig": {"app_account": "Roth IRA ••1111"}}),
+            status="active",
+        )
+        session.add(item)
+        session.commit()
+        session.refresh(item)
+        return item
+
+    def test_relinking_a_connected_bank_is_refused(self, client, test_session, monkeypatch):
+        _configure(monkeypatch)
+        first = self._seed_schwab(test_session)
+        fake = FakeReExchangeClient()
+        monkeypatch.setattr(plaid_client, "get_client", lambda: fake)
+
+        resp = client.post("/api/plaid/exchange", json={"public_token": "public-second"})
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["code"] == "INSTITUTION_ALREADY_LINKED"
+        assert detail["item_id"] == first.id
+        assert "already connected" in detail["message"]
+        assert "Add accounts" in detail["message"]
+
+        # No second row for the same bank...
+        items = test_session.query(PlaidItem).all()
+        assert len(items) == 1 and items[0].id == first.id
+        # ...and the Item Plaid just minted was released, not left billing.
+        assert fake.removed_tokens == ["access-sandbox-SECOND"]
+
+    def test_refusal_does_not_disturb_the_existing_item(self, client, test_session, monkeypatch):
+        """The original link keeps its token, accounts and labels untouched."""
+        _configure(monkeypatch)
+        first = self._seed_schwab(test_session)
+        monkeypatch.setattr(plaid_client, "get_client", lambda: FakeReExchangeClient())
+
+        client.post("/api/plaid/exchange", json={"public_token": "public-second"})
+
+        test_session.refresh(first)
+        assert first.access_token == "access-schwab-1"
+        assert first.item_id == "item-schwab-1"
+        assert json.loads(first.accounts_json) == {
+            "acc_roth_orig": {"app_account": "Roth IRA ••1111"}
+        }
+
+    def test_relinking_the_SAME_item_still_upserts(self, client, test_session, monkeypatch):
+        """Re-linking an item Plaid hands back with the SAME item_id is a genuine
+        refresh, not a duplicate — it must still update in place."""
+        _configure(monkeypatch)
+        first = self._seed_schwab(test_session)
+        monkeypatch.setattr(
+            plaid_client, "get_client",
+            lambda: FakeReExchangeClient(item_id="item-schwab-1"),
+        )
+
+        resp = client.post("/api/plaid/exchange", json={"public_token": "public-refresh"})
+
+        assert resp.status_code == 200
+        assert test_session.query(PlaidItem).count() == 1
+        test_session.refresh(first)
+        assert first.access_token == "access-sandbox-SECOND"  # token rotated in place
+        assert set(json.loads(first.accounts_json)) == {"acc_roth", "acc_brok"}
+
+    def test_a_different_bank_links_normally(self, client, test_session, monkeypatch):
+        """The guard is per-institution — a genuinely new bank is unaffected."""
+        _configure(monkeypatch)
+        self._seed_schwab(test_session)
+        monkeypatch.setattr(
+            plaid_client, "get_client",
+            lambda: FakeReExchangeClient(institution_id="ins_other", item_id="item-other"),
+        )
+
+        resp = client.post("/api/plaid/exchange", json={"public_token": "public-other"})
+
+        assert resp.status_code == 200
+        assert test_session.query(PlaidItem).count() == 2
+
+    def test_bank_without_institution_id_is_not_blocked(self, client, test_session, monkeypatch):
+        """institution_id can be absent; never refuse a link on a null match."""
+        _configure(monkeypatch)
+        item = PlaidItem(item_id="item-noinst", access_token="tok", institution_id=None,
+                         status="active")
+        test_session.add(item)
+        test_session.commit()
+        monkeypatch.setattr(
+            plaid_client, "get_client",
+            lambda: FakeReExchangeClient(institution_id=None, item_id="item-noinst-2"),
+        )
+
+        resp = client.post("/api/plaid/exchange", json={"public_token": "public-x"})
+
+        assert resp.status_code == 200
+        assert test_session.query(PlaidItem).count() == 2
+
+    def test_add_accounts_uses_update_mode_on_the_same_item(
+        self, client, test_session, monkeypatch,
+    ):
+        """The supported path: one Item, account selection reopened — so an
+        account that's already linked can never be added a second time."""
+        _configure(monkeypatch)
+        item = self._seed_schwab(test_session)
+        seen = {}
+
+        class FakeLinkClient:
+            def link_token_create(self, req):
+                seen["req"] = req
+                return _Resp({"link_token": "link-add-accounts", "expiration": "2026-08-09T00:00:00Z"})
+
+        monkeypatch.setattr(plaid_client, "get_client", lambda: FakeLinkClient())
+
+        resp = client.post("/api/plaid/link-token", json={"item_id": item.id})
+
+        assert resp.status_code == 200
+        assert seen["req"].access_token == "access-schwab-1"
+        assert seen["req"].update.account_selection_enabled is True
+        assert test_session.query(PlaidItem).count() == 1  # still ONE Schwab item
 
 
 # ═══════════════════════════════════════════════════════════════════════════

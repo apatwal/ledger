@@ -203,9 +203,10 @@ export default function PlaidConnect() {
   // keeps the old handler (and `ready`) around until the new token's handler is
   // built, so we only auto-open once `open` has actually changed away from this.
   const openAtRequest = useRef<Function | null>(null)
-  // Which item the in-flight Link session is REPAIRING (update mode), or null for
-  // a brand-new link. Decides whether onSuccess exchanges the public_token.
-  const reconnectId = useRef<number | null>(null)
+  // The item the in-flight Link session is updating, or null for a brand-new
+  // link. Decides whether onSuccess exchanges the public_token (update mode keeps
+  // the existing access_token), and which wording to report.
+  const updating = useRef<{ id: number; intent: 'repair' | 'add' } | null>(null)
 
   // Per-action state
   const [syncingId, setSyncingId] = useState<number | 'all' | null>(null)
@@ -220,21 +221,23 @@ export default function PlaidConnect() {
   // ─── Link success → exchange → first sync ──────────────────────────────────
   const onLinkSuccess = useCallback(
     async (publicToken: string, _metadata: PlaidLinkOnSuccessMetadata) => {
-      const repairing = reconnectId.current
-      reconnectId.current = null
+      const update = updating.current
+      updating.current = null
       setLinkToken(null)
       setPendingOpen(false)
       setFinishing(true)
       setMsg(null)
       setActionError(null)
       try {
-        if (repairing !== null) {
+        if (update !== null) {
           // Update mode keeps the SAME item and access_token, so there is nothing
           // to exchange — re-syncing is what clears the item's error status and
-          // pulls in any account the user just ticked.
-          const res = await plaidSync(repairing)
+          // pulls in any account the user just ticked. Crucially it does NOT mint
+          // a second item, so accounts already linked can't be duplicated.
+          const res = await plaidSync(update.id)
           const failed = syncFailureNote(res)
-          setMsg(failed ? `Reconnected, but ${failed}` : `Reconnected. ${syncSummary(res)}`)
+          const done = update.intent === 'repair' ? 'Reconnected' : 'Accounts updated'
+          setMsg(failed ? `${done}, but ${failed}` : `${done}. ${syncSummary(res)}`)
         } else {
           const item = await exchangePlaidPublicToken(publicToken)
           const res = await plaidSync(item.id)
@@ -245,8 +248,8 @@ export default function PlaidConnect() {
         setActionError(
           e instanceof Error
             ? e.message
-            : repairing !== null
-              ? 'Could not finish reconnecting your bank'
+            : update !== null
+              ? 'Could not finish updating your bank'
               : 'Could not finish connecting your bank',
         )
       } finally {
@@ -263,7 +266,7 @@ export default function PlaidConnect() {
       // User bailed out of Link; drop the one-shot token and cancel the pending open.
       setLinkToken(null)
       setPendingOpen(false)
-      reconnectId.current = null
+      updating.current = null
     },
   })
 
@@ -280,24 +283,25 @@ export default function PlaidConnect() {
     }
   }, [pendingOpen, ready, linkToken, open])
 
-  // itemId set => UPDATE mode: repair an existing bank rather than link a new one.
-  async function handleConnect(itemId?: number) {
+  // itemId set => UPDATE mode against that existing bank (repair it, or pick up
+  // accounts you didn't select before). Only a bare call links a NEW bank.
+  async function handleConnect(itemId?: number, intent: 'repair' | 'add' = 'repair') {
     setPreparing(true)
     setActionError(null)
     setMsg(null)
     try {
       const { link_token } = await createPlaidLinkToken(itemId)
-      reconnectId.current = itemId ?? null
+      updating.current = itemId === undefined ? null : { id: itemId, intent }
       openAtRequest.current = open // remember the current (soon-to-be-stale) handler
       setPendingOpen(true)
       setLinkToken(link_token)
     } catch (e) {
-      reconnectId.current = null
+      updating.current = null
       setActionError(
         e instanceof Error
           ? e.message
           : itemId !== undefined
-            ? 'Could not start reconnecting this bank'
+            ? 'Could not start updating this bank'
             : 'Could not start bank connection',
       )
     } finally {
@@ -434,6 +438,7 @@ export default function PlaidConnect() {
           </div>
           <p className="wallet-lede">
             Securely link a bank through Plaid — transactions sync in on their own, no CSV needed.
+            {items.length > 0 && ' Already connected a bank? Use + on its card to add more of its accounts.'}
           </p>
           {msg && (
             <div className="plaid-note success">
@@ -482,7 +487,10 @@ export default function PlaidConnect() {
                 confirming={confirmId === item.id}
                 disabled={syncingId !== null || busy}
                 onSync={() => void handleSync(item.id)}
-                onReconnect={() => void handleConnect(item.id)}
+                // Same update-mode flow serves both: repairing a broken bank and
+                // adding accounts at a healthy one. Neither can mint a second Item.
+                onReconnect={() => void handleConnect(item.id, 'repair')}
+                onAddAccounts={() => void handleConnect(item.id, 'add')}
                 onAskDisconnect={() => setConfirmId(item.id)}
                 onCancelDisconnect={() => setConfirmId(null)}
                 onConfirmDisconnect={() => void handleDisconnect(item.id)}
@@ -556,7 +564,7 @@ function NetWorthPanel({
 
 function WalletCard({
   item, account, rot, z, syncing, removing, confirming, disabled,
-  onSync, onReconnect, onAskDisconnect, onCancelDisconnect, onConfirmDisconnect,
+  onSync, onReconnect, onAddAccounts, onAskDisconnect, onCancelDisconnect, onConfirmDisconnect,
 }: {
   item: PlaidItem
   account: PlaidAccount
@@ -568,6 +576,7 @@ function WalletCard({
   disabled: boolean
   onSync: () => void
   onReconnect: () => void
+  onAddAccounts: () => void
   onAskDisconnect: () => void
   onCancelDisconnect: () => void
   onConfirmDisconnect: () => void
@@ -658,6 +667,17 @@ function WalletCard({
                 >
                   {syncing ? <span className="spinner" style={{ width: 12, height: 12 }} /> : <RefreshCw size={12} />}
                   Sync
+                </button>
+              )}
+              {!broken && (
+                <button
+                  className="wallet-cbtn ghost"
+                  onClick={onAddAccounts}
+                  disabled={disabled}
+                  title={`Add another ${inst} account — reopens Plaid with your account picker, without re-adding the ones you already have`}
+                  aria-label={`Add another account from ${inst}`}
+                >
+                  <Plus size={12} />
                 </button>
               )}
               <button

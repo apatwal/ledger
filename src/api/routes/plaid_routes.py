@@ -390,6 +390,44 @@ def exchange_public_token(body: ExchangeRequest, db: Session = Depends(get_db)):
         select(PlaidItem).where(PlaidItem.item_id == item_id)
     ).scalar_one_or_none()
 
+    # v13: REFUSE a second Item for a bank that's already linked.
+    #
+    # Running Link again on a connected institution mints a BRAND-NEW Plaid Item
+    # (new item_id), so the upsert above misses and we'd store a second row whose
+    # accounts overlap the first — e.g. picking a new Schwab brokerage account
+    # re-adds the Roth IRA that came with the original link. That double-counts
+    # the account's balance AND its holdings in net worth, and re-imports its
+    # transactions under fresh per-Item ids that no uniqueness rule can catch.
+    #
+    # The supported way to add accounts at a linked bank is update mode with
+    # account selection (POST /plaid/link-token {item_id}), which keeps ONE Item.
+    if existing is None and institution_id:
+        already = db.execute(
+            select(PlaidItem).where(PlaidItem.institution_id == institution_id)
+        ).scalars().first()
+        if already is not None:
+            # Release the Item we just created so it doesn't linger (Plaid bills
+            # per active Item). Best-effort — the 409 matters more than cleanup.
+            try:
+                from plaid.model.item_remove_request import ItemRemoveRequest
+
+                client.item_remove(ItemRemoveRequest(access_token=access_token))
+            except Exception as e:
+                print(f"[plaid] could not release duplicate item for {institution_id}: {e}")
+            name = already.institution_name or "That bank"
+            raise HTTPException(
+                409,
+                {
+                    "code": "INSTITUTION_ALREADY_LINKED",
+                    "item_id": already.id,
+                    "message": (
+                        f"{name} is already connected. Use “Add accounts” on its "
+                        f"card to choose more accounts from this bank — linking it "
+                        f"again would duplicate the accounts you already have."
+                    ),
+                },
+            )
+
     # Build the {account_id: {...}} map (labels + balances), preserving any
     # existing app_account labels when re-linking the same bank.
     prev_accounts = _accounts_map(existing) if existing is not None else None

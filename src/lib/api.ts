@@ -79,10 +79,28 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...(init.headers as Record<string, string> | undefined) },
   })
   if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
+    throw new Error(await errorMessage(res))
   }
   return res.json() as Promise<T>
+}
+
+// FastAPI puts the human-readable text in `detail` — a plain string, or an object
+// when the route attaches extra context (e.g. the already-linked-bank 409 carries
+// the existing item_id). Surface that instead of dumping raw JSON at the user;
+// fall back to the status line only when the body isn't a shape we recognise.
+async function errorMessage(res: Response): Promise<string> {
+  const text = await res.text().catch(() => '')
+  try {
+    const detail = (JSON.parse(text) as { detail?: unknown })?.detail
+    if (typeof detail === 'string' && detail.trim()) return detail
+    if (detail && typeof detail === 'object') {
+      const msg = (detail as { message?: unknown }).message
+      if (typeof msg === 'string' && msg.trim()) return msg
+    }
+  } catch {
+    // not JSON — fall through to the raw text
+  }
+  return text ? `${res.status} ${res.statusText}: ${text}` : `${res.status} ${res.statusText}`
 }
 
 function toQuery(params: QueryParams): string {

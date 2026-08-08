@@ -331,11 +331,11 @@ existing tests pass, and every `/api/plaid/*` network endpoint returns `503`
 ### Endpoints (all under `/api/plaid`)
 - `GET /status` → `PlaidStatus { configured: bool, env: str, products: string[], items: PlaidItemOut[] }`. **Works without keys** (`configured=false`). Never 503.
 - `POST /link-token` body `{ item_id?: int|null }` (body optional) → `{ link_token, expiration }`. With no `item_id`, creates a normal new-link token (products/country codes from env, `client_user_id="local-user"`, optional redirect_uri). With an `item_id`, creates an **update-mode** token instead: bound to that item's `access_token`, `update.account_selection_enabled=true`, and **no `products`** (Plaid rejects products alongside an access_token). **503** if unconfigured; **404** if the `item_id` doesn't exist.
-- `POST /exchange` body `{ public_token }` → `PlaidItemOut`. Exchanges for an access_token, fetches accounts + best-effort institution name, stores/updates a `PlaidItem` (account label = `"{name} ••{mask}"`). Clears any recorded `error_code`/`error_message`. **503** if unconfigured.
+- `POST /exchange` body `{ public_token }` → `PlaidItemOut`. Exchanges for an access_token, fetches accounts + best-effort institution name, stores/updates a `PlaidItem` (account label = `"{name} ••{mask}"`). Clears any recorded `error_code`/`error_message`. **503** if unconfigured; **409** `INSTITUTION_ALREADY_LINKED` when that bank is already connected (see *One Item per institution*).
 - `POST /sync` body `{ item_id?: int|null }` → `PlaidSyncResult { items_synced, added, modified, removed, errors }`. Syncs one item, or ALL items when `item_id` is null. **503** if unconfigured; **404** if a given `item_id` doesn't exist; **409** if another sync is already running (see *Sync serialization*).
 - `POST /sync-all` (header `X-Plaid-Sync-Token` required only when `PLAID_SYNC_TOKEN` set) → `PlaidSyncResult`. Cron/scheduler friendly; **401** on token mismatch, **409** if a sync is already running, **503** if unconfigured.
 - `GET /items` → `PlaidItemOut[]`. **Works without keys.**
-- `DELETE /items/{id}` → `204`. Best-effort Plaid `item/remove`, then deletes the `PlaidItem` row. **Keeps the imported transactions** — just nulls their `plaid_item_id`. **404** if not found.
+- `DELETE /items/{id}` → `204`. Best-effort Plaid `item/remove`, then **deletes that item's imported transactions** and the `PlaidItem` row. **404** if not found.
 
 `PlaidItemOut { id, item_id, institution_id?, institution_name?, accounts: PlaidAccount[], status, error_code?, error_message?, last_synced_at?, created_at }`; `PlaidAccount { account_id, name?, mask?, type?, subtype?, app_account? }`. **No `access_token` field anywhere.**
 
@@ -363,6 +363,36 @@ and commits. So:
 Before v13 the loop had no per-item guard: the first failing item raised straight
 out of `sync_items()`, every item ordered after it was silently skipped, and the
 route mapped the exception to a `502` that named no institution.
+
+### One Item per institution (v13)
+Running Link again on an already-connected bank does **not** refresh it — Plaid
+mints a brand-new Item with a new `item_id`, so the upsert-by-`item_id` in
+`/exchange` misses and a second `PlaidItem` gets stored covering accounts the
+first one already had. Adding one new Schwab brokerage account therefore
+re-added the existing Roth IRA, and because `GET /stats/net-worth` and
+`compute_holdings()` both iterate **every** item, that account's balance and
+holdings were counted twice. Its transactions came back too, under fresh
+per-Item ids that the `plaid_transaction_id` uniqueness rule cannot detect.
+
+`/exchange` now refuses it: if the exchanged item's `institution_id` matches an
+existing `PlaidItem` (and it isn't the same `item_id`), the route calls Plaid
+`item/remove` to release the Item it just minted — an unused Item is still
+billable — and returns **409**:
+
+```json
+{"detail": {
+  "code": "INSTITUTION_ALREADY_LINKED",
+  "item_id": 3,
+  "message": "Charles Schwab is already connected. Use “Add accounts” on its card …"
+}}
+```
+
+The supported way to add an account at a linked bank is **update mode**:
+`POST /plaid/link-token {item_id}` → Link reopens with account selection against
+the SAME Item, so accounts already linked cannot be added twice. The wallet
+exposes it as **+ / Add accounts** on each card (and as **Reconnect** on a card
+in the error state — same endpoint, same guarantee). A re-link that Plaid hands
+back with the *same* `item_id` is a genuine refresh and still upserts in place.
 
 ### Sync serialization + duplicate prevention (v13)
 `transactions.plaid_transaction_id` carries a **UNIQUE partial index**
