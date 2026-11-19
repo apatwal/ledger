@@ -42,6 +42,12 @@ user see total spending AND spending broken down by card.
 ## Pydantic Schemas
 - `TransactionCreate`: `{ date, amount, type, category, description? , source?, account? }`
 - `TransactionOut`: all columns including `id`, `created_at`, `account`.
+- Input rules (`amount > 0`, non-empty `category`) are enforced on
+  `TransactionCreate` (POST and PUT bodies) **only**. `TransactionOut` shares
+  the fields via a validator-free `TransactionBase` and never re-applies them:
+  response validation runs on every row a read returns, so one stored row that
+  breaks an input rule would otherwise 500 the whole list. Stored data never
+  fails a read (regression: $0 Plaid brokerage rows 500'd `GET /api/transactions`).
 
 ## Endpoints
 
@@ -434,6 +440,19 @@ by `investment_transaction_id`. The new cursor + `last_synced_at` are persisted,
 so re-running sync never duplicates rows (safe to call repeatedly / on a
 schedule). Investments are best-effort — an item without the investments product
 is skipped, not failed.
+
+### Zero-amount rows are never imported
+Plaid reports brokerage **non-cash** events — in-kind share transfers
+(`NVIDIA CORP - XFER`), forward and reverse stock splits — with `amount = 0`.
+They arrive on the investments path (`/investments/transactions/get`), but the
+rule lives in `_upsert_transaction`, so it covers every Plaid import path
+(`/transactions/sync` `added` + `modified`, the investments pull, and the
+savings-toggle re-sync):
+- a $0 row that isn't stored yet is **skipped** (not counted in `added`/`modified`);
+- a $0 event for a row that already exists (Plaid modified it to $0, or a
+  cursor-reset replay) **deletes** it, every copy, like a `removed` event, and
+  counts in `removed`.
+This keeps the `amount > 0` invariant for Plaid rows.
 
 ### Categorization — trust Plaid (no rules engine / needs-review / AI)
 Plaid rows map `personal_finance_category` **directly**; they never run the

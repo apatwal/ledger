@@ -21,6 +21,8 @@ or custom range — is just a query, and year-end stats come for free.
   Syncs are also **serialized and exactly-once**: the cron, scheduler, webhooks,
   and manual syncs can't overlap, and a unique index guarantees one row per Plaid
   transaction, so a bank charge can never be imported (or counted) twice.
+  $0 brokerage events (in-kind share transfers, stock splits) aren't money
+  movement and are never imported.
   **One connection per bank** — to add an account at a bank you've already linked,
   use **+ Add accounts** on its card, which reopens Plaid's account picker against
   the same connection. Linking the bank a second time is refused, since that would
