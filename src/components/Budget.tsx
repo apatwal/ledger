@@ -12,6 +12,7 @@ import {
   deleteCategoryBudget,
   getCategories,
 } from '../lib/api'
+import ErrorNotice, { type FailedAction } from './ErrorNotice'
 import type {
   SavingsGoal,
   SavingsGoalInput,
@@ -192,6 +193,7 @@ function GoalModal({
   const [account, setAccount] = useState(goal?.account ?? '')
   const [saving, setSaving] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [saveError, setSaveError] = useState<unknown>(null)
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -218,12 +220,13 @@ function GoalModal({
       account: account.trim() || null,
     }
     setSaving(true)
+    setSaveError(null)
     try {
       if (isEdit && goal) await updateSavingsGoal(goal.id, data)
       else await createSavingsGoal(data)
       onSaved()
     } catch (err) {
-      setErrors({ submit: err instanceof Error ? err.message : 'Failed to save' })
+      setSaveError(err)
     } finally {
       setSaving(false)
     }
@@ -240,7 +243,9 @@ function GoalModal({
         </div>
         <form onSubmit={(e) => { void handleSubmit(e) }}>
           <div className="modal-body">
-            {errors.submit && <div className="budget-form-error">{errors.submit}</div>}
+            {saveError != null && (
+              <ErrorNotice compact title="Couldn't save the goal" error={saveError} />
+            )}
 
             <div className="form-group">
               <label htmlFor="goal-name">Goal name</label>
@@ -324,6 +329,7 @@ function LimitModal({
   const [amount, setAmount] = useState(limit?.limit_amount?.toString() ?? '')
   const [saving, setSaving] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [saveError, setSaveError] = useState<unknown>(null)
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -348,12 +354,13 @@ function LimitModal({
       limit_amount: parseFloat(amount),
     }
     setSaving(true)
+    setSaveError(null)
     try {
       if (isEdit && limit) await updateCategoryBudget(limit.id, data)
       else await createCategoryBudget(data)
       onSaved()
     } catch (err) {
-      setErrors({ submit: err instanceof Error ? err.message : 'Failed to save' })
+      setSaveError(err)
     } finally {
       setSaving(false)
     }
@@ -370,7 +377,9 @@ function LimitModal({
         </div>
         <form onSubmit={(e) => { void handleSubmit(e) }}>
           <div className="modal-body">
-            {errors.submit && <div className="budget-form-error">{errors.submit}</div>}
+            {saveError != null && (
+              <ErrorNotice compact title="Couldn't save the limit" error={saveError} />
+            )}
 
             <div className="form-group">
               <label htmlFor="limit-category">Category</label>
@@ -439,8 +448,7 @@ export default function Budget() {
   const categoryOptions = categoriesQuery.data ?? []
   const loading = goalsQuery.isPending || limitsQuery.isPending
   const loadError = goalsQuery.error ?? limitsQuery.error
-  const [deleteError, setDeleteError] = useState<string | null>(null)
-  const error = deleteError ?? (loadError instanceof Error ? loadError.message : loadError ? 'Failed to load budget' : null)
+  const [deleteError, setDeleteError] = useState<FailedAction | null>(null)
 
   const invalidateBudgets = () => { void queryClient.invalidateQueries({ queryKey: ['budgets'] }) }
   const load = () => {
@@ -463,7 +471,11 @@ export default function Budget() {
       setDeleting(null)
       invalidateBudgets()
     } catch (e) {
-      setDeleteError(e instanceof Error ? e.message : 'Failed to delete')
+      setDeleteError({
+        title: deleting.kind === 'goal' ? "Couldn't delete the goal" : "Couldn't delete the limit",
+        error: e,
+      })
+      setDeleting(null) // close the dialog so the notice on the page is visible
     } finally {
       setDeleteBusy(false)
     }
@@ -484,15 +496,19 @@ export default function Budget() {
         </div>
       )}
 
-      {error && !loading && (
-        <div className="error-state">
-          <AlertTriangle size={32} />
-          <div>{error}</div>
-          <button className="btn btn-secondary btn-sm" onClick={load}>Retry</button>
-        </div>
+      {deleteError && (
+        <ErrorNotice
+          title={deleteError.title}
+          error={deleteError.error}
+          onDismiss={() => setDeleteError(null)}
+        />
       )}
 
-      {!loading && !error && (
+      {loadError && !loading && (
+        <ErrorNotice title="Couldn't load your budget" error={loadError} onRetry={load} />
+      )}
+
+      {!loading && !loadError && (
         <>
           {/* ── Savings goals ─────────────────────────────────────────────── */}
           <section className="budget-section">

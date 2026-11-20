@@ -24,11 +24,17 @@ from . import plaid_client
 from .plaid_mapping import CANONICAL_CATEGORIES
 from . import auth
 from .auth import require_user
+from .errors import install_error_handlers
 
 logger = logging.getLogger("expense_tracker.auth")
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Expense Tracker API", version="1.0.0")
+
+# Unhandled exceptions -> JSON 500 with an error ID (see errors.py). Installed
+# BEFORE CORSMiddleware on purpose: later-added middleware wraps earlier, so this
+# sits inside CORS and the browser can read the 500 body cross-origin.
+install_error_handlers(app)
 
 # CORS origins are env-driven (CORS_ORIGINS, comma-separated). We do NOT use "*"
 # because allow_credentials=True with a wildcard is both unsafe and rejected by

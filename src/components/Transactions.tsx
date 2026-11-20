@@ -1,10 +1,11 @@
 import { useEffect, useState, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Plus, Pencil, Trash2, Search, ChevronLeft, ChevronRight, AlertCircle, Sparkles, EyeOff, ChevronDown, Check } from 'lucide-react'
+import { Plus, Pencil, Trash2, Search, ChevronLeft, ChevronRight, Sparkles, EyeOff, ChevronDown, Check } from 'lucide-react'
 import { getTransactions, deleteTransaction, getCategories, getAssistantStatus, categorizeBatch, createRule, applyRules, getDuplicates } from '../lib/api'
 import type { Transaction, TransactionQuery } from '../lib/types'
 import TransactionModal from './TransactionModal'
+import ErrorNotice, { type FailedAction } from './ErrorNotice'
 import DatePicker from './DatePicker'
 import { todayISO, toISO, addDays } from '../lib/date'
 import { useAccountSelection } from '../lib/accountSelection'
@@ -222,7 +223,8 @@ function ExcludeFilter({
 
 export default function Transactions() {
   const queryClient = useQueryClient()
-  const [actionError, setActionError] = useState<string | null>(null)
+  // A failed action (delete, auto-categorize, …): its headline + the thrown error.
+  const [actionError, setActionError] = useState<FailedAction | null>(null)
 
   // Which accounts are in view is driven globally by the header selector.
   const { accountsParam, allSelected, selected } = useAccountSelection()
@@ -305,7 +307,6 @@ export default function Transactions() {
   const hasMore = rawRows.length > PAGE_SIZE
   const transactions = rawRows.slice(0, PAGE_SIZE)
   const loading = listQuery.isPending
-  const error = actionError ?? (listQuery.error instanceof Error ? listQuery.error.message : listQuery.error ? 'Failed to load transactions' : null)
 
   // Duplicate groups for the current window/accounts, flattened to an id set.
   // Shares the ['duplicates'] prefix with the dashboard so writes refresh both.
@@ -330,6 +331,7 @@ export default function Transactions() {
   async function handleAutoCategorize() {
     setCategorizing(true)
     setAiMsg(null)
+    setActionError(null)
     try {
       // Target the current view's window; only uncategorized/needs-review rows.
       // The batch endpoint takes a single account, so scope to it only when the
@@ -345,7 +347,7 @@ export default function Transactions() {
       void queryClient.invalidateQueries({ queryKey: ['transactions'] })
       void queryClient.invalidateQueries({ queryKey: ['stats'] })
     } catch (e) {
-      setAiMsg(e instanceof Error ? e.message : 'Auto-categorize failed')
+      setActionError({ title: "Couldn't auto-categorize transactions", error: e })
     } finally {
       setCategorizing(false)
     }
@@ -371,7 +373,7 @@ export default function Transactions() {
       void queryClient.invalidateQueries({ queryKey: ['stats'] })
       void queryClient.invalidateQueries({ queryKey: ['duplicates'] })
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Failed to save your choice')
+      setActionError({ title: "Couldn't save your choice", error: e })
     } finally {
       setBrokerageBusyId(null)
     }
@@ -440,7 +442,7 @@ export default function Transactions() {
       setDeleteConfirmId(null)
       invalidateLedger(queryClient)
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Delete failed')
+      setActionError({ title: "Couldn't delete the transaction", error: e })
     } finally {
       setDeletingId(null)
     }
@@ -590,12 +592,19 @@ export default function Transactions() {
       </div>
 
       {/* Error */}
-      {error && (
-        <div className="error-state" style={{ padding: 24 }}>
-          <AlertCircle size={24} />
-          {error}
-        </div>
-      )}
+      {actionError ? (
+        <ErrorNotice
+          title={actionError.title}
+          error={actionError.error}
+          onDismiss={() => setActionError(null)}
+        />
+      ) : listQuery.error ? (
+        <ErrorNotice
+          title="Couldn't load transactions"
+          error={listQuery.error}
+          onRetry={() => void listQuery.refetch()}
+        />
+      ) : null}
 
       {/* Table */}
       <div className="table-wrapper">

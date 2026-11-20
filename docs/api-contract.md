@@ -242,6 +242,42 @@ The app must run on **SQLite (local dev/tests) AND Postgres (Neon, for real pers
 
 ## Errors
 - Validation → `422` (FastAPI default). Not found → `404` `{ "detail": "..." }`.
+  Every deliberate `HTTPException` (4xx, and the Plaid 502/503s) keeps FastAPI's
+  default `{ "detail": ... }` shape — unchanged by the 500 handling below.
+- **Unhandled server error → `500` JSON** (`src/api/errors.py`). Any exception a
+  route doesn't catch, and any `ResponseValidationError` (the route returned data
+  its `response_model` rejects, e.g. a stored row that breaks a schema rule),
+  comes back as:
+  ```json
+  {
+    "detail": "Server error: ResponseValidationError: row 0 (id 1662) amount: Input should be greater than 0 (got 0.0) (error ID 3f9c2a1b)",
+    "error": {
+      "id": "3f9c2a1b",
+      "type": "ResponseValidationError",
+      "message": "row 0 (id 1662) amount: Input should be greater than 0 (got 0.0)",
+      "status": 500,
+      "method": "GET",
+      "path": "/api/transactions"
+    }
+  }
+  ```
+  - `detail` is always a human-readable string, so detail-only clients still work.
+  - `error.id` is 8 hex chars, fresh per failure. The **full stack trace is logged
+    server-side only** (logger `expense_tracker.errors`, line
+    `Unhandled <Type> [error_id=<id>] <METHOD> <path>: <message>`). Search the
+    Render logs for the ID. The browser never receives a traceback.
+  - `error.type` + `error.message` are the exception class and message (capped at
+    300 chars). For a `ResponseValidationError` the message is the first pydantic
+    error as `row <index> (id <row id>) <field>: <msg> (got <input>)`, plus
+    `(+N more)` when there are others. The row part is omitted for a single-object
+    response, and `(id …)` when the row has no recoverable id.
+  - Handled in a pure-ASGI middleware that sits **inside** `CORSMiddleware`, so the
+    500 carries CORS headers and a cross-origin browser can read the body (a plain
+    `@app.exception_handler(Exception)` runs outside CORS and would not).
+  - The frontend turns every failure into an `ApiError` (`status`, `method`,
+    `path`, `errorId`, `type`, `cause`), including network failures (`status: null`,
+    "Can't reach the server…"). `<ErrorNotice>` shows a plain-English headline with
+    these in a collapsible **Details** block with a Copy button.
 
 ## CORS
 - Allow origin `http://localhost:3000` (and `*` is fine for dev).

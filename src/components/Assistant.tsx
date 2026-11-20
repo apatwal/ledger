@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Sparkles, X, ArrowUp, Check, ArrowRight } from 'lucide-react'
 import { getAssistantStatus, assistantChat } from '../lib/api'
 import { invalidateLedger } from '../lib/queryKeys'
+import ErrorNotice from './ErrorNotice'
 import type { ChatMessage } from '../lib/types'
 
 // Create-tool names the backend reports in `AssistantReply.tool_calls` when the
@@ -34,7 +35,7 @@ export default function Assistant() {
   const [entries, setEntries] = useState<ChatEntry[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<unknown>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -78,7 +79,7 @@ export default function Assistant() {
         if (ran.includes(CREATE_BUDGET)) void queryClient.invalidateQueries({ queryKey: ['budgets', 'categories'] })
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Something went wrong')
+      setError(e)
     } finally {
       setLoading(false)
     }
@@ -172,7 +173,9 @@ export default function Assistant() {
               </div>
             )}
 
-            {error && <div className="assistant-error">{error}</div>}
+            {error != null && (
+              <ErrorNotice compact title="The assistant couldn't answer" error={error} />
+            )}
           </div>
 
           <div className="assistant-input">

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Plus, Pencil, Trash2, X, Wand2, AlertCircle, Check, ListChecks } from 'lucide-react'
+import { Plus, Pencil, Trash2, X, Wand2, Check, ListChecks } from 'lucide-react'
+import ErrorNotice, { type FailedAction } from './ErrorNotice'
 import {
   getRules,
   createRule,
@@ -30,8 +31,7 @@ export default function Rules() {
   const rulesQuery = useQuery({ queryKey: ['rules'], queryFn: () => getRules() })
   const rules = rulesQuery.data ?? []
   const loading = rulesQuery.isPending
-  const [actionError, setActionError] = useState<string | null>(null)
-  const error = actionError ?? (rulesQuery.error instanceof Error ? rulesQuery.error.message : rulesQuery.error ? 'Failed to load rules' : null)
+  const [actionError, setActionError] = useState<FailedAction | null>(null)
 
   const invalidateRules = () => { void queryClient.invalidateQueries({ queryKey: ['rules'] }) }
 
@@ -99,7 +99,7 @@ export default function Rules() {
       invalidateRules()
       exitSelectMode()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Bulk delete failed')
+      setActionError({ title: "Couldn't delete the selected rules", error: e })
     } finally {
       setBulkBusy(false)
     }
@@ -115,7 +115,7 @@ export default function Rules() {
       await updateRule(rule.id, { enabled: !rule.enabled })
       invalidateRules()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Failed to update rule')
+      setActionError({ title: "Couldn't update the rule", error: e })
     } finally {
       setBusyId(null)
     }
@@ -129,7 +129,7 @@ export default function Rules() {
       setDeleteConfirmId(null)
       invalidateRules()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Delete failed')
+      setActionError({ title: "Couldn't delete the rule", error: e })
     } finally {
       setBusyId(null)
     }
@@ -138,6 +138,7 @@ export default function Rules() {
   async function handleReapply() {
     setApplying(true)
     setApplyMsg(null)
+    setActionError(null)
     try {
       const { updated } = await applyRules({})
       setApplyMsg(`Re-applied rules — ${updated} transaction${updated === 1 ? '' : 's'} updated.`)
@@ -147,7 +148,7 @@ export default function Rules() {
       void queryClient.invalidateQueries({ queryKey: ['stats'] })
       void queryClient.invalidateQueries({ queryKey: ['duplicates'] })
     } catch (e) {
-      setApplyMsg(e instanceof Error ? e.message : 'Failed to apply rules')
+      setActionError({ title: "Couldn't re-apply rules", error: e })
     } finally {
       setApplying(false)
     }
@@ -192,12 +193,19 @@ export default function Rules() {
         </div>
       )}
 
-      {error && (
-        <div className="error-state" style={{ padding: 24, marginBottom: 16 }}>
-          <AlertCircle size={24} />
-          {error}
-        </div>
-      )}
+      {actionError ? (
+        <ErrorNotice
+          title={actionError.title}
+          error={actionError.error}
+          onDismiss={() => setActionError(null)}
+        />
+      ) : rulesQuery.error ? (
+        <ErrorNotice
+          title="Couldn't load rules"
+          error={rulesQuery.error}
+          onRetry={() => void rulesQuery.refetch()}
+        />
+      ) : null}
 
       {selectMode && (
         <div
@@ -369,7 +377,8 @@ function RuleModal({ rule, onClose, onSaved }: { rule: Rule | null; onClose: () 
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: getCategories })
   const { data: accounts = [] } = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
   const [saving, setSaving] = useState(false)
-  const [err, setErr] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null) // client-side validation
+  const [saveError, setSaveError] = useState<unknown>(null)
   const [matchCount, setMatchCount] = useState<number | null>(null)
 
   useEffect(() => {
@@ -413,12 +422,13 @@ function RuleModal({ rule, onClose, onSaved }: { rule: Rule | null; onClose: () 
     }
     setSaving(true)
     setErr(null)
+    setSaveError(null)
     try {
       if (isEdit && rule) await updateRule(rule.id, buildPayload())
       else await createRule(buildPayload())
       onSaved()
     } catch (e2) {
-      setErr(e2 instanceof Error ? e2.message : 'Failed to save rule')
+      setSaveError(e2)
     } finally {
       setSaving(false)
     }
@@ -438,6 +448,9 @@ function RuleModal({ rule, onClose, onSaved }: { rule: Rule | null; onClose: () 
               <div style={{ background: 'var(--danger-dim)', border: '1px solid rgba(168,50,46,0.3)', borderRadius: 'var(--radius-sm)', padding: '10px 14px', color: 'var(--danger)', fontSize: 13, marginBottom: 16 }}>
                 {err}
               </div>
+            )}
+            {saveError != null && (
+              <ErrorNotice compact title="Couldn't save the rule" error={saveError} />
             )}
 
             <div className="form-row">

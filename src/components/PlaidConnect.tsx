@@ -10,7 +10,6 @@ import {
   Wallet,
   Plus,
   CheckCircle,
-  XCircle,
 } from 'lucide-react'
 import {
   getPlaidStatus,
@@ -22,6 +21,7 @@ import {
 } from '../lib/api'
 import type { PlaidItem, PlaidAccount, PlaidSyncResult } from '../lib/types'
 import { invalidateLedger } from '../lib/queryKeys'
+import ErrorNotice, { type FailedAction } from './ErrorNotice'
 
 // Human-friendly "last synced" — relative for recent, absolute for older.
 function formatSynced(iso: string | null): string {
@@ -190,9 +190,7 @@ export default function PlaidConnect() {
   const netWorthQuery = useQuery({ queryKey: ['stats', 'net-worth'], queryFn: getNetWorth })
   const status = statusQuery.data ?? null
   const loading = statusQuery.isPending
-  const [actionError, setActionError] = useState<string | null>(null)
-  const error = actionError
-    ?? (statusQuery.error instanceof Error ? statusQuery.error.message : statusQuery.error ? 'Could not load bank sync status' : null)
+  const [actionError, setActionError] = useState<FailedAction | null>(null)
 
   // Link flow
   const [linkToken, setLinkToken] = useState<string | null>(null)
@@ -245,13 +243,10 @@ export default function PlaidConnect() {
         }
         refresh()
       } catch (e) {
-        setActionError(
-          e instanceof Error
-            ? e.message
-            : update !== null
-              ? 'Could not finish updating your bank'
-              : 'Could not finish connecting your bank',
-        )
+        setActionError({
+          title: update !== null ? "Couldn't finish updating your bank" : "Couldn't finish connecting your bank",
+          error: e,
+        })
       } finally {
         setFinishing(false)
       }
@@ -297,13 +292,10 @@ export default function PlaidConnect() {
       setLinkToken(link_token)
     } catch (e) {
       updating.current = null
-      setActionError(
-        e instanceof Error
-          ? e.message
-          : itemId !== undefined
-            ? 'Could not start updating this bank'
-            : 'Could not start bank connection',
-      )
+      setActionError({
+        title: itemId !== undefined ? "Couldn't start updating this bank" : "Couldn't start the bank connection",
+        error: e,
+      })
     } finally {
       setPreparing(false)
     }
@@ -319,10 +311,10 @@ export default function PlaidConnect() {
       // failures — report them instead of claiming a clean sync.
       const failed = syncFailureNote(res)
       setMsg(syncSummary(res))
-      setActionError(failed)
+      setActionError(failed ? { title: 'Sync finished with problems', error: failed } : null)
       refresh()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Sync failed')
+      setActionError({ title: "Couldn't sync", error: e })
     } finally {
       setSyncingId(null)
     }
@@ -338,7 +330,7 @@ export default function PlaidConnect() {
       setMsg('Bank disconnected. Its imported transactions were removed.')
       refresh()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Could not disconnect')
+      setActionError({ title: "Couldn't disconnect the bank", error: e })
     } finally {
       setRemovingId(null)
     }
@@ -366,6 +358,20 @@ export default function PlaidConnect() {
           <span className="spinner" style={{ width: 15, height: 15 }} />
           Loading your accounts…
         </div>
+      </div>
+    )
+  }
+
+  // Status failed to load — say so, rather than claiming bank sync is off.
+  if (statusQuery.error) {
+    return (
+      <div className="wallet-shell">
+        <ErrorNotice
+          compact
+          title="Couldn't load bank sync status"
+          error={statusQuery.error}
+          onRetry={() => void statusQuery.refetch()}
+        />
       </div>
     )
   }
@@ -446,11 +452,13 @@ export default function PlaidConnect() {
               <span>{msg}</span>
             </div>
           )}
-          {error && (
-            <div className="plaid-note danger">
-              <XCircle size={15} />
-              <span>{error}</span>
-            </div>
+          {actionError && (
+            <ErrorNotice
+              compact
+              title={actionError.title}
+              error={actionError.error}
+              onDismiss={() => setActionError(null)}
+            />
           )}
         </div>
       </section>

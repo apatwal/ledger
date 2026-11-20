@@ -47,6 +47,13 @@ or custom range — is just a query, and year-end stats come for free.
 - **Authentication (Clerk)** — optional Google sign-in via Clerk with server-side
   JWT verification and an email allowlist. Off by default locally; hard-required
   in production (see below).
+- **Readable errors** — when something fails, the page says what in plain English
+  ("Couldn't load transactions") and keeps the technical record behind a
+  **Details** toggle: the request, status, the real cause (e.g.
+  `ResponseValidationError: row 0 (id 1662) amount: …`) and an **error ID**, with a
+  Copy button. Search Render's logs for the error ID to find the full stack trace,
+  which is never sent to the browser. Nothing is stored; it's on screen only. See
+  *Errors* in [`docs/api-contract.md`](docs/api-contract.md).
 - **CSV import (decommissioned)** — a bank-agnostic drag-and-drop importer that
   predates the Plaid integration. Now that the app is Plaid-first, its UI is
   **hidden behind the `CSV_IMPORT_ENABLED` flag** (off by default — see

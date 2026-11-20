@@ -13,6 +13,7 @@ import {
   applyRules,
 } from '../lib/api'
 import { invalidateLedger } from '../lib/queryKeys'
+import ErrorNotice from './ErrorNotice'
 import type { Transaction, TransactionCreate, TransactionType, RuleCreate } from '../lib/types'
 
 // Derive a sensible match token from a description (longest alphabetic word, e.g. "STARBUCKS").
@@ -59,6 +60,7 @@ export default function TransactionModal({ transaction, onClose, onSaved }: Prop
   const [account, setAccount] = useState(transaction?.account ?? '')
   const [saving, setSaving] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [saveError, setSaveError] = useState<unknown>(null) // server-side save failure
 
   const [suggesting, setSuggesting] = useState(false)
 
@@ -163,6 +165,7 @@ export default function TransactionModal({ transaction, onClose, onSaved }: Prop
     }
 
     setSaving(true)
+    setSaveError(null)
     try {
       if (isEdit && transaction) {
         await updateTransaction(transaction.id, data)
@@ -182,7 +185,7 @@ export default function TransactionModal({ transaction, onClose, onSaved }: Prop
       invalidateLedger(queryClient)
       onSaved()
     } catch (err) {
-      setErrors({ submit: err instanceof Error ? err.message : 'Failed to save' })
+      setSaveError(err)
     } finally {
       setSaving(false)
     }
@@ -200,18 +203,8 @@ export default function TransactionModal({ transaction, onClose, onSaved }: Prop
 
         <form onSubmit={(e) => { void handleSubmit(e) }}>
           <div className="modal-body">
-            {errors.submit && (
-              <div style={{
-                background: 'var(--danger-dim)',
-                border: '1px solid rgba(244,63,94,0.3)',
-                borderRadius: 'var(--radius-sm)',
-                padding: '10px 14px',
-                color: 'var(--danger)',
-                fontSize: 13,
-                marginBottom: 16,
-              }}>
-                {errors.submit}
-              </div>
+            {saveError != null && (
+              <ErrorNotice compact title="Couldn't save the transaction" error={saveError} />
             )}
 
             <div className="form-row">
