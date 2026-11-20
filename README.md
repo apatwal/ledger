@@ -150,7 +150,9 @@ add keys.
 
 - **AI** — `OPENAI_API_KEY` (create one at
   <https://platform.openai.com/api-keys>; AI endpoints return `503` when unset),
-  `OPENAI_MODEL` (defaults to `gpt-4o-mini`). OpenAI failures (bad key, rate
+  `OPENAI_MODEL` (defaults to `gpt-4o-mini`), `APP_TIMEZONE` (the IANA zone the
+  AI treats as "today", defaults to `America/New_York`; the server itself runs
+  in UTC). OpenAI failures (bad key, rate
   limit or exhausted quota, timeout) come back as a readable `502`/`503` that the
   Assistant shows in its error notice.
 - **Database** — `DATABASE_URL`; unset uses local SQLite, set a `postgresql://…`

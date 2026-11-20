@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import os
 import json
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -41,11 +42,29 @@ DEFAULT_MODEL = "gpt-4o-mini"
 REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_RETRIES = 1
 
-TODAY = "2026-06-28"
+# The app's "today" is the USER's calendar date, not the server's. Render runs
+# in UTC, so a bare date.today() would flip to tomorrow every US evening.
+# APP_TIMEZONE overrides the default (an unknown zone falls back to UTC).
+DEFAULT_TIMEZONE = "America/New_York"
+
+
+def today() -> date:
+    tz_name = (os.environ.get("APP_TIMEZONE") or "").strip() or DEFAULT_TIMEZONE
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).date()
+
+
+def _date_sentence() -> str:
+    """Computed per request (never at import) so a long-running server stays current."""
+    d = today()
+    return f"Today is {d.strftime('%A')}, {d.isoformat()}."
 
 SYSTEM_INSTRUCTION = (
     "You are the assistant inside a personal expense-tracker app called Expense Tracker. "
-    f"Today's date is {TODAY}. All amounts are in US dollars (USD). "
+    "All amounts are in US dollars (USD). "
     "You can both answer questions AND take actions on the user's behalf using the tools "
     "provided. For questions, never guess at figures — always call a read tool to get real "
     "data, then state the numbers you found. "
@@ -525,7 +544,7 @@ def _dynamic_system_instruction(db: Session) -> str:
         descriptions = []
 
     return (
-        f"{SYSTEM_INSTRUCTION}\n\n"
+        f"{SYSTEM_INSTRUCTION}\n\n{_date_sentence()}\n"
         f"Known categories: {', '.join(categories) or '(none yet)'}.\n"
         f"Connected account labels: {', '.join(labels) or '(none)'}.\n"
         f"Recent transaction descriptions (for inferring rule match text): "
@@ -652,7 +671,7 @@ def suggest_category(
 
 BUDGET_SYSTEM_INSTRUCTION = (
     "You are the budgeting assistant inside a personal expense-tracker app. "
-    f"Today's date is {TODAY}. All amounts are in US dollars (USD). "
+    "All amounts are in US dollars (USD). "
     "The user is asking you to set up budgets. Turn their request into concrete "
     "actions of two kinds:\n"
     "  - kind='goal': a savings goal with a name, a positive target_amount, an "
@@ -715,7 +734,7 @@ def plan_budget(
         client,
         parse=True,
         messages=[
-            {"role": "system", "content": BUDGET_SYSTEM_INSTRUCTION},
+            {"role": "system", "content": f"{BUDGET_SYSTEM_INSTRUCTION}\n\n{_date_sentence()}"},
             {"role": "user", "content": prompt},
         ],
         response_format=_BudgetPlan,

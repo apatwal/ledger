@@ -20,6 +20,10 @@ services:
       # Optional model override (defaults to gpt-4o-mini in code).
       # - key: OPENAI_MODEL
       #   value: gpt-4o-mini
+      # Optional: the user's timezone, which sets "today" for the AI (Render runs
+      # in UTC). Defaults to America/New_York in code.
+      # - key: APP_TIMEZONE
+      #   value: America/New_York
 
       # ── Authentication (Clerk) ────────────────────────────────────────────
       # Forces auth ON in prod: with REQUIRE_AUTH=true (or Render's own RENDER
