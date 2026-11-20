@@ -19,6 +19,16 @@ DATABASE_URL = os.environ.get(
 # such arg but wants pool_pre_ping=True to survive serverless idle-connection drops.
 _IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
+# Name the Postgres driver explicitly. SQLAlchemy 2.1 changed the default driver
+# for a bare postgresql:// URL from psycopg2 to psycopg (v3), which we don't
+# install, so a fresh build crashed at import with "No module named 'psycopg'".
+# Neon/Render hand out bare postgres:// or postgresql:// URLs, so pin psycopg2
+# (requirements.txt) here. A URL that already names a driver is left alone.
+for _bare in ("postgres://", "postgresql://"):
+    if DATABASE_URL.startswith(_bare):
+        DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len(_bare):]
+        break
+
 
 def _int_env(name: str, default: int) -> int:
     """Read a positive-ish int from env, falling back to `default` on unset/blank
