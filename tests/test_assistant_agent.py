@@ -2,7 +2,7 @@
 Unit tests for the Assistant AGENT creation tools (src/api/ai.execute_tool).
 
 These exercise the tool dispatch DIRECTLY against a per-test in-memory DB — no
-live Gemini call is made. They verify that the three creation tools persist the
+live OpenAI call is made. They verify that the three creation tools persist the
 right rows, that creating a rule re-labels existing matching transactions, and
 that invalid arguments return {"error": ...} without creating anything.
 """

@@ -183,7 +183,7 @@ Checking/savings exports differ from credit cards in three ways the importer mus
 - `POST /api/rules/apply` → body `{account?, only_review?}` → re-apply enabled rules to existing transactions → `{ "updated": int }`.
 - `POST /api/rules/preview` → body `RuleCreate` → `{ "matches": int }` (how many existing transactions this rule would hit; powers the "apply to N existing" confirm when learning from an edit).
 - `GET /api/transactions` gains `needs_review?` filter (true/false). Existing `PUT` persists `needs_review`/`review_reason`/`category`/`type`.
-- `POST /api/assistant/categorize-batch` → body `{ids?: int[], only_uncategorized?: bool, account?, start_date?, end_date?}` → for each target txn, reuse `ai.suggest_category(...)`; update `category` and clear `needs_review` when confident → `{ results: [{id, category, confidence}] }`. Gated by `GEMINI_API_KEY` (503 when unset), like other AI endpoints.
+- `POST /api/assistant/categorize-batch` → body `{ids?: int[], only_uncategorized?: bool, account?, start_date?, end_date?}` → for each target txn, reuse `ai.suggest_category(...)`; update `category` and clear `needs_review` when confident → `{ results: [{id, category, confidence}] }`. Gated by `OPENAI_API_KEY` (503 when unset), like other AI endpoints.
 
 ### Reference fixture
 - `tests/fixtures/debit_sample.csv` — synthetic checking statement covering: paycheck (income), credit-card payment (transfer), brokerage deposit, Venmo, Zelle, ATM withdrawal, cash deposit, utilities, check. Regression guard for debit handling + needs_review flagging.
@@ -278,6 +278,36 @@ The app must run on **SQLite (local dev/tests) AND Postgres (Neon, for real pers
     `path`, `errorId`, `type`, `cause`), including network failures (`status: null`,
     "Can't reach the server…"). `<ErrorNotice>` shows a plain-English headline with
     these in a collapsible **Details** block with a Copy button.
+
+## AI assistant (OpenAI)
+All `/api/assistant/*` AI features run on the OpenAI API (official `openai` SDK,
+Chat Completions) from `src/api/ai.py`.
+- **Config:** `OPENAI_API_KEY` (required; unset → every AI endpoint returns **503**
+  `"… Set OPENAI_API_KEY on the server."` and `GET /api/assistant/status` returns
+  `{enabled: false}`), `OPENAI_MODEL` (optional, default `gpt-4o-mini`). Each
+  request has a 30 s timeout and 1 SDK retry (connection errors, 429, 5xx).
+- **Endpoints:** `GET /status` → `{enabled}`; `POST /chat` `{messages:[{role,
+  content}]}` → `{reply: str, tool_calls: str[]}` (deduped names of the tools the
+  model ran, e.g. `create_category_budget`); `POST /categorize` → `{category,
+  confidence}`; `POST /categorize-batch` (above); `POST /budget` (below);
+  `GET /insights?start_date&end_date` → `{insights: str}`.
+- **Chat** is a tool-calling loop (`tools` / `tool_calls`, max 8 rounds) over
+  `ai.execute_tool()`: read tools (`get_financial_summary`,
+  `get_spending_by_category`, `get_income_expense_over_time`,
+  `search_transactions`) and create tools (`create_categorization_rule`,
+  `create_savings_goal`, `create_category_budget`). A tool exception (or bad
+  arguments) is returned to the model as `{"error": "..."}` so it can recover.
+  History roles `assistant`/`model` → `assistant`; anything else → `user`.
+- **Categorize / budget** use strict JSON-schema structured output parsed into
+  pydantic models; a model refusal → **502** with the refusal text.
+- **OpenAI failures** come back as a readable string `detail` starting
+  `"AI request failed: "` (never a traceback, never any part of the key):
+
+  | Cause | Status |
+  |---|---|
+  | Key rejected (401), no access to the model (403), model not found (404) | 503 |
+  | Rate limit, or account out of quota/credits (429) | 503 |
+  | Timeout, connection failure, OpenAI 5xx / other API error, refusal, reply cut off | 502 |
 
 ## CORS
 - Allow origin `http://localhost:3000` (and `*` is fine for dev).
@@ -704,14 +734,14 @@ is reused by goal creation + progress.
 ### Assistant budget-creation — `POST /api/assistant/budget`
 Creates budgets/goals from a natural-language request **immediately** (no approval
 step), then returns a confirmation. Request mirrors `/assistant/chat`:
-`{ messages: [{ role, content }, ...] }`. Gated on `GEMINI_API_KEY` (**503** when
-unset, **502** on provider error, **400** on empty messages) like the other AI
-endpoints.
+`{ messages: [{ role, content }, ...] }`. Gated on `OPENAI_API_KEY` (**503** when
+unset, **502**/**503** on OpenAI errors — see *AI assistant (OpenAI)* — **400** on
+empty messages) like the other AI endpoints.
 
 Flow: the endpoint passes the KNOWN CATEGORIES (distinct `Transaction.category`)
 and connected account labels (`app_account` from every `PlaidItem.accounts_json`)
-to `ai.plan_budget(messages, known_categories, account_labels)`, which uses Gemini
-**structured output** (`response_schema`) to return:
+to `ai.plan_budget(messages, known_categories, account_labels)`, which uses OpenAI
+**structured output** (strict JSON schema via `client.chat.completions.parse`) to return:
 ```
 { actions: [ { kind: "goal", name, target_amount, target_date?, account? }
            | { kind: "category_limit", category, limit_amount } ],

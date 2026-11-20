@@ -31,10 +31,10 @@ one URL in production).
      Neon URL as your local setup so production shares your existing data.
      *(If you skip this, the app falls back to an in-container SQLite file that
      resets on every deploy — fine for a demo, not for real persistence.)*
-   - **`GEMINI_API_KEY`** — your Google Gemini key (for the AI assistant /
+   - **`OPENAI_API_KEY`** — your OpenAI API key (for the AI assistant /
      auto-categorize / insights). Optional: if unset, those endpoints return
      `503` and the rest of the app works normally.
-   - *(Optional)* `GEMINI_MODEL` to override the default `gemini-2.5-flash`.
+   - *(Optional)* `OPENAI_MODEL` to override the default `gpt-4o-mini`.
 
 4. **Deploy.** Render builds the Docker image and starts the service. The health
    check hits `/api/health`.

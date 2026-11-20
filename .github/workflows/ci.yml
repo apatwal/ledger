@@ -34,9 +34,10 @@ jobs:
     # All pytest tests run in-process against the FastAPI app via TestClient,
     # so nothing needs to be excluded here — the full suite runs.
     #
-    # GEMINI_API_KEY is intentionally left UNSET: the tests assert graceful
-    # degradation (HTTP 503) when the key is absent. Do NOT add it as a
-    # secret or env var, or those tests would no longer exercise that path.
+    # OPENAI_API_KEY is intentionally left UNSET: the tests assert graceful
+    # degradation (HTTP 503) when the key is absent, and mock the OpenAI client
+    # everywhere else (tests/conftest.py also strips the key from the env). Do
+    # NOT add it as a secret or env var.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

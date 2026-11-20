@@ -35,8 +35,9 @@ or custom range — is just a query, and year-end stats come for free.
   modal form. Filter by date range, type, category, account, or "needs review".
 - **Budgets** — monthly per-category spending limits and savings goals, tracked
   against live spend. Can be created conversationally through the AI assistant.
-- **AI assistant (Google Gemini)** — on-demand auto-categorization, spending Q&A,
-  and natural-language budget/goal creation. Optional; requires a `GEMINI_API_KEY`.
+- **AI assistant (OpenAI)** — on-demand auto-categorization, spending Q&A,
+  spending insights, and natural-language budget/goal creation. Optional;
+  requires an `OPENAI_API_KEY` (model defaults to `gpt-4o-mini`).
 - **Rules engine + needs-review queue** — user-editable keyword/amount rules that
   set type, category, or account; ambiguous rows are flagged for review instead
   of being silently miscounted.
@@ -65,7 +66,7 @@ or custom range — is just a query, and year-end stats come for free.
 
 - **Backend** — FastAPI, SQLAlchemy 2.x, Pydantic 2.x. SQLite by default
   (zero-config); Postgres-ready via `DATABASE_URL` (e.g. Neon). Plaid
-  (`plaid-python`) for bank sync, Google Gemini SDK (`google-genai`) for AI,
+  (`plaid-python`) for bank sync, the OpenAI Python SDK (`openai`) for AI,
   PyJWT for Clerk session verification, APScheduler for auto-sync.
 - **Frontend** — React 18, Vite 5, TypeScript, React Router, Recharts,
   lucide-react, `@clerk/react`, `react-plaid-link`.
@@ -106,6 +107,11 @@ cp .env.example .env
 
 `.env` and the SQLite database file are gitignored.
 
+To turn on the AI assistant (auto-categorize, Q&A, insights, budget creation),
+set `OPENAI_API_KEY` in `.env` to a key from
+<https://platform.openai.com/api-keys>, and optionally `OPENAI_MODEL` (defaults to
+`gpt-4o-mini`). Without a key the app runs normally and the assistant stays hidden.
+
 ### Backend (port 8000)
 
 ```bash
@@ -142,8 +148,11 @@ Environment variables (see [`.env.example`](.env.example) for the full list and
 notes). Everything is optional for a bare local run; features light up as you
 add keys.
 
-- **AI** — `GEMINI_API_KEY` (AI endpoints return `503` when unset),
-  `GEMINI_MODEL` (defaults to `gemini-2.5-flash`).
+- **AI** — `OPENAI_API_KEY` (create one at
+  <https://platform.openai.com/api-keys>; AI endpoints return `503` when unset),
+  `OPENAI_MODEL` (defaults to `gpt-4o-mini`). OpenAI failures (bad key, rate
+  limit or exhausted quota, timeout) come back as a readable `502`/`503` that the
+  Assistant shows in its error notice.
 - **Database** — `DATABASE_URL`; unset uses local SQLite, set a `postgresql://…`
   URL for Postgres/Neon.
 - **Plaid** — `PLAID_CLIENT_ID`, `PLAID_SECRET`, and `PLAID_ENV`
@@ -169,7 +178,7 @@ single origin — no CORS in prod) deployed to Render with Neon Postgres. See
 
 ```bash
 source .venv/bin/activate
-pytest              # backend unit/integration (in-memory SQLite)
+pytest              # backend unit/integration (in-memory SQLite; OpenAI is mocked)
 npm run e2e         # Playwright end-to-end
 ```
 

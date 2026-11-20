@@ -12,14 +12,14 @@ services:
       # (ephemeral — resets on every deploy), so set this for real persistence.
       - key: DATABASE_URL
         sync: false
-      # Google Gemini key for the AI assistant / auto-categorize / insights.
+      # OpenAI API key for the AI assistant / auto-categorize / insights.
       # sync:false => prompted at deploy, not committed. If unset, AI endpoints
       # return 503 and the rest of the app works normally.
-      - key: GEMINI_API_KEY
+      - key: OPENAI_API_KEY
         sync: false
-      # Optional model override (defaults to gemini-2.5-flash in code).
-      # - key: GEMINI_MODEL
-      #   value: gemini-2.5-flash
+      # Optional model override (defaults to gpt-4o-mini in code).
+      # - key: OPENAI_MODEL
+      #   value: gpt-4o-mini
 
       # ── Authentication (Clerk) ────────────────────────────────────────────
       # Forces auth ON in prod: with REQUIRE_AUTH=true (or Render's own RENDER

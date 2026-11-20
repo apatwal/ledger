@@ -8,9 +8,9 @@ Discipline
     which share `test_engine`). No network, no real DB.
   * Category-budget "spent" is the CURRENT CALENDAR MONTH net expense, so dates
     are computed relative to `date.today()` (prior-month rows must not count).
-  * The Assistant path (`POST /api/assistant/budget`) mocks the Gemini seam:
+  * The Assistant path (`POST /api/assistant/budget`) mocks the AI seam:
     `ai.is_enabled` -> True and `ai.plan_budget` -> a canned plan. Gating (503)
-    is verified by deleting GEMINI_API_KEY, exactly like test_assistant.py.
+    is verified by deleting OPENAI_API_KEY, exactly like test_assistant.py.
 """
 from __future__ import annotations
 
@@ -284,7 +284,7 @@ class TestAssistantBudget:
     }
 
     def _enable(self, monkeypatch, plan):
-        """Patch the Gemini seam: ai.is_enabled -> True, ai.plan_budget -> plan.
+        """Patch the AI seam: ai.is_enabled -> True, ai.plan_budget -> plan.
         The assistant route calls both via the `ai` module ref, so patching the
         module attributes is sufficient (mirrors test_assistant.py)."""
         from src.api import ai as ai_mod
@@ -295,7 +295,7 @@ class TestAssistantBudget:
         )
 
     def test_503_when_key_unset(self, client, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         resp = client.post("/api/assistant/budget",
                            json={"messages": [{"role": "user", "content": "save for japan"}]})
         assert resp.status_code == 503

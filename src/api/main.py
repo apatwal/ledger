@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment (e.g. GEMINI_API_KEY) from a .env file in the project root,
+# Load environment (e.g. OPENAI_API_KEY) from a .env file in the project root,
 # before anything reads os.environ. Robust to the current working directory.
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 

@@ -1,8 +1,11 @@
 """
-AI assistant routes — Gemini-backed Q&A, auto-categorize, and insights.
+AI assistant routes — OpenAI-backed Q&A, auto-categorize, budgets, and insights.
 
-All AI endpoints degrade gracefully: when GEMINI_API_KEY is unset they return 503
-so the frontend can hide the affordances. Provider errors map to 502.
+All AI endpoints degrade gracefully: when OPENAI_API_KEY is unset they return 503
+so the frontend can hide the affordances. OpenAI failures come back as
+ai.AIProviderError and are returned with its status (503 for a bad key, no model
+access, rate limit or quota; 502 for timeouts, unreachable, or upstream errors)
+and readable detail. Any other unexpected error maps to 502.
 """
 from datetime import date
 from typing import Optional
@@ -84,13 +87,15 @@ def status():
 @router.post("/chat")
 def chat(body: ChatRequest, db: Session = Depends(get_db)):
     if not ai.is_enabled():
-        raise HTTPException(503, "AI assistant is not configured. Set GEMINI_API_KEY on the server.")
+        raise HTTPException(503, "AI assistant is not configured. Set OPENAI_API_KEY on the server.")
     if not body.messages:
         raise HTTPException(400, "messages must not be empty")
     try:
         return ai.run_assistant(db, [m.model_dump() for m in body.messages])
     except ai.AINotConfigured as e:
         raise HTTPException(503, str(e))
+    except ai.AIProviderError as e:
+        raise HTTPException(e.status_code, e.detail)
     except Exception as e:  # provider / network errors
         raise HTTPException(502, f"AI request failed: {e}")
 
@@ -98,13 +103,13 @@ def chat(body: ChatRequest, db: Session = Depends(get_db)):
 @router.post("/budget", response_model=BudgetChatResponse)
 def budget(body: BudgetChatRequest, db: Session = Depends(get_db)):
     """Create budgets/goals from a natural-language request, IMMEDIATELY (no
-    approval step). Gemini returns structured actions; each is persisted via the
+    approval step). The model returns structured actions; each is persisted via the
     SAME create helpers the /budgets routes use, then a confirmation is returned.
     When no budget intent is detected (empty actions) the reply is returned with
-    nothing created. Gated on GEMINI_API_KEY (503 when unset), like the other AI
+    nothing created. Gated on OPENAI_API_KEY (503 when unset), like the other AI
     endpoints."""
     if not ai.is_enabled():
-        raise HTTPException(503, "AI assistant is not configured. Set GEMINI_API_KEY on the server.")
+        raise HTTPException(503, "AI assistant is not configured. Set OPENAI_API_KEY on the server.")
     if not body.messages:
         raise HTTPException(400, "messages must not be empty")
 
@@ -122,6 +127,8 @@ def budget(body: BudgetChatRequest, db: Session = Depends(get_db)):
         )
     except ai.AINotConfigured as e:
         raise HTTPException(503, str(e))
+    except ai.AIProviderError as e:
+        raise HTTPException(e.status_code, e.detail)
     except Exception as e:  # provider / network errors
         raise HTTPException(502, f"AI request failed: {e}")
 
@@ -153,7 +160,7 @@ def budget(body: BudgetChatRequest, db: Session = Depends(get_db)):
 @router.post("/categorize")
 def categorize(body: CategorizeRequest, db: Session = Depends(get_db)):
     if not ai.is_enabled():
-        raise HTTPException(503, "AI features are not configured. Set GEMINI_API_KEY on the server.")
+        raise HTTPException(503, "AI features are not configured. Set OPENAI_API_KEY on the server.")
     rows = db.execute(
         sqlalchemy.text("SELECT DISTINCT category FROM transactions ORDER BY category")
     ).scalars().all()
@@ -162,6 +169,8 @@ def categorize(body: CategorizeRequest, db: Session = Depends(get_db)):
         return ai.suggest_category(body.description, body.amount, body.type, known)
     except ai.AINotConfigured as e:
         raise HTTPException(503, str(e))
+    except ai.AIProviderError as e:
+        raise HTTPException(e.status_code, e.detail)
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
 
@@ -171,7 +180,7 @@ def categorize_batch(body: CategorizeBatchRequest, db: Session = Depends(get_db)
     """AI-categorize a set of transactions on demand (v5). Updates each txn's
     category and clears needs_review when the suggestion is confident."""
     if not ai.is_enabled():
-        raise HTTPException(503, "AI features are not configured. Set GEMINI_API_KEY on the server.")
+        raise HTTPException(503, "AI features are not configured. Set OPENAI_API_KEY on the server.")
 
     # Build the target set (direct query — no FastAPI Query sentinels passed in).
     conditions = []
@@ -203,6 +212,8 @@ def categorize_batch(body: CategorizeBatchRequest, db: Session = Depends(get_db)
             suggestion = ai.suggest_category(t.description or "", t.amount, t.type, known)
         except ai.AINotConfigured as e:
             raise HTTPException(503, str(e))
+        except ai.AIProviderError as e:
+            raise HTTPException(e.status_code, e.detail)
         except Exception as e:
             raise HTTPException(502, f"AI request failed: {e}")
         category = suggestion["category"]
@@ -224,10 +235,12 @@ def insights(
     db: Session = Depends(get_db),
 ):
     if not ai.is_enabled():
-        raise HTTPException(503, "AI features are not configured. Set GEMINI_API_KEY on the server.")
+        raise HTTPException(503, "AI features are not configured. Set OPENAI_API_KEY on the server.")
     try:
         return {"insights": ai.generate_insights(db, start_date, end_date)}
     except ai.AINotConfigured as e:
         raise HTTPException(503, str(e))
+    except ai.AIProviderError as e:
+        raise HTTPException(e.status_code, e.detail)
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")

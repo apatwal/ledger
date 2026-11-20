@@ -221,7 +221,7 @@ A user-controlled classification layer for messy debit/checking imports.
   body `{ids?, only_uncategorized?, account?, start_date?, end_date?, limit?}`;
   for each target txn calls `ai.suggest_category`, and when confidence ≥ 0.6
   updates `category` + clears `needs_review`; returns
-  `{results: [{id, category, confidence}]}`. Gated by `GEMINI_API_KEY` (503
+  `{results: [{id, category, confidence}]}`. Gated by `OPENAI_API_KEY` (503
   when unset). Queries are built directly (no FastAPI `Query` sentinels passed
   into internal calls).
 
