@@ -5,6 +5,11 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     plan: free
+    # README/docs-only commits to main skip the Render rebuild.
+    buildFilter:
+      ignoredPaths:
+        - "**/*.md"
+        - docs/**
     envVars:
       # Postgres connection string (Neon). sync:false => Render prompts for it and
       # never stores it in this file. Reuse the SAME Neon URL as local so prod
