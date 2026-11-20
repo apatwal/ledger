@@ -4,7 +4,13 @@ from typing import Literal, Optional
 from pydantic import BaseModel, field_validator
 
 
-class TransactionCreate(BaseModel):
+class TransactionBase(BaseModel):
+    """Transaction fields shared by input and output schemas — NO validators.
+
+    Input rules (amount > 0, non-empty category) live on TransactionCreate only.
+    TransactionOut must not inherit them: response validation runs on every row
+    a read returns, so one stored row that breaks an input rule (e.g. a $0 Plaid
+    brokerage event) would 500 the WHOLE list. Stored data never fails a read."""
     date: date
     amount: float
     type: Literal["income", "expense", "transfer", "refund"]
@@ -15,6 +21,10 @@ class TransactionCreate(BaseModel):
     review_reason: Optional[str] = None
     dup_dismissed: bool = False   # v7
     source: Literal["manual", "csv", "plaid"] = "manual"
+
+
+class TransactionCreate(TransactionBase):
+    """Request body for POST and PUT /transactions — enforces the input rules."""
 
     @field_validator("amount")
     @classmethod
@@ -31,7 +41,8 @@ class TransactionCreate(BaseModel):
         return v.strip()
 
 
-class TransactionOut(TransactionCreate):
+class TransactionOut(TransactionBase):
+    # Inherits TransactionBase (not TransactionCreate) on purpose — see its docstring.
     id: int
     created_at: datetime
     # v8 Plaid provenance (null for manual/csv rows).

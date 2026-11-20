@@ -16,7 +16,8 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { TrendingUp, TrendingDown, LineChart, Wallet, PieChart as PieIcon, Layers } from 'lucide-react'
-import { getHoldings, getSnapshots, captureSnapshot, getInvestmentFlows } from '../lib/api'
+import { ApiError, getHoldings, getSnapshots, captureSnapshot, getInvestmentFlows } from '../lib/api'
+import ErrorNotice from './ErrorNotice'
 import type { Holding } from '../lib/types'
 import { useAccountLabels } from '../lib/accountLabels'
 
@@ -287,9 +288,8 @@ export default function Holdings() {
   const loading = holdingsQ.isPending
   // A 503 means Plaid isn't configured — a "feature off" state, distinct from a
   // real error or "no holdings yet".
-  const errMsg = holdingsQ.error instanceof Error ? holdingsQ.error.message : holdingsQ.error ? 'Could not load holdings' : null
-  const disabled = errMsg?.startsWith('503') ?? false
-  const error = disabled ? null : errMsg
+  const disabled = holdingsQ.error instanceof ApiError && holdingsQ.error.status === 503
+  const error = disabled ? null : holdingsQ.error
 
   // Secondary data — only fetched once holdings resolve so we don't hit these
   // endpoints when Plaid is off. Their errors are swallowed into empty states.
@@ -403,10 +403,11 @@ export default function Holdings() {
           </p>
         </div>
       ) : error ? (
-        <div className="error-state" style={{ padding: 32 }}>
-          <TrendingUp size={28} />
-          <div>{error}</div>
-        </div>
+        <ErrorNotice
+          title="Couldn't load your holdings"
+          error={error}
+          onRetry={() => void holdingsQ.refetch()}
+        />
       ) : holdings.length === 0 ? (
         <div className="empty-state">
           <div className="empty-state-icon">
@@ -593,7 +594,7 @@ export default function Holdings() {
                   {capture.isPending ? 'Capturing…' : 'Capture now'}
                 </button>
                 {capture.isError && (
-                  <div style={{ fontSize: 12, color: C.red }}>Couldn't capture a snapshot right now.</div>
+                  <ErrorNotice compact title="Couldn't capture a snapshot" error={capture.error} />
                 )}
               </div>
             ) : (

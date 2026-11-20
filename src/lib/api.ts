@@ -55,7 +55,7 @@ export function setAuthTokenGetter(fn: (() => Promise<string | null>) | null): v
   authTokenGetter = fn
 }
 
-// Single choke-point for all network calls: injects the bearer token when available.
+// Injects the bearer token when available. Every call goes through send(), below.
 async function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers as HeadersInit | undefined)
   if (authTokenGetter) {
@@ -73,16 +73,171 @@ async function authFetch(url: string, init: RequestInit = {}): Promise<Response>
 type QueryValue = string | number | boolean | string[] | undefined
 type QueryParams = Record<string, QueryValue>
 
+// ─── Errors ──────────────────────────────────────────────────────────────────
+// Every failed request throws an ApiError. `.message` is always a human sentence
+// (the server's `detail`, or a plain-English fallback), so callers that only
+// render `error.message` read fine; <ErrorNotice> uses the other fields for its
+// collapsible Details block.
+export class ApiError extends Error {
+  /** HTTP status, or null when the request never got a response (network down). */
+  readonly status: number | null
+  readonly method: string
+  /** Request path including the query string, e.g. `/api/transactions?limit=51`. */
+  readonly path: string
+  /** Server-issued ID for an unhandled 500 — search Render's logs for it. */
+  readonly errorId: string | null
+  /** Exception class name for an unhandled 500 (e.g. `ResponseValidationError`). */
+  readonly type: string | null
+  /** The underlying reason in technical terms, for the Details block. */
+  readonly cause: string | null
+  /** When it failed — handy for lining the error up with the server log. */
+  readonly at: Date
+
+  constructor(
+    message: string,
+    init: {
+      status: number | null
+      method: string
+      path: string
+      errorId?: string | null
+      type?: string | null
+      cause?: string | null
+    },
+  ) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = init.status
+    this.method = init.method
+    this.path = init.path
+    this.errorId = init.errorId ?? null
+    this.type = init.type ?? null
+    this.cause = init.cause ?? null
+    this.at = new Date()
+  }
+
+  /** True when fetch itself failed — no HTTP response at all. */
+  get isNetwork(): boolean {
+    return this.status === null
+  }
+
+  /** An unhandled server crash (carries an error ID), as opposed to a deliberate HTTPException. */
+  get isServerCrash(): boolean {
+    return this.errorId !== null || this.type !== null
+  }
+}
+
+export const NETWORK_ERROR_MESSAGE = "Can't reach the server. Check your connection, or try again in a moment."
+
+// Reason phrases for when res.statusText is empty — it always is over HTTP/2
+// (Render), which is how "500 : Internal Server Error" used to reach the screen.
+const REASON: Record<number, string> = {
+  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+  405: 'Method Not Allowed', 408: 'Request Timeout', 409: 'Conflict', 413: 'Payload Too Large',
+  422: 'Unprocessable Content', 429: 'Too Many Requests', 500: 'Internal Server Error',
+  502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Timeout',
+}
+
+/** "500 Internal Server Error" — never "500 " with an empty reason. */
+export function statusLabel(status: number, statusText = ''): string {
+  const reason = statusText || REASON[status] || ''
+  return reason ? `${status} ${reason}` : String(status)
+}
+
+// Body text for the Details block when the server didn't send JSON (e.g. a proxy
+// error page). Strip tags and squash whitespace so HTML doesn't swamp the panel.
+function snippet(text: string): string | null {
+  const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!plain) return null
+  return plain.length > 300 ? `${plain.slice(0, 299)}…` : plain
+}
+
+// FastAPI puts the human-readable text in `detail` — a plain string, an object
+// when the route attaches extra context (e.g. the already-linked-bank 409 carries
+// the existing item_id), or a list for a 422. An unhandled 500 also carries a
+// structured `error` object (see src/api/errors.py).
+async function toApiError(res: Response, method: string, path: string): Promise<ApiError> {
+  const text = await res.text().catch(() => '')
+  let body: { detail?: unknown; error?: unknown } | null = null
+  try {
+    body = JSON.parse(text) as { detail?: unknown; error?: unknown }
+  } catch {
+    // not JSON — handled below
+  }
+
+  const detail = body?.detail
+  let message: string | null = null
+  if (typeof detail === 'string' && detail.trim()) {
+    message = detail
+  } else if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+    const msg = (detail as { message?: unknown }).message
+    if (typeof msg === 'string' && msg.trim()) message = msg
+  } else if (Array.isArray(detail) && detail.length) {
+    // 422 RequestValidationError: [{loc, msg, ...}] — show the first one.
+    const first = detail[0] as { loc?: unknown[]; msg?: unknown }
+    const field = Array.isArray(first?.loc) ? first.loc.filter((p) => p !== 'body').join('.') : ''
+    if (typeof first?.msg === 'string') message = field ? `${field}: ${first.msg}` : first.msg
+  }
+
+  const err = body?.error as
+    | { id?: unknown; type?: unknown; message?: unknown }
+    | undefined
+  const str = (v: unknown) => (typeof v === 'string' && v ? v : null)
+  const type = err ? str(err.type) : null
+  const errMessage = err ? str(err.message) : null
+
+  return new ApiError(message ?? `The server responded ${statusLabel(res.status, res.statusText)}.`, {
+    status: res.status,
+    method,
+    path,
+    errorId: err ? str(err.id) : null,
+    type,
+    cause: type && errMessage
+      ? `${type}: ${errMessage}`
+      : message ?? (body ? snippet(JSON.stringify(body)) : snippet(text)),
+  })
+}
+
+// The one place a request goes out. Throws ApiError for a non-2xx response and
+// for a network failure; returns the Response otherwise.
+async function send(path: string, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method ?? 'GET').toUpperCase()
+  const fullPath = `${BASE}${path}`
+  let res: Response
+  try {
+    res = await authFetch(fullPath, init)
+  } catch (e) {
+    throw new ApiError(NETWORK_ERROR_MESSAGE, {
+      status: null,
+      method,
+      path: fullPath,
+      cause: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+    })
+  }
+  if (!res.ok) throw await toApiError(res, method, fullPath)
+  return res
+}
+
+// JSON request → parsed JSON response.
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await authFetch(`${BASE}${path}`, {
+  const res = await send(path, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init.headers as Record<string, string> | undefined) },
   })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
+  try {
+    return (await res.json()) as T
+  } catch (e) {
+    throw new ApiError('The server sent a response the app could not read.', {
+      status: res.status,
+      method: (init.method ?? 'GET').toUpperCase(),
+      path: `${BASE}${path}`,
+      cause: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+    })
   }
-  return res.json() as Promise<T>
+}
+
+// Request whose response body is ignored (DELETEs, 204s).
+async function requestVoid(path: string, init: RequestInit = {}): Promise<void> {
+  await send(path, init)
 }
 
 function toQuery(params: QueryParams): string {
@@ -128,7 +283,7 @@ export async function updateTransaction(id: number, data: TransactionUpdate): Pr
 }
 
 export async function deleteTransaction(id: number): Promise<void> {
-  await authFetch(`${BASE}/transactions/${id}`, { method: 'DELETE' })
+  await requestVoid(`/transactions/${id}`, { method: 'DELETE' })
 }
 
 // ─── CSV ─────────────────────────────────────────────────────────────────────
@@ -142,14 +297,8 @@ export async function importCsv(
   form.append('file', file)
   if (account && account.trim()) form.append('account', account.trim())
   if (statementType) form.append('statement_type', statementType)
-  const res = await authFetch(`${BASE}/transactions/csv`, {
-    method: 'POST',
-    body: form,
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
-  }
+  // No JSON Content-Type: the browser sets the multipart boundary itself.
+  const res = await send('/transactions/csv', { method: 'POST', body: form })
   return res.json() as Promise<CsvImportResult>
 }
 
@@ -167,7 +316,7 @@ export async function reassignImport(id: number, account: string | null): Promis
 }
 
 export async function deleteImport(id: number): Promise<void> {
-  await authFetch(`${BASE}/imports/${id}`, { method: 'DELETE' })
+  await requestVoid(`/imports/${id}`, { method: 'DELETE' })
 }
 
 // ─── Duplicate detection (v7) ────────────────────────────────────────────────
@@ -232,11 +381,7 @@ export async function getHoldings(): Promise<Holding[]> {
 }
 
 export async function deletePlaidItem(id: number): Promise<void> {
-  const res = await authFetch(`${BASE}/plaid/items/${id}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
-  }
+  await requestVoid(`/plaid/items/${id}`, { method: 'DELETE' })
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
@@ -302,17 +447,13 @@ export async function getNicknames(): Promise<AccountNickname[]> {
 }
 
 // Upsert a nickname. A blank nickname reverts/deletes it server-side. Uses
-// authFetch directly so an empty (204) response body doesn't trip JSON parsing.
+// requestVoid so an empty (204) response body doesn't trip JSON parsing.
 export async function upsertNickname(label: string, nickname: string): Promise<void> {
-  const res = await authFetch(`${BASE}/accounts/nicknames`, {
+  await requestVoid('/accounts/nicknames', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ label, nickname }),
   })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
-  }
 }
 
 // Mark (or unmark) an account as a savings destination. Returns the full,
@@ -325,11 +466,7 @@ export async function setSavingsAccount(label: string, is_savings: boolean): Pro
 }
 
 export async function deleteNickname(label: string): Promise<void> {
-  const res = await authFetch(`${BASE}/accounts/nicknames/${encodeURIComponent(label)}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
-  }
+  await requestVoid(`/accounts/nicknames/${encodeURIComponent(label)}`, { method: 'DELETE' })
 }
 
 // ─── Investments: snapshots & flows (investments-viz) ─────────────────────────
@@ -428,7 +565,7 @@ export async function updateRule(id: number, data: RuleUpdate): Promise<Rule> {
 }
 
 export async function deleteRule(id: number): Promise<void> {
-  await authFetch(`${BASE}/rules/${id}`, { method: 'DELETE' })
+  await requestVoid(`/rules/${id}`, { method: 'DELETE' })
 }
 
 export async function bulkDeleteRules(ids: number[]): Promise<{ deleted: number }> {
@@ -473,11 +610,7 @@ export async function updateCategoryBudget(id: number, data: CategoryBudgetUpdat
 }
 
 export async function deleteCategoryBudget(id: number): Promise<void> {
-  const res = await authFetch(`${BASE}/budgets/categories/${id}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
-  }
+  await requestVoid(`/budgets/categories/${id}`, { method: 'DELETE' })
 }
 
 // ─── Budget: savings goals (v9d) ──────────────────────────────────────────────
@@ -501,11 +634,7 @@ export async function updateSavingsGoal(id: number, data: SavingsGoalUpdate): Pr
 }
 
 export async function deleteSavingsGoal(id: number): Promise<void> {
-  const res = await authFetch(`${BASE}/budgets/goals/${id}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status} ${res.statusText}: ${text}`)
-  }
+  await requestVoid(`/budgets/goals/${id}`, { method: 'DELETE' })
 }
 
 // ─── Assistant budget-creation (v9d) ──────────────────────────────────────────

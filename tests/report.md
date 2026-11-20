@@ -176,7 +176,7 @@ and stats count 133 → 144.)
   flagged rows and `?needs_review=false` the other 7; 0 skipped / 0 errors. — PASS
 
 `test_assistant.py::TestCategorizeBatch*` (5) — `POST /assistant/categorize-batch`:
-- 503 when `GEMINI_API_KEY` unset; with AI mocked available (no key/network),
+- 503 when `OPENAI_API_KEY` unset; with AI mocked available (no key/network),
   response shape is `{results:[{id,category,confidence}]}`; a confident
   suggestion (≥0.6) updates category + clears `needs_review`; a low-confidence
   suggestion is returned but does NOT mutate; `ids` targets specific rows. — PASS

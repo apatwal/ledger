@@ -390,6 +390,44 @@ def exchange_public_token(body: ExchangeRequest, db: Session = Depends(get_db)):
         select(PlaidItem).where(PlaidItem.item_id == item_id)
     ).scalar_one_or_none()
 
+    # v13: REFUSE a second Item for a bank that's already linked.
+    #
+    # Running Link again on a connected institution mints a BRAND-NEW Plaid Item
+    # (new item_id), so the upsert above misses and we'd store a second row whose
+    # accounts overlap the first — e.g. picking a new Schwab brokerage account
+    # re-adds the Roth IRA that came with the original link. That double-counts
+    # the account's balance AND its holdings in net worth, and re-imports its
+    # transactions under fresh per-Item ids that no uniqueness rule can catch.
+    #
+    # The supported way to add accounts at a linked bank is update mode with
+    # account selection (POST /plaid/link-token {item_id}), which keeps ONE Item.
+    if existing is None and institution_id:
+        already = db.execute(
+            select(PlaidItem).where(PlaidItem.institution_id == institution_id)
+        ).scalars().first()
+        if already is not None:
+            # Release the Item we just created so it doesn't linger (Plaid bills
+            # per active Item). Best-effort — the 409 matters more than cleanup.
+            try:
+                from plaid.model.item_remove_request import ItemRemoveRequest
+
+                client.item_remove(ItemRemoveRequest(access_token=access_token))
+            except Exception as e:
+                print(f"[plaid] could not release duplicate item for {institution_id}: {e}")
+            name = already.institution_name or "That bank"
+            raise HTTPException(
+                409,
+                {
+                    "code": "INSTITUTION_ALREADY_LINKED",
+                    "item_id": already.id,
+                    "message": (
+                        f"{name} is already connected. Use “Add accounts” on its "
+                        f"card to choose more accounts from this bank — linking it "
+                        f"again would duplicate the accounts you already have."
+                    ),
+                },
+            )
+
     # Build the {account_id: {...}} map (labels + balances), preserving any
     # existing app_account labels when re-linking the same bank.
     prev_accounts = _accounts_map(existing) if existing is not None else None
@@ -481,13 +519,20 @@ def _sync_transactions_for_item(
         for txn in resp.get("added", []):
             label = _account_label(accounts, txn.get("account_id"), fallback)
             mapped = map_transaction(txn, label, is_savings_account=label in savings_labels)
-            if _upsert_transaction(db, item, mapped):
+            outcome = _upsert_transaction(db, item, mapped)
+            if outcome == "inserted":
                 added += 1
+            elif outcome == "deleted":
+                # An "added" replay (cursor reset) of a row that is now $0.
+                removed += 1
         for txn in resp.get("modified", []):
             label = _account_label(accounts, txn.get("account_id"), fallback)
             mapped = map_transaction(txn, label, is_savings_account=label in savings_labels)
-            _upsert_transaction(db, item, mapped)
-            modified += 1
+            outcome = _upsert_transaction(db, item, mapped)
+            if outcome == "deleted":
+                removed += 1          # modified to $0 -> the row is gone
+            elif outcome != "skipped":
+                modified += 1
         for removed_txn in resp.get("removed", []):
             tid = removed_txn.get("transaction_id")
             if tid and _delete_transaction(db, tid):
@@ -513,7 +558,7 @@ def _sync_investments_for_item(client, db: Session, item: PlaidItem) -> dict:
     fallback = item.institution_name or "Plaid"
     end = date.today()
     start = end - timedelta(days=INVESTMENTS_WINDOW_DAYS)
-    added = modified = 0
+    added = modified = removed = 0
     offset = 0
     total = None
 
@@ -531,18 +576,30 @@ def _sync_investments_for_item(client, db: Session, item: PlaidItem) -> dict:
             break
         for inv in batch:
             label = _account_label(accounts, inv.get("account_id"), fallback)
-            if _upsert_transaction(db, item, map_investment_transaction(inv, label)):
+            outcome = _upsert_transaction(db, item, map_investment_transaction(inv, label))
+            if outcome == "inserted":
                 added += 1
-            else:
+            elif outcome == "updated":
                 modified += 1
+            elif outcome == "deleted":
+                removed += 1
         offset += len(batch)
 
-    return {"added": added, "modified": modified, "removed": 0}
+    return {"added": added, "modified": modified, "removed": removed}
 
 
-def _upsert_transaction(db: Session, item: PlaidItem, mapped: dict) -> bool:
-    """Insert (True) or update (False) a Transaction by plaid_transaction_id.
-    Skips rows with no usable id or date.
+def _upsert_transaction(db: Session, item: PlaidItem, mapped: dict) -> str:
+    """Insert or update a Transaction by plaid_transaction_id. Returns what
+    happened: "inserted", "updated", "deleted" or "skipped". Skips rows with no
+    usable id or date.
+
+    ZERO AMOUNTS: Plaid reports brokerage non-cash events — in-kind share
+    transfers ("NVIDIA CORP - XFER"), stock splits — with amount 0. They are not
+    money movement, and a $0 row breaks the app's amount > 0 invariant, so they
+    are never imported ("skipped"). If a row already exists for that id (Plaid
+    modified it to $0, or a cursor-reset replay), it is deleted ("deleted").
+    This is the single choke point for every Plaid import path: /transactions/sync
+    added + modified, and /investments/transactions/get.
 
     SELF-HEALING (v13): this used to use scalar_one_or_none(), which RAISED
     MultipleResultsFound on a DB that already had duplicate rows for one Plaid id
@@ -551,7 +608,9 @@ def _upsert_transaction(db: Session, item: PlaidItem, mapped: dict) -> bool:
     so an un-migrated DB heals itself instead of failing forever."""
     pid = mapped.get("plaid_transaction_id")
     if not pid or mapped.get("date") is None:
-        return False
+        return "skipped"
+    if not (mapped.get("amount") or 0) > 0:
+        return "deleted" if _delete_transaction(db, pid) else "skipped"
     rows = db.execute(
         select(Transaction)
         .where(Transaction.plaid_transaction_id == pid)
@@ -580,7 +639,7 @@ def _upsert_transaction(db: Session, item: PlaidItem, mapped: dict) -> bool:
             category_icon_url=mapped.get("category_icon_url"),
         )
         db.add(obj)
-        return True
+        return "inserted"
     existing.date = mapped["date"]
     existing.amount = mapped["amount"]
     existing.type = mapped["type"]
@@ -595,11 +654,12 @@ def _upsert_transaction(db: Session, item: PlaidItem, mapped: dict) -> bool:
     existing.pending = bool(mapped.get("pending", False))
     existing.pending_transaction_id = mapped.get("pending_transaction_id")
     existing.category_icon_url = mapped.get("category_icon_url")
-    return False
+    return "updated"
 
 
 def _delete_transaction(db: Session, plaid_transaction_id: str) -> bool:
-    """Delete the row(s) for a Plaid transaction Plaid told us it removed. Deletes
+    """Delete the row(s) for a Plaid transaction Plaid told us it removed (or that
+    became $0 — see _upsert_transaction). Deletes
     EVERY copy — a pre-index duplicate must not survive its own removal (v13)."""
     rows = db.execute(
         select(Transaction).where(Transaction.plaid_transaction_id == plaid_transaction_id)
@@ -681,6 +741,7 @@ def _sync_items_locked(db: Session, item_id: int | None = None) -> dict:
                 inv_res = _sync_investments_for_item(client, db, item)
                 added += inv_res["added"]
                 modified += inv_res["modified"]
+                removed += inv_res["removed"]
             except Exception:
                 pass
 

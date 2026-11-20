@@ -5,6 +5,7 @@ import { Upload, FileText, CheckCircle, AlertTriangle, XCircle, X, ArrowLeftRigh
 import { importCsv, getAccounts, getAssistantStatus, categorizeBatch, getImports, reassignImport, deleteImport } from '../lib/api'
 import type { CsvImportResult, ImportBatch, StatementType } from '../lib/types'
 import { invalidateLedger } from '../lib/queryKeys'
+import ErrorNotice, { type FailedAction } from './ErrorNotice'
 
 // Lightweight client-side peek: does the file look like a bank/checking export
 // (a header row with a running-balance / balance column)? If so, pre-select "bank".
@@ -31,9 +32,10 @@ export default function CsvImport() {
   const [importing, setImporting] = useState(false)
   const [result, setResult] = useState<CsvImportResult | null>(null)
   const [importedAccount, setImportedAccount] = useState('')
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<FailedAction | null>(null)
   const [categorizing, setCategorizing] = useState(false)
   const [aiMsg, setAiMsg] = useState<string | null>(null)
+  const [aiError, setAiError] = useState<unknown>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   const { data: accounts = [] } = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
@@ -45,6 +47,7 @@ export default function CsvImport() {
   const [batchBusyId, setBatchBusyId] = useState<number | null>(null)
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null)
   const [batchMsg, setBatchMsg] = useState<string | null>(null)
+  const [batchError, setBatchError] = useState<FailedAction | null>(null)
 
   // A reassign/undo/import changes the ledger and the import list itself.
   const invalidateAfterImportChange = () => {
@@ -55,12 +58,13 @@ export default function CsvImport() {
   async function handleReassign(batch: ImportBatch, account: string) {
     setBatchBusyId(batch.id)
     setBatchMsg(null)
+    setBatchError(null)
     try {
       const { updated } = await reassignImport(batch.id, account || null)
       setBatchMsg(`Reassigned ${updated} transaction${updated === 1 ? '' : 's'} to ${account.trim() || 'Unassigned'}.`)
       invalidateAfterImportChange()
     } catch (e) {
-      setBatchMsg(e instanceof Error ? e.message : 'Reassign failed')
+      setBatchError({ title: "Couldn't reassign the import", error: e })
     } finally {
       setBatchBusyId(null)
     }
@@ -69,13 +73,14 @@ export default function CsvImport() {
   async function handleDeleteImport(id: number) {
     setBatchBusyId(id)
     setBatchMsg(null)
+    setBatchError(null)
     try {
       await deleteImport(id)
       setDeleteConfirmId(null)
       setBatchMsg('Import undone — its transactions were removed.')
       invalidateAfterImportChange()
     } catch (e) {
-      setBatchMsg(e instanceof Error ? e.message : 'Delete failed')
+      setBatchError({ title: "Couldn't undo the import", error: e })
     } finally {
       setBatchBusyId(null)
     }
@@ -84,6 +89,7 @@ export default function CsvImport() {
   async function handleAutoCategorize() {
     setCategorizing(true)
     setAiMsg(null)
+    setAiError(null)
     try {
       const { results } = await categorizeBatch({
         only_uncategorized: true,
@@ -93,7 +99,7 @@ export default function CsvImport() {
       void queryClient.invalidateQueries({ queryKey: ['transactions'] })
       void queryClient.invalidateQueries({ queryKey: ['stats'] })
     } catch (e) {
-      setAiMsg(e instanceof Error ? e.message : 'Auto-categorize failed')
+      setAiError(e)
     } finally {
       setCategorizing(false)
     }
@@ -101,7 +107,7 @@ export default function CsvImport() {
 
   const handleFile = useCallback((f: File) => {
     if (!f.name.toLowerCase().endsWith('.csv')) {
-      setError('Please select a CSV file (.csv)')
+      setError({ title: "That isn't a CSV file", error: 'Please select a CSV file (.csv).' })
       return
     }
     setFile(f)
@@ -138,7 +144,7 @@ export default function CsvImport() {
       if (inputRef.current) inputRef.current.value = ''
       invalidateAfterImportChange()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Import failed')
+      setError({ title: "Couldn't import the CSV", error: e })
     } finally {
       setImporting(false)
     }
@@ -300,21 +306,12 @@ export default function CsvImport() {
 
       {/* Error */}
       {error && (
-        <div style={{
-          marginTop: 16,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 10,
-          padding: '12px 16px',
-          background: 'var(--danger-dim)',
-          border: '1px solid rgba(244,63,94,0.3)',
-          borderRadius: 'var(--radius-sm)',
-          color: 'var(--danger)',
-          fontSize: 14,
-        }}>
-          <XCircle size={18} />
-          {error}
-        </div>
+        <ErrorNotice
+          className="csv-error-notice"
+          title={error.title}
+          error={error.error}
+          onDismiss={() => setError(null)}
+        />
       )}
 
       {/* Import Button */}
@@ -416,6 +413,9 @@ export default function CsvImport() {
               {aiMsg}
             </div>
           )}
+          {aiError != null && (
+            <ErrorNotice compact title="Couldn't auto-categorize" error={aiError} />
+          )}
 
           {result.transfers > 0 && (
             <div style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.6 }}>
@@ -469,6 +469,14 @@ export default function CsvImport() {
             <Check size={14} style={{ color: 'var(--green)' }} />
             {batchMsg}
           </div>
+        )}
+        {batchError && (
+          <ErrorNotice
+            compact
+            title={batchError.title}
+            error={batchError.error}
+            onDismiss={() => setBatchError(null)}
+          />
         )}
 
         {imports.length === 0 ? (

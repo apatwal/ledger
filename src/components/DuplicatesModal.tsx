@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { X, Copy, AlertCircle } from 'lucide-react'
+import { X, Copy } from 'lucide-react'
 import { getDuplicates, dismissDuplicates, deleteTransaction } from '../lib/api'
 import type { DuplicateGroup } from '../lib/types'
+import ErrorNotice, { type FailedAction } from './ErrorNotice'
 import { acctKey } from '../lib/queryKeys'
 
 interface Props {
@@ -32,8 +33,7 @@ export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
   })
   const groups: DuplicateGroup[] = dupQuery.data ?? []
   const loading = dupQuery.isPending
-  const [actionError, setActionError] = useState<string | null>(null)
-  const error = actionError ?? (dupQuery.error instanceof Error ? dupQuery.error.message : dupQuery.error ? 'Failed to load duplicates' : null)
+  const [actionError, setActionError] = useState<FailedAction | null>(null)
 
   // key of the group with a pending in-flight action, so we can disable its buttons
   const [busyKey, setBusyKey] = useState<string | null>(null)
@@ -64,7 +64,7 @@ export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
       onChanged?.()
       invalidateAfterDupChange()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Failed to dismiss group')
+      setActionError({ title: "Couldn't dismiss the group", error: e })
     } finally {
       setBusyKey(null)
       setConfirmKey(null)
@@ -84,7 +84,7 @@ export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
       onChanged?.()
       invalidateAfterDupChange()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Failed to delete extra charges')
+      setActionError({ title: "Couldn't delete the extra charges", error: e })
     } finally {
       setBusyKey(null)
       setConfirmKey(null)
@@ -102,12 +102,21 @@ export default function DuplicatesModal({ params, onClose, onChanged }: Props) {
         </div>
 
         <div className="modal-body" style={{ maxHeight: '65vh', overflowY: 'auto' }}>
-          {error && (
-            <div className="dup-error">
-              <AlertCircle size={15} />
-              {error}
-            </div>
-          )}
+          {actionError ? (
+            <ErrorNotice
+              compact
+              title={actionError.title}
+              error={actionError.error}
+              onDismiss={() => setActionError(null)}
+            />
+          ) : dupQuery.error ? (
+            <ErrorNotice
+              compact
+              title="Couldn't check for duplicates"
+              error={dupQuery.error}
+              onRetry={() => void dupQuery.refetch()}
+            />
+          ) : null}
 
           {loading ? (
             <div className="loading-state" style={{ padding: 32 }}>

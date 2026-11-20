@@ -510,6 +510,73 @@ class TestDeleteTransaction:
 
 
 # ---------------------------------------------------------------------------
+# Stored rows never fail a read. Input rules (amount > 0) belong to
+# TransactionCreate only; TransactionOut must serialize whatever is stored.
+# Regression: 19 $0 Plaid brokerage rows (in-kind XFERs, splits) made response
+# validation fail and GET /api/transactions returned a bare 500.
+# ---------------------------------------------------------------------------
+
+def _seed_zero_row(session, description="NVIDIA CORP - XFER", type_="transfer"):
+    from datetime import date
+    from src.api.models import Transaction
+
+    row = Transaction(
+        date=date(2026, 6, 1), amount=0.0, type=type_, category="Investment",
+        description=description, account="Brokerage", source="plaid",
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+class TestStoredRowsNeverFailRead:
+
+    def test_out_schema_accepts_zero_but_create_rejects_it(self):
+        from datetime import datetime
+        from pydantic import ValidationError
+        from src.api.schemas import TransactionCreate, TransactionOut
+
+        fields = {"date": "2026-06-01", "amount": 0.0, "type": "transfer",
+                  "category": "Investment"}
+        out = TransactionOut(**fields, id=1, created_at=datetime(2026, 6, 1))
+        assert out.amount == 0.0
+        with pytest.raises(ValidationError):
+            TransactionCreate(**fields)
+
+    def test_list_with_zero_amount_row_is_200(self, client, test_session):
+        _seed_zero_row(test_session)
+        client.post("/api/transactions", json={
+            "date": "2026-06-02", "amount": 12.0, "type": "expense", "category": "Dining",
+        })
+        resp = client.get("/api/transactions")
+        assert resp.status_code == 200
+        assert sorted(t["amount"] for t in resp.json()) == [0.0, 12.0]
+
+    def test_get_zero_amount_row_by_id_is_200(self, client, test_session):
+        row = _seed_zero_row(test_session)
+        resp = client.get(f"/api/transactions/{row.id}")
+        assert resp.status_code == 200
+        assert resp.json()["amount"] == 0.0
+
+    def test_duplicates_with_zero_amount_group_is_200(self, client, test_session):
+        """/api/duplicates builds TransactionOut too (it only groups expense
+        rows) — a $0 duplicate expense pair must not 500 it either."""
+        _seed_zero_row(test_session, type_="expense")
+        _seed_zero_row(test_session, type_="expense")
+        resp = client.get("/api/duplicates")
+        assert resp.status_code == 200
+        assert [g["count"] for g in resp.json()] == [2]
+
+    def test_put_still_rejects_zero_amount(self, client, test_session):
+        row = _seed_zero_row(test_session)
+        resp = client.put(f"/api/transactions/{row.id}", json={
+            "date": "2026-06-01", "amount": 0.0, "type": "transfer", "category": "Investment",
+        })
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # Health + miscellaneous
 # ---------------------------------------------------------------------------
 

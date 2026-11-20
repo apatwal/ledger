@@ -15,7 +15,8 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts'
-import { TrendingDown, Sparkles, Copy, Landmark } from 'lucide-react'
+import { Sparkles, Copy, Landmark } from 'lucide-react'
+import ErrorNotice from './ErrorNotice'
 import {
   getStatsSummary,
   getStatsByCategory,
@@ -191,8 +192,7 @@ export default function Dashboard() {
   const overTime = overTimeQ.data ?? []
   const byAccount = byAccountQ.data ?? []
   const loading = summaryQ.isPending || byCategoryQ.isPending || overTimeQ.isPending || byAccountQ.isPending
-  const firstError = summaryQ.error ?? byCategoryQ.error ?? overTimeQ.error ?? byAccountQ.error
-  const error = firstError instanceof Error ? firstError.message : firstError ? 'Failed to load data' : null
+  const error = summaryQ.error ?? byCategoryQ.error ?? overTimeQ.error ?? byAccountQ.error
 
   // Refresh/retry forces every filtered stats + duplicates variant to refetch.
   const loadData = useCallback(() => {
@@ -226,7 +226,7 @@ export default function Dashboard() {
 
   const [insights, setInsights] = useState<string | null>(null)
   const [insightsLoading, setInsightsLoading] = useState(false)
-  const [insightsError, setInsightsError] = useState<string | null>(null)
+  const [insightsError, setInsightsError] = useState<unknown>(null)
 
   const loadInsights = useCallback(async () => {
     setInsightsLoading(true)
@@ -235,7 +235,7 @@ export default function Dashboard() {
       const res = await getInsights({ start_date: startDate, end_date: endDate })
       setInsights(res.insights)
     } catch (e) {
-      setInsightsError(e instanceof Error ? e.message : 'Failed to generate insights')
+      setInsightsError(e)
     } finally {
       setInsightsLoading(false)
     }
@@ -394,13 +394,7 @@ export default function Dashboard() {
       )}
 
       {error && (
-        <div className="error-state">
-          <TrendingDown size={32} />
-          <div>{error}</div>
-          <button className="btn btn-secondary btn-sm" onClick={() => void loadData()}>
-            Retry
-          </button>
-        </div>
+        <ErrorNotice title="Couldn't load your dashboard" error={error} onRetry={() => void loadData()} />
       )}
 
       {!loading && !error && summary && (
@@ -486,14 +480,16 @@ export default function Dashboard() {
           )}
 
           {/* AI insights */}
-          {aiEnabled && (insights || insightsLoading || insightsError) && (
+          {aiEnabled && (insights || insightsLoading || insightsError != null) && (
             <section className="insights-card">
               <div className="insights-head">
                 <Sparkles size={14} />
                 <span>Insights</span>
               </div>
               {insightsLoading && <div className="insights-loading">Reading your ledger…</div>}
-              {insightsError && <div className="insights-error">{insightsError}</div>}
+              {insightsError != null && (
+                <ErrorNotice compact title="Couldn't generate insights" error={insightsError} />
+              )}
               {insights && !insightsLoading && <p className="insights-text">{insights}</p>}
             </section>
           )}

@@ -42,6 +42,12 @@ user see total spending AND spending broken down by card.
 ## Pydantic Schemas
 - `TransactionCreate`: `{ date, amount, type, category, description? , source?, account? }`
 - `TransactionOut`: all columns including `id`, `created_at`, `account`.
+- Input rules (`amount > 0`, non-empty `category`) are enforced on
+  `TransactionCreate` (POST and PUT bodies) **only**. `TransactionOut` shares
+  the fields via a validator-free `TransactionBase` and never re-applies them:
+  response validation runs on every row a read returns, so one stored row that
+  breaks an input rule would otherwise 500 the whole list. Stored data never
+  fails a read (regression: $0 Plaid brokerage rows 500'd `GET /api/transactions`).
 
 ## Endpoints
 
@@ -177,7 +183,7 @@ Checking/savings exports differ from credit cards in three ways the importer mus
 - `POST /api/rules/apply` → body `{account?, only_review?}` → re-apply enabled rules to existing transactions → `{ "updated": int }`.
 - `POST /api/rules/preview` → body `RuleCreate` → `{ "matches": int }` (how many existing transactions this rule would hit; powers the "apply to N existing" confirm when learning from an edit).
 - `GET /api/transactions` gains `needs_review?` filter (true/false). Existing `PUT` persists `needs_review`/`review_reason`/`category`/`type`.
-- `POST /api/assistant/categorize-batch` → body `{ids?: int[], only_uncategorized?: bool, account?, start_date?, end_date?}` → for each target txn, reuse `ai.suggest_category(...)`; update `category` and clear `needs_review` when confident → `{ results: [{id, category, confidence}] }`. Gated by `GEMINI_API_KEY` (503 when unset), like other AI endpoints.
+- `POST /api/assistant/categorize-batch` → body `{ids?: int[], only_uncategorized?: bool, account?, start_date?, end_date?}` → for each target txn, reuse `ai.suggest_category(...)`; update `category` and clear `needs_review` when confident → `{ results: [{id, category, confidence}] }`. Gated by `OPENAI_API_KEY` (503 when unset), like other AI endpoints.
 
 ### Reference fixture
 - `tests/fixtures/debit_sample.csv` — synthetic checking statement covering: paycheck (income), credit-card payment (transfer), brokerage deposit, Venmo, Zelle, ATM withdrawal, cash deposit, utilities, check. Regression guard for debit handling + needs_review flagging.
@@ -236,6 +242,72 @@ The app must run on **SQLite (local dev/tests) AND Postgres (Neon, for real pers
 
 ## Errors
 - Validation → `422` (FastAPI default). Not found → `404` `{ "detail": "..." }`.
+  Every deliberate `HTTPException` (4xx, and the Plaid 502/503s) keeps FastAPI's
+  default `{ "detail": ... }` shape — unchanged by the 500 handling below.
+- **Unhandled server error → `500` JSON** (`src/api/errors.py`). Any exception a
+  route doesn't catch, and any `ResponseValidationError` (the route returned data
+  its `response_model` rejects, e.g. a stored row that breaks a schema rule),
+  comes back as:
+  ```json
+  {
+    "detail": "Server error: ResponseValidationError: row 0 (id 1662) amount: Input should be greater than 0 (got 0.0) (error ID 3f9c2a1b)",
+    "error": {
+      "id": "3f9c2a1b",
+      "type": "ResponseValidationError",
+      "message": "row 0 (id 1662) amount: Input should be greater than 0 (got 0.0)",
+      "status": 500,
+      "method": "GET",
+      "path": "/api/transactions"
+    }
+  }
+  ```
+  - `detail` is always a human-readable string, so detail-only clients still work.
+  - `error.id` is 8 hex chars, fresh per failure. The **full stack trace is logged
+    server-side only** (logger `expense_tracker.errors`, line
+    `Unhandled <Type> [error_id=<id>] <METHOD> <path>: <message>`). Search the
+    Render logs for the ID. The browser never receives a traceback.
+  - `error.type` + `error.message` are the exception class and message (capped at
+    300 chars). For a `ResponseValidationError` the message is the first pydantic
+    error as `row <index> (id <row id>) <field>: <msg> (got <input>)`, plus
+    `(+N more)` when there are others. The row part is omitted for a single-object
+    response, and `(id …)` when the row has no recoverable id.
+  - Handled in a pure-ASGI middleware that sits **inside** `CORSMiddleware`, so the
+    500 carries CORS headers and a cross-origin browser can read the body (a plain
+    `@app.exception_handler(Exception)` runs outside CORS and would not).
+  - The frontend turns every failure into an `ApiError` (`status`, `method`,
+    `path`, `errorId`, `type`, `cause`), including network failures (`status: null`,
+    "Can't reach the server…"). `<ErrorNotice>` shows a plain-English headline with
+    these in a collapsible **Details** block with a Copy button.
+
+## AI assistant (OpenAI)
+All `/api/assistant/*` AI features run on the OpenAI API (official `openai` SDK,
+Chat Completions) from `src/api/ai.py`.
+- **Config:** `OPENAI_API_KEY` (required; unset → every AI endpoint returns **503**
+  `"… Set OPENAI_API_KEY on the server."` and `GET /api/assistant/status` returns
+  `{enabled: false}`), `OPENAI_MODEL` (optional, default `gpt-4o-mini`). Each
+  request has a 30 s timeout and 1 SDK retry (connection errors, 429, 5xx).
+- **Endpoints:** `GET /status` → `{enabled}`; `POST /chat` `{messages:[{role,
+  content}]}` → `{reply: str, tool_calls: str[]}` (deduped names of the tools the
+  model ran, e.g. `create_category_budget`); `POST /categorize` → `{category,
+  confidence}`; `POST /categorize-batch` (above); `POST /budget` (below);
+  `GET /insights?start_date&end_date` → `{insights: str}`.
+- **Chat** is a tool-calling loop (`tools` / `tool_calls`, max 8 rounds) over
+  `ai.execute_tool()`: read tools (`get_financial_summary`,
+  `get_spending_by_category`, `get_income_expense_over_time`,
+  `search_transactions`) and create tools (`create_categorization_rule`,
+  `create_savings_goal`, `create_category_budget`). A tool exception (or bad
+  arguments) is returned to the model as `{"error": "..."}` so it can recover.
+  History roles `assistant`/`model` → `assistant`; anything else → `user`.
+- **Categorize / budget** use strict JSON-schema structured output parsed into
+  pydantic models; a model refusal → **502** with the refusal text.
+- **OpenAI failures** come back as a readable string `detail` starting
+  `"AI request failed: "` (never a traceback, never any part of the key):
+
+  | Cause | Status |
+  |---|---|
+  | Key rejected (401), no access to the model (403), model not found (404) | 503 |
+  | Rate limit, or account out of quota/credits (429) | 503 |
+  | Timeout, connection failure, OpenAI 5xx / other API error, refusal, reply cut off | 502 |
 
 ## CORS
 - Allow origin `http://localhost:3000` (and `*` is fine for dev).
@@ -331,11 +403,11 @@ existing tests pass, and every `/api/plaid/*` network endpoint returns `503`
 ### Endpoints (all under `/api/plaid`)
 - `GET /status` → `PlaidStatus { configured: bool, env: str, products: string[], items: PlaidItemOut[] }`. **Works without keys** (`configured=false`). Never 503.
 - `POST /link-token` body `{ item_id?: int|null }` (body optional) → `{ link_token, expiration }`. With no `item_id`, creates a normal new-link token (products/country codes from env, `client_user_id="local-user"`, optional redirect_uri). With an `item_id`, creates an **update-mode** token instead: bound to that item's `access_token`, `update.account_selection_enabled=true`, and **no `products`** (Plaid rejects products alongside an access_token). **503** if unconfigured; **404** if the `item_id` doesn't exist.
-- `POST /exchange` body `{ public_token }` → `PlaidItemOut`. Exchanges for an access_token, fetches accounts + best-effort institution name, stores/updates a `PlaidItem` (account label = `"{name} ••{mask}"`). Clears any recorded `error_code`/`error_message`. **503** if unconfigured.
+- `POST /exchange` body `{ public_token }` → `PlaidItemOut`. Exchanges for an access_token, fetches accounts + best-effort institution name, stores/updates a `PlaidItem` (account label = `"{name} ••{mask}"`). Clears any recorded `error_code`/`error_message`. **503** if unconfigured; **409** `INSTITUTION_ALREADY_LINKED` when that bank is already connected (see *One Item per institution*).
 - `POST /sync` body `{ item_id?: int|null }` → `PlaidSyncResult { items_synced, added, modified, removed, errors }`. Syncs one item, or ALL items when `item_id` is null. **503** if unconfigured; **404** if a given `item_id` doesn't exist; **409** if another sync is already running (see *Sync serialization*).
 - `POST /sync-all` (header `X-Plaid-Sync-Token` required only when `PLAID_SYNC_TOKEN` set) → `PlaidSyncResult`. Cron/scheduler friendly; **401** on token mismatch, **409** if a sync is already running, **503** if unconfigured.
 - `GET /items` → `PlaidItemOut[]`. **Works without keys.**
-- `DELETE /items/{id}` → `204`. Best-effort Plaid `item/remove`, then deletes the `PlaidItem` row. **Keeps the imported transactions** — just nulls their `plaid_item_id`. **404** if not found.
+- `DELETE /items/{id}` → `204`. Best-effort Plaid `item/remove`, then **deletes that item's imported transactions** and the `PlaidItem` row. **404** if not found.
 
 `PlaidItemOut { id, item_id, institution_id?, institution_name?, accounts: PlaidAccount[], status, error_code?, error_message?, last_synced_at?, created_at }`; `PlaidAccount { account_id, name?, mask?, type?, subtype?, app_account? }`. **No `access_token` field anywhere.**
 
@@ -363,6 +435,36 @@ and commits. So:
 Before v13 the loop had no per-item guard: the first failing item raised straight
 out of `sync_items()`, every item ordered after it was silently skipped, and the
 route mapped the exception to a `502` that named no institution.
+
+### One Item per institution (v13)
+Running Link again on an already-connected bank does **not** refresh it — Plaid
+mints a brand-new Item with a new `item_id`, so the upsert-by-`item_id` in
+`/exchange` misses and a second `PlaidItem` gets stored covering accounts the
+first one already had. Adding one new Schwab brokerage account therefore
+re-added the existing Roth IRA, and because `GET /stats/net-worth` and
+`compute_holdings()` both iterate **every** item, that account's balance and
+holdings were counted twice. Its transactions came back too, under fresh
+per-Item ids that the `plaid_transaction_id` uniqueness rule cannot detect.
+
+`/exchange` now refuses it: if the exchanged item's `institution_id` matches an
+existing `PlaidItem` (and it isn't the same `item_id`), the route calls Plaid
+`item/remove` to release the Item it just minted — an unused Item is still
+billable — and returns **409**:
+
+```json
+{"detail": {
+  "code": "INSTITUTION_ALREADY_LINKED",
+  "item_id": 3,
+  "message": "Charles Schwab is already connected. Use “Add accounts” on its card …"
+}}
+```
+
+The supported way to add an account at a linked bank is **update mode**:
+`POST /plaid/link-token {item_id}` → Link reopens with account selection against
+the SAME Item, so accounts already linked cannot be added twice. The wallet
+exposes it as **+ / Add accounts** on each card (and as **Reconnect** on a card
+in the error state — same endpoint, same guarantee). A re-link that Plaid hands
+back with the *same* `item_id` is a genuine refresh and still upserts in place.
 
 ### Sync serialization + duplicate prevention (v13)
 `transactions.plaid_transaction_id` carries a **UNIQUE partial index**
@@ -404,6 +506,19 @@ by `investment_transaction_id`. The new cursor + `last_synced_at` are persisted,
 so re-running sync never duplicates rows (safe to call repeatedly / on a
 schedule). Investments are best-effort — an item without the investments product
 is skipped, not failed.
+
+### Zero-amount rows are never imported
+Plaid reports brokerage **non-cash** events — in-kind share transfers
+(`NVIDIA CORP - XFER`), forward and reverse stock splits — with `amount = 0`.
+They arrive on the investments path (`/investments/transactions/get`), but the
+rule lives in `_upsert_transaction`, so it covers every Plaid import path
+(`/transactions/sync` `added` + `modified`, the investments pull, and the
+savings-toggle re-sync):
+- a $0 row that isn't stored yet is **skipped** (not counted in `added`/`modified`);
+- a $0 event for a row that already exists (Plaid modified it to $0, or a
+  cursor-reset replay) **deletes** it, every copy, like a `removed` event, and
+  counts in `removed`.
+This keeps the `amount > 0` invariant for Plaid rows.
 
 ### Categorization — trust Plaid (no rules engine / needs-review / AI)
 Plaid rows map `personal_finance_category` **directly**; they never run the
@@ -619,14 +734,14 @@ is reused by goal creation + progress.
 ### Assistant budget-creation — `POST /api/assistant/budget`
 Creates budgets/goals from a natural-language request **immediately** (no approval
 step), then returns a confirmation. Request mirrors `/assistant/chat`:
-`{ messages: [{ role, content }, ...] }`. Gated on `GEMINI_API_KEY` (**503** when
-unset, **502** on provider error, **400** on empty messages) like the other AI
-endpoints.
+`{ messages: [{ role, content }, ...] }`. Gated on `OPENAI_API_KEY` (**503** when
+unset, **502**/**503** on OpenAI errors — see *AI assistant (OpenAI)* — **400** on
+empty messages) like the other AI endpoints.
 
 Flow: the endpoint passes the KNOWN CATEGORIES (distinct `Transaction.category`)
 and connected account labels (`app_account` from every `PlaidItem.accounts_json`)
-to `ai.plan_budget(messages, known_categories, account_labels)`, which uses Gemini
-**structured output** (`response_schema`) to return:
+to `ai.plan_budget(messages, known_categories, account_labels)`, which uses OpenAI
+**structured output** (strict JSON schema via `client.chat.completions.parse`) to return:
 ```
 { actions: [ { kind: "goal", name, target_amount, target_date?, account? }
            | { kind: "category_limit", category, limit_amount } ],

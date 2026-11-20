@@ -1,8 +1,8 @@
 """
 test_assistant.py — AI assistant routes + tool dispatch.
 
-The Gemini calls themselves are NOT exercised here (no key, no network). What we
-lock down is:
+The OpenAI calls themselves are exercised (mocked) in test_ai_openai.py. What we
+lock down here is:
   * graceful degradation: /status reports disabled and AI endpoints 503 with no key
   * ai.execute_tool() — the tool->query mapping the model relies on — returns correct
     numbers against a seeded DB (this is the part we can't validate at runtime).
@@ -13,17 +13,17 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 
 
-# ── Graceful degradation (no GEMINI_API_KEY) ──────────────────────────────────
+# ── Graceful degradation (no OPENAI_API_KEY) ──────────────────────────────────
 
 class TestAssistantDisabled:
     def test_status_disabled(self, client, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         resp = client.get("/api/assistant/status")
         assert resp.status_code == 200
         assert resp.json() == {"enabled": False}
 
     def test_chat_503(self, client, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         resp = client.post(
             "/api/assistant/chat",
             json={"messages": [{"role": "user", "content": "hi"}]},
@@ -31,7 +31,7 @@ class TestAssistantDisabled:
         assert resp.status_code == 503
 
     def test_categorize_503(self, client, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         resp = client.post(
             "/api/assistant/categorize",
             json={"description": "Uber", "amount": 20, "type": "expense"},
@@ -39,7 +39,7 @@ class TestAssistantDisabled:
         assert resp.status_code == 503
 
     def test_insights_503(self, client, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         resp = client.get("/api/assistant/insights")
         assert resp.status_code == 503
 
@@ -121,10 +121,10 @@ class TestExecuteTool:
 # ── categorize-batch (v5) ─────────────────────────────────────────────────────
 
 class TestCategorizeBatchDisabled:
-    """Gated on GEMINI_API_KEY — 503 when unset (like other AI endpoints)."""
+    """Gated on OPENAI_API_KEY — 503 when unset (like other AI endpoints)."""
 
     def test_categorize_batch_503_without_key(self, client, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         resp = client.post("/api/assistant/categorize-batch", json={"only_uncategorized": True})
         assert resp.status_code == 503
 

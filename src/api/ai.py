@@ -1,39 +1,70 @@
 """
-AI layer — Google Gemini (google-genai SDK).
+AI layer — OpenAI (official `openai` SDK, Chat Completions).
 
-Powers three product features on top of the existing query logic:
-  * Q&A assistant  -> run_assistant()      (function-calling loop over the stats/search tools)
-  * Auto-categorize -> suggest_category()  (structured JSON output)
+Powers four product features on top of the existing query logic:
+  * Q&A assistant  -> run_assistant()      (tool-calling loop over the stats/search tools)
+  * Auto-categorize -> suggest_category()  (strict JSON-schema structured output)
   * Insights        -> generate_insights() (one-shot narrative)
+  * Budget planning -> plan_budget()       (strict JSON-schema structured output)
 
 The model never touches the DB directly: every tool routes through execute_tool(),
 which calls the SAME query functions the REST API uses. execute_tool() is pure
 (no network, no key) so the tool->query mapping is unit-testable offline.
 
+Every OpenAI request goes through _chat(), which turns SDK failures (bad key,
+rate limit / quota, timeout, unreachable, model errors) into AIProviderError —
+a status code (502/503) plus a readable detail the routes hand back as-is.
+
 Config (environment):
-  GEMINI_API_KEY   required for any AI call (absent -> features disabled / 503)
-  GEMINI_MODEL     optional, defaults to "gemini-2.5-flash"
+  OPENAI_API_KEY   required for any AI call (absent -> features disabled / 503)
+  OPENAI_MODEL     optional, defaults to "gpt-4o-mini"
 """
 from __future__ import annotations
 
 import os
 import json
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Optional
 
+from pydantic import BaseModel
 from sqlalchemy import select, and_
 from sqlalchemy.orm import Session
 
 from .models import Transaction
 from .routes import stats as stats_routes
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = "gpt-4o-mini"
 
-TODAY = "2026-06-28"
+# Per-request timeout (seconds) and SDK retry count. The SDK retries connection
+# errors, 408/409/429 and 5xx with backoff; one retry keeps the worst case for a
+# single call to ~1 minute instead of the SDK default's ~1.5.
+REQUEST_TIMEOUT_SECONDS = 30.0
+MAX_RETRIES = 1
+
+# The app's "today" is the USER's calendar date, not the server's. Render runs
+# in UTC, so a bare date.today() would flip to tomorrow every US evening.
+# APP_TIMEZONE overrides the default (an unknown zone falls back to UTC).
+DEFAULT_TIMEZONE = "America/New_York"
+
+
+def today() -> date:
+    tz_name = (os.environ.get("APP_TIMEZONE") or "").strip() or DEFAULT_TIMEZONE
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).date()
+
+
+def _date_sentence() -> str:
+    """Computed per request (never at import) so a long-running server stays current."""
+    d = today()
+    return f"Today is {d.strftime('%A')}, {d.isoformat()}."
 
 SYSTEM_INSTRUCTION = (
     "You are the assistant inside a personal expense-tracker app called Expense Tracker. "
-    f"Today's date is {TODAY}. All amounts are in US dollars (USD). "
+    "All amounts are in US dollars (USD). "
     "You can both answer questions AND take actions on the user's behalf using the tools "
     "provided. For questions, never guess at figures — always call a read tool to get real "
     "data, then state the numbers you found. "
@@ -66,20 +97,119 @@ SYSTEM_INSTRUCTION = (
 
 
 class AINotConfigured(RuntimeError):
-    """Raised when an AI call is attempted without GEMINI_API_KEY set."""
+    """Raised when an AI call is attempted without OPENAI_API_KEY set."""
+
+
+class AIProviderError(RuntimeError):
+    """An OpenAI request failed. `status_code` (502 or 503) and `detail` (a
+    readable sentence, never containing the API key) are what the route returns."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def get_model() -> str:
+    """The chat model to use — read per call so a .env loaded after import counts."""
+    return (os.environ.get("OPENAI_MODEL") or "").strip() or DEFAULT_MODEL
 
 
 def is_enabled() -> bool:
-    return bool(os.environ.get("GEMINI_API_KEY"))
+    return bool(os.environ.get("OPENAI_API_KEY"))
 
 
 def get_client():
-    key = os.environ.get("GEMINI_API_KEY")
+    key = os.environ.get("OPENAI_API_KEY")
     if not key:
-        raise AINotConfigured("GEMINI_API_KEY is not set")
-    from google import genai  # imported lazily so the app boots without the key
+        raise AINotConfigured("OPENAI_API_KEY is not set")
+    from openai import OpenAI  # imported lazily so the app boots fast without AI
 
-    return genai.Client(api_key=key)
+    return OpenAI(api_key=key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=MAX_RETRIES)
+
+
+def _provider_message(e: Exception) -> str:
+    """The human part of an OpenAI error body ('message'), trimmed."""
+    body = getattr(e, "body", None)
+    msg = None
+    if isinstance(body, dict):
+        inner = body.get("error") if isinstance(body.get("error"), dict) else body
+        msg = inner.get("message")
+    msg = (msg or getattr(e, "message", None) or str(e) or "").strip()
+    return msg if len(msg) <= 300 else msg[:299] + "…"
+
+
+def translate_openai_error(e: Exception) -> AIProviderError:
+    """Map an `openai` SDK exception to a status code + readable detail.
+
+    503 = the AI is unusable until someone fixes config/billing or waits (bad key,
+    no access to the model, rate limit / quota). 502 = this request failed
+    upstream (timeout, unreachable, OpenAI 5xx, rejected or unparseable reply)."""
+    import openai
+
+    model = get_model()
+    if isinstance(e, openai.AuthenticationError):
+        # Deliberately not echoing OpenAI's message: it quotes part of the key.
+        return AIProviderError(
+            503, "AI request failed: OpenAI rejected the server's API key. Check OPENAI_API_KEY on the server."
+        )
+    if isinstance(e, openai.PermissionDeniedError):
+        return AIProviderError(
+            503, f"AI request failed: OpenAI denied access to model '{model}': {_provider_message(e)}"
+        )
+    if isinstance(e, openai.NotFoundError):
+        return AIProviderError(
+            503, f"AI request failed: OpenAI model '{model}' was not found. Check OPENAI_MODEL on the server."
+        )
+    if isinstance(e, openai.RateLimitError):
+        code = getattr(e, "code", None)
+        if code == "insufficient_quota":
+            return AIProviderError(
+                503, "AI request failed: the OpenAI account is out of credits or over its usage quota."
+            )
+        return AIProviderError(
+            503, "AI request failed: OpenAI rate limit reached. Wait a moment and try again."
+        )
+    if isinstance(e, openai.APITimeoutError):  # subclass of APIConnectionError — check first
+        return AIProviderError(
+            502, f"AI request failed: OpenAI didn't respond within {int(REQUEST_TIMEOUT_SECONDS)} seconds. Try again."
+        )
+    if isinstance(e, openai.APIConnectionError):
+        return AIProviderError(502, "AI request failed: couldn't reach the OpenAI API. Try again in a moment.")
+    if isinstance(e, openai.LengthFinishReasonError):
+        return AIProviderError(502, "AI request failed: the model's reply was cut off before it finished.")
+    if isinstance(e, openai.ContentFilterFinishReasonError):
+        return AIProviderError(502, "AI request failed: OpenAI's content filter blocked the reply.")
+    if isinstance(e, openai.APIStatusError):
+        return AIProviderError(
+            502, f"AI request failed: OpenAI returned HTTP {e.status_code}: {_provider_message(e)}"
+        )
+    return AIProviderError(502, f"AI request failed: {type(e).__name__}: {_provider_message(e)}")
+
+
+def _chat(client, *, parse: bool = False, **kwargs):
+    """One Chat Completions request (`parse=True` for structured output), with
+    OpenAI SDK errors translated to AIProviderError."""
+    import openai
+
+    try:
+        if parse:
+            return client.chat.completions.parse(model=get_model(), **kwargs)
+        return client.chat.completions.create(model=get_model(), **kwargs)
+    except openai.OpenAIError as e:
+        raise translate_openai_error(e) from e
+
+
+def _parsed(completion, what: str):
+    """The pydantic object from a parse() completion, or AIProviderError when the
+    model refused or returned nothing usable."""
+    message = completion.choices[0].message
+    if getattr(message, "parsed", None) is not None:
+        return message.parsed
+    refusal = getattr(message, "refusal", None)
+    if refusal:
+        raise AIProviderError(502, f"AI request failed: the model declined to {what}: {refusal}")
+    raise AIProviderError(502, f"AI request failed: the model returned no usable {what} result.")
 
 
 def _parse_date(value: Optional[str]) -> Optional[date]:
@@ -267,12 +397,12 @@ _TOOL_SCHEMAS = [
     {
         "name": "get_financial_summary",
         "description": "Totals for a date range: total_income, total_expense, net, savings, savings_rate, and transaction count. Transfers are excluded.",
-        "parameters_json_schema": {"type": "object", "properties": dict(_DATE_PROPS), "required": []},
+        "parameters": {"type": "object", "properties": dict(_DATE_PROPS), "required": []},
     },
     {
         "name": "get_spending_by_category",
         "description": "Totals grouped by category for a date range. Use to find the biggest categories.",
-        "parameters_json_schema": {
+        "parameters": {
             "type": "object",
             "properties": {**_DATE_PROPS, "type": {"type": "string", "enum": ["expense", "income"], "description": "Defaults to expense."}},
             "required": [],
@@ -281,7 +411,7 @@ _TOOL_SCHEMAS = [
     {
         "name": "get_income_expense_over_time",
         "description": "Income, expense, and net per time period. Use for trends over time.",
-        "parameters_json_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"granularity": {"type": "string", "enum": ["day", "week", "month", "year"], "description": "Defaults to month."}, **_DATE_PROPS},
             "required": [],
@@ -290,7 +420,7 @@ _TOOL_SCHEMAS = [
     {
         "name": "search_transactions",
         "description": "List individual transactions matching the filters, newest first. Use to inspect specific entries.",
-        "parameters_json_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 **_DATE_PROPS,
@@ -313,7 +443,7 @@ _TOOL_SCHEMAS = [
             "in the system context. After it runs, tell the user the rule and how many existing "
             "rows were updated."
         ),
-        "parameters_json_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "match_field": {"type": "string", "enum": ["description", "category", "account", "any"], "description": "Which transaction field to test."},
@@ -337,7 +467,7 @@ _TOOL_SCHEMAS = [
             "context — the goal tracks that account's balance growth. Confirm the goal details "
             "to the user afterward."
         ),
-        "parameters_json_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Goal name, e.g. 'Emergency fund'."},
@@ -355,7 +485,7 @@ _TOOL_SCHEMAS = [
             "positive. Prefer a real known category from the system context. Confirm the budget "
             "to the user afterward."
         ),
-        "parameters_json_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "category": {"type": "string", "description": "The category to cap (use a real known category)."},
@@ -414,7 +544,7 @@ def _dynamic_system_instruction(db: Session) -> str:
         descriptions = []
 
     return (
-        f"{SYSTEM_INSTRUCTION}\n\n"
+        f"{SYSTEM_INSTRUCTION}\n\n{_date_sentence()}\n"
         f"Known categories: {', '.join(categories) or '(none yet)'}.\n"
         f"Connected account labels: {', '.join(labels) or '(none)'}.\n"
         f"Recent transaction descriptions (for inferring rule match text): "
@@ -422,59 +552,87 @@ def _dynamic_system_instruction(db: Session) -> str:
     )
 
 
-def run_assistant(db: Session, messages: list[dict]) -> dict:
-    """Run the agentic chat loop. messages: [{role: 'user'|'assistant', content: str}]."""
-    from google.genai import types
+# OpenAI function-tool form of _TOOL_SCHEMAS (non-strict, so optional params stay
+# optional exactly as declared).
+_OPENAI_TOOLS = [{"type": "function", "function": schema} for schema in _TOOL_SCHEMAS]
 
-    client = get_client()
 
-    tool = types.Tool(function_declarations=[
-        types.FunctionDeclaration(**schema) for schema in _TOOL_SCHEMAS
-    ])
-    config = types.GenerateContentConfig(
-        system_instruction=_dynamic_system_instruction(db),
-        tools=[tool],
-        temperature=0.2,
-    )
-
-    contents = [
-        types.Content(
-            role="model" if m.get("role") in ("assistant", "model") else "user",
-            parts=[types.Part.from_text(text=m.get("content", ""))],
-        )
+def _history_to_openai(messages: list[dict]) -> list[dict]:
+    """Chat history -> OpenAI messages. 'assistant'/'model' -> assistant, anything
+    else -> user; empty turns dropped."""
+    return [
+        {
+            "role": "assistant" if m.get("role") in ("assistant", "model") else "user",
+            "content": m.get("content", ""),
+        }
         for m in messages
         if m.get("content")
     ]
 
+
+def run_assistant(db: Session, messages: list[dict]) -> dict:
+    """Run the agentic chat loop. messages: [{role: 'user'|'assistant', content: str}]."""
+    client = get_client()
+
+    convo: list[dict] = [
+        {"role": "system", "content": _dynamic_system_instruction(db)},
+        *_history_to_openai(messages),
+    ]
+
+    def _ask():
+        return _chat(client, messages=convo, tools=_OPENAI_TOOLS, temperature=0.2)
+
     tool_calls: list[str] = []
-    response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+    response = _ask()
 
     for _ in range(_MAX_TOOL_ROUNDS):
-        calls = response.function_calls or []
+        message = response.choices[0].message
+        calls = [c for c in (message.tool_calls or []) if getattr(c, "type", "function") == "function"]
         if not calls:
             break
         # record the model's tool-call turn, then answer every call
-        contents.append(response.candidates[0].content)
-        parts = []
-        for fc in calls:
-            tool_calls.append(fc.name)
-            args = dict(fc.args or {})
+        convo.append({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": c.id,
+                    "type": "function",
+                    "function": {"name": c.function.name, "arguments": c.function.arguments or "{}"},
+                }
+                for c in calls
+            ],
+        })
+        for c in calls:
+            name = c.function.name
+            tool_calls.append(name)
             try:
-                result = execute_tool(db, fc.name, args)
+                args = json.loads(c.function.arguments or "{}") or {}
+                if not isinstance(args, dict):
+                    raise ValueError("tool arguments must be a JSON object")
+                result = execute_tool(db, name, args)
                 payload = {"result": result}
             except Exception as e:  # surface to the model so it can recover
                 payload = {"error": str(e)}
-            parts.append(types.Part.from_function_response(name=fc.name, response=payload))
-        contents.append(types.Content(role="tool", parts=parts))
-        response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+            convo.append({
+                "role": "tool",
+                "tool_call_id": c.id,
+                "content": json.dumps(payload, default=str),
+            })
+        response = _ask()
 
-    reply = (response.text or "").strip() or "I couldn't find an answer to that."
+    reply = (response.choices[0].message.content or "").strip() or "I couldn't find an answer to that."
     seen: set[str] = set()
     deduped = [t for t in tool_calls if not (t in seen or seen.add(t))]
     return {"reply": reply, "tool_calls": deduped}
 
 
 # ── Auto-categorize (structured output) ────────────────────────────────────────
+
+class _Suggestion(BaseModel):
+    category: str
+    confidence: float
+
 
 def suggest_category(
     description: str,
@@ -483,13 +641,6 @@ def suggest_category(
     known_categories: list[str],
 ) -> dict:
     """Suggest the single best category for a transaction. Returns {category, confidence}."""
-    from google.genai import types
-    from pydantic import BaseModel
-
-    class _Suggestion(BaseModel):
-        category: str
-        confidence: float
-
     client = get_client()
     prompt = (
         f"Transaction to categorize:\n"
@@ -501,20 +652,17 @@ def suggest_category(
         "only invent a short new one (1-2 words) if none fit. "
         "confidence is 0.0-1.0 for how sure you are."
     )
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction="You categorize personal-finance transactions into one concise category.",
-            response_mime_type="application/json",
-            response_schema=_Suggestion,
-            temperature=0.0,
-        ),
+    completion = _chat(
+        client,
+        parse=True,
+        messages=[
+            {"role": "system", "content": "You categorize personal-finance transactions into one concise category."},
+            {"role": "user", "content": prompt},
+        ],
+        response_format=_Suggestion,
+        temperature=0.0,
     )
-    parsed = getattr(response, "parsed", None)
-    if parsed is None:
-        data = json.loads(response.text)
-        parsed = _Suggestion(**data)
+    parsed = _parsed(completion, "categorize the transaction")
     confidence = max(0.0, min(1.0, float(parsed.confidence)))
     return {"category": parsed.category.strip(), "confidence": round(confidence, 2)}
 
@@ -523,7 +671,7 @@ def suggest_category(
 
 BUDGET_SYSTEM_INSTRUCTION = (
     "You are the budgeting assistant inside a personal expense-tracker app. "
-    f"Today's date is {TODAY}. All amounts are in US dollars (USD). "
+    "All amounts are in US dollars (USD). "
     "The user is asking you to set up budgets. Turn their request into concrete "
     "actions of two kinds:\n"
     "  - kind='goal': a savings goal with a name, a positive target_amount, an "
@@ -542,34 +690,33 @@ BUDGET_SYSTEM_INSTRUCTION = (
 )
 
 
+class _BudgetAction(BaseModel):
+    kind: str  # "goal" | "category_limit"
+    # goal fields
+    name: Optional[str] = None
+    target_amount: Optional[float] = None
+    target_date: Optional[str] = None  # YYYY-MM-DD
+    account: Optional[str] = None
+    # category_limit fields
+    category: Optional[str] = None
+    limit_amount: Optional[float] = None
+
+
+class _BudgetPlan(BaseModel):
+    actions: list[_BudgetAction]
+    reply: str
+
+
 def plan_budget(
     messages: list[dict],
     known_categories: Optional[list[str]] = None,
     account_labels: Optional[list[str]] = None,
 ) -> dict:
-    """Turn a chat request into concrete budget/goal creation actions via Gemini
-    structured output. Returns {"actions": [ {kind, ...}, ... ], "reply": str}.
+    """Turn a chat request into concrete budget/goal creation actions via OpenAI
+    structured output (strict JSON schema). Returns {"actions": [ {kind, ...}, ... ], "reply": str}.
     Actions are dicts; the caller (assistant route) persists them via the shared
     budget create helpers. The caller passes in known categories + account labels
     so this stays pure w.r.t. the DB."""
-    from google.genai import types
-    from pydantic import BaseModel
-
-    class _BudgetAction(BaseModel):
-        kind: str  # "goal" | "category_limit"
-        # goal fields
-        name: Optional[str] = None
-        target_amount: Optional[float] = None
-        target_date: Optional[str] = None  # YYYY-MM-DD
-        account: Optional[str] = None
-        # category_limit fields
-        category: Optional[str] = None
-        limit_amount: Optional[float] = None
-
-    class _BudgetPlan(BaseModel):
-        actions: list[_BudgetAction]
-        reply: str
-
     client = get_client()
 
     convo = "\n".join(
@@ -583,20 +730,17 @@ def plan_budget(
         f"Conversation:\n{convo}\n\n"
         "Produce the budget actions and a confirmation reply."
     )
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=BUDGET_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=_BudgetPlan,
-            temperature=0.2,
-        ),
+    completion = _chat(
+        client,
+        parse=True,
+        messages=[
+            {"role": "system", "content": f"{BUDGET_SYSTEM_INSTRUCTION}\n\n{_date_sentence()}"},
+            {"role": "user", "content": prompt},
+        ],
+        response_format=_BudgetPlan,
+        temperature=0.2,
     )
-    parsed = getattr(response, "parsed", None)
-    if parsed is None:
-        data = json.loads(response.text)
-        parsed = _BudgetPlan(**data)
+    parsed = _parsed(completion, "plan the budget")
     return {
         "actions": [a.model_dump() for a in parsed.actions],
         "reply": (parsed.reply or "").strip(),
@@ -607,8 +751,6 @@ def plan_budget(
 
 def generate_insights(db: Session, start_date: Optional[date], end_date: Optional[date]) -> str:
     """Generate a short narrative read of the user's finances for the period."""
-    from google.genai import types
-
     client = get_client()
     summary = stats_routes.get_summary(start_date=start_date, end_date=end_date, db=db).model_dump()
     by_category = [c.model_dump() for c in stats_routes.get_by_category(
@@ -629,9 +771,5 @@ def generate_insights(db: Session, start_date: Optional[date], end_date: Optiona
         "notable month-to-month trend. Use specific numbers and plain language. No markdown "
         "headings or bullet lists — just short sentences."
     )
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.4),
-    )
-    return (response.text or "").strip() or "No insights available for this period."
+    response = _chat(client, messages=[{"role": "user", "content": prompt}], temperature=0.4)
+    return (response.choices[0].message.content or "").strip() or "No insights available for this period."

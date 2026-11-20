@@ -21,6 +21,12 @@ or custom range — is just a query, and year-end stats come for free.
   Syncs are also **serialized and exactly-once**: the cron, scheduler, webhooks,
   and manual syncs can't overlap, and a unique index guarantees one row per Plaid
   transaction, so a bank charge can never be imported (or counted) twice.
+  $0 brokerage events (in-kind share transfers, stock splits) aren't money
+  movement and are never imported.
+  **One connection per bank** — to add an account at a bank you've already linked,
+  use **+ Add accounts** on its card, which reopens Plaid's account picker against
+  the same connection. Linking the bank a second time is refused, since that would
+  duplicate the accounts you already have (and double-count them in net worth).
 - **Dashboard** — KPI cards (income, expense, net, savings rate), spend-over-time
   area chart, category donut, and income-vs-expense bar chart, driven by a
   date-range and granularity selector, plus a per-account spending breakdown. A
@@ -29,8 +35,9 @@ or custom range — is just a query, and year-end stats come for free.
   modal form. Filter by date range, type, category, account, or "needs review".
 - **Budgets** — monthly per-category spending limits and savings goals, tracked
   against live spend. Can be created conversationally through the AI assistant.
-- **AI assistant (Google Gemini)** — on-demand auto-categorization, spending Q&A,
-  and natural-language budget/goal creation. Optional; requires a `GEMINI_API_KEY`.
+- **AI assistant (OpenAI)** — on-demand auto-categorization, spending Q&A,
+  spending insights, and natural-language budget/goal creation. Optional;
+  requires an `OPENAI_API_KEY` (model defaults to `gpt-4o-mini`).
 - **Rules engine + needs-review queue** — user-editable keyword/amount rules that
   set type, category, or account; ambiguous rows are flagged for review instead
   of being silently miscounted.
@@ -41,6 +48,13 @@ or custom range — is just a query, and year-end stats come for free.
 - **Authentication (Clerk)** — optional Google sign-in via Clerk with server-side
   JWT verification and an email allowlist. Off by default locally; hard-required
   in production (see below).
+- **Readable errors** — when something fails, the page says what in plain English
+  ("Couldn't load transactions") and keeps the technical record behind a
+  **Details** toggle: the request, status, the real cause (e.g.
+  `ResponseValidationError: row 0 (id 1662) amount: …`) and an **error ID**, with a
+  Copy button. Search Render's logs for the error ID to find the full stack trace,
+  which is never sent to the browser. Nothing is stored; it's on screen only. See
+  *Errors* in [`docs/api-contract.md`](docs/api-contract.md).
 - **CSV import (decommissioned)** — a bank-agnostic drag-and-drop importer that
   predates the Plaid integration. Now that the app is Plaid-first, its UI is
   **hidden behind the `CSV_IMPORT_ENABLED` flag** (off by default — see
@@ -52,7 +66,7 @@ or custom range — is just a query, and year-end stats come for free.
 
 - **Backend** — FastAPI, SQLAlchemy 2.x, Pydantic 2.x. SQLite by default
   (zero-config); Postgres-ready via `DATABASE_URL` (e.g. Neon). Plaid
-  (`plaid-python`) for bank sync, Google Gemini SDK (`google-genai`) for AI,
+  (`plaid-python`) for bank sync, the OpenAI Python SDK (`openai`) for AI,
   PyJWT for Clerk session verification, APScheduler for auto-sync.
 - **Frontend** — React 18, Vite 5, TypeScript, React Router, Recharts,
   lucide-react, `@clerk/react`, `react-plaid-link`.
@@ -93,6 +107,11 @@ cp .env.example .env
 
 `.env` and the SQLite database file are gitignored.
 
+To turn on the AI assistant (auto-categorize, Q&A, insights, budget creation),
+set `OPENAI_API_KEY` in `.env` to a key from
+<https://platform.openai.com/api-keys>, and optionally `OPENAI_MODEL` (defaults to
+`gpt-4o-mini`). Without a key the app runs normally and the assistant stays hidden.
+
 ### Backend (port 8000)
 
 ```bash
@@ -129,8 +148,13 @@ Environment variables (see [`.env.example`](.env.example) for the full list and
 notes). Everything is optional for a bare local run; features light up as you
 add keys.
 
-- **AI** — `GEMINI_API_KEY` (AI endpoints return `503` when unset),
-  `GEMINI_MODEL` (defaults to `gemini-2.5-flash`).
+- **AI** — `OPENAI_API_KEY` (create one at
+  <https://platform.openai.com/api-keys>; AI endpoints return `503` when unset),
+  `OPENAI_MODEL` (defaults to `gpt-4o-mini`), `APP_TIMEZONE` (the IANA zone the
+  AI treats as "today", defaults to `America/New_York`; the server itself runs
+  in UTC). OpenAI failures (bad key, rate
+  limit or exhausted quota, timeout) come back as a readable `502`/`503` that the
+  Assistant shows in its error notice.
 - **Database** — `DATABASE_URL`; unset uses local SQLite, set a `postgresql://…`
   URL for Postgres/Neon.
 - **Plaid** — `PLAID_CLIENT_ID`, `PLAID_SECRET`, and `PLAID_ENV`
@@ -156,7 +180,7 @@ single origin — no CORS in prod) deployed to Render with Neon Postgres. See
 
 ```bash
 source .venv/bin/activate
-pytest              # backend unit/integration (in-memory SQLite)
+pytest              # backend unit/integration (in-memory SQLite; OpenAI is mocked)
 npm run e2e         # Playwright end-to-end
 ```
 

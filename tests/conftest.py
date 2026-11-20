@@ -116,6 +116,23 @@ def _disable_clerk_auth(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Keep the suite off the real OpenAI API.
+#
+# load_dotenv() (see above) also pulls OPENAI_API_KEY / OPENAI_MODEL from the
+# real .env. Delete them before every test so AI is DISABLED by default (as in
+# CI); tests that need AI "on" set a dummy key and mock ai.get_client. As a
+# second guard, OPENAI_BASE_URL points at a closed local port, so a client that
+# somehow escaped mocking fails fast instead of reaching api.openai.com.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _no_real_openai(monkeypatch):
+    for var in ("OPENAI_API_KEY", "OPENAI_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1")
+    yield
+
+
+# ---------------------------------------------------------------------------
 # Core fixtures
 # ---------------------------------------------------------------------------
 
